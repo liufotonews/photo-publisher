@@ -7,10 +7,9 @@ use std::path::Path;
 
 pub fn load_json(path: impl AsRef<Path>) -> Result<Value> {
     let path = path.as_ref();
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("invalid JSON in {}", path.display()))
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
 pub fn compile_schema(schema_path: impl AsRef<Path>) -> Result<Validator> {
