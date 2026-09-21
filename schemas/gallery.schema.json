@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://photo-publisher.org/schemas/gallery.schema.json",
+  "title": "Photo Publisher Gallery Manifest",
+  "description": "Published photo manifest consumed by compatible gallery templates.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "gallery", "photos"],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "gallery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{1,99}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "date": {
+          "type": "string",
+          "format": "date"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 5000
+        }
+      }
+    },
+    "photos": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/photo" },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "width", "height"],
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri-reference"
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mimeType": {
+          "type": "string",
+          "enum": ["image/jpeg"]
+        }
+      }
+    },
+    "photo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "filename", "preview"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "filename": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "preview": {
+          "$ref": "#/$defs/asset"
+        },
+        "download": {
+          "$ref": "#/$defs/asset"
+        },
+        "alt": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "caption": {
+          "type": "string",
+          "maxLength": 5000
+        }
+      }
+    }
+  }
+}

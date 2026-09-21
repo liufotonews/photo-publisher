@@ -1,0 +1,9 @@
+[package]
+name = "photo-publisher-contract-validator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+jsonschema = "0.29"
+serde_json = "1"

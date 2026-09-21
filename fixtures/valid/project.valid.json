@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "id": "joao-maria-2026",
+    "name": "João & Maria",
+    "client": "João & Maria",
+    "date": "2026-09-20"
+  },
+  "gallery": {
+    "template": "editorial-v1",
+    "title": "João & Maria",
+    "description": "Galeria de entrega."
+  },
+  "source": {
+    "type": "folder",
+    "path": "D:\\Fotos\\JoaoMaria\\Final"
+  },
+  "repository": {
+    "provider": "github",
+    "repository": "fotografo/joao-maria-2026",
+    "branch": "main"
+  },
+  "hosting": {
+    "provider": "vercel",
+    "project": "joao-maria-2026"
+  },
+  "storage": {
+    "preview": {
+      "provider": "github",
+      "prefix": "public/photos"
+    },
+    "highResolution": {
+      "provider": "r2",
+      "bucket": "fotografia",
+      "prefix": "joao-maria-2026"
+    }
+  },
+  "domain": {
+    "url": "https://galeria.exemplo.com"
+  }
+}

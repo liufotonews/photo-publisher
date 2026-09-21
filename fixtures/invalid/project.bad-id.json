@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "id": "Joao Maria 2026",
+    "name": "João & Maria"
+  },
+  "gallery": {
+    "template": "editorial-v1",
+    "title": "João & Maria"
+  },
+  "repository": {
+    "provider": "github",
+    "repository": "fotografo/joao-maria-2026"
+  },
+  "hosting": {
+    "provider": "vercel"
+  },
+  "storage": {
+    "preview": { "provider": "github" },
+    "highResolution": { "provider": "r2", "bucket": "fotografia" }
+  }
+}

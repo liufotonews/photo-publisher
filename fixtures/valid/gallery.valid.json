@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "gallery": {
+    "id": "joao-maria-2026",
+    "title": "João & Maria",
+    "date": "2026-09-20",
+    "description": "Galeria de entrega."
+  },
+  "photos": [
+    {
+      "id": "photo-000001",
+      "filename": "IMG_0001.jpg",
+      "sequence": 1,
+      "preview": {
+        "url": "/photos/preview/IMG_0001.jpg",
+        "width": 2048,
+        "height": 1365,
+        "mimeType": "image/jpeg"
+      },
+      "download": {
+        "url": "https://storage.example.com/joao-maria-2026/IMG_0001.jpg",
+        "width": 6000,
+        "height": 4000,
+        "mimeType": "image/jpeg"
+      }
+    }
+  ]
+}
