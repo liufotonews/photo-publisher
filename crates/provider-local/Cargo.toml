@@ -1,0 +1,15 @@
+[package]
+name = "photo-publisher-provider-local"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+photo-publisher-provider-contracts = { path = "../provider-contracts" }
+sha2 = "0.10"
+thiserror = "2"
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+photo-publisher-provider-contract-tests = { path = "../provider-contract-tests" }

@@ -5,4 +5,7 @@ members = [
     "crates/publisher-core",
     "crates/publisher-pipeline",
     "crates/publisher-cli",
+    "crates/provider-contracts",
+    "crates/provider-contract-tests",
+    "crates/provider-local",
 ]

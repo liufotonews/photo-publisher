@@ -1236,6 +1236,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "photo-publisher-provider-contract-tests"
+version = "0.1.0"
+dependencies = [
+ "photo-publisher-provider-contracts",
+]
+
+[[package]]
+name = "photo-publisher-provider-contracts"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "thiserror",
+ "windows-sys",
+]
+
+[[package]]
+name = "photo-publisher-provider-local"
+version = "0.1.0"
+dependencies = [
+ "photo-publisher-provider-contract-tests",
+ "photo-publisher-provider-contracts",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,7 @@
+[package]
+name = "photo-publisher-provider-contract-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+photo-publisher-provider-contracts = { path = "../provider-contracts" }
