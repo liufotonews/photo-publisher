@@ -372,7 +372,6 @@ fn is_generation(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn journal_hash_is_deterministic_without_self_reference() {
@@ -422,6 +421,7 @@ mod tests {
     #[test]
     fn replacement_preserves_locked_destination_and_succeeds_after_unlock() {
         use std::os::windows::fs::OpenOptionsExt;
+        use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
         let source = dir.path().join("new.json");
