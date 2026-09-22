@@ -1,3 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/contract-validator", "crates/publisher-core", "crates/publisher-pipeline"]
+members = [
+    "crates/contract-validator",
+    "crates/publisher-core",
+    "crates/publisher-pipeline",
+    "crates/publisher-cli",
+]
