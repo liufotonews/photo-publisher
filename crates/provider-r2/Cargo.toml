@@ -1,0 +1,16 @@
+[package]
+name = "photo-publisher-provider-r2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aws-config = "1"
+aws-sdk-s3 = "1"
+base64 = "0.22"
+photo-publisher-provider-contracts = { path = "../provider-contracts" }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+mockito = "1"
+photo-publisher-provider-contract-tests = { path = "../provider-contract-tests" }
