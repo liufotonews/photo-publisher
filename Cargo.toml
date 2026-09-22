@@ -8,4 +8,5 @@ members = [
     "crates/provider-contracts",
     "crates/provider-contract-tests",
     "crates/provider-local",
+    "crates/provider-github",
 ]
