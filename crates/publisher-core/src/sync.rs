@@ -130,7 +130,9 @@ mod tests {
         // Output order of BTreeMap keys: "added.jpg", "updated.jpg" from current loop,
         // then "removed.jpg" from prev loop
         assert!(matches!(&actions[0], SyncAction::Add(ref p) if p.relative_path == "added.jpg"));
-        assert!(matches!(&actions[1], SyncAction::Update(ref p) if p.relative_path == "updated.jpg"));
+        assert!(
+            matches!(&actions[1], SyncAction::Update(ref p) if p.relative_path == "updated.jpg")
+        );
         assert!(
             matches!(&actions[2], SyncAction::Remove { ref relative_path } if relative_path == "removed.jpg")
         );
