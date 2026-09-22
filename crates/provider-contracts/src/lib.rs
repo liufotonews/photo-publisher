@@ -261,8 +261,24 @@ pub trait StorageProvider {
     fn delete(&mut self, key: &ObjectKey) -> ProviderResult<()>;
 }
 
+/// Result of a hosting publication that completed successfully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentInfo {
+    /// Provider-specific deployment identifier.
+    pub id: String,
+    /// URL at which the published deployment can be reached.
+    pub url: String,
+}
+
+/// Publishes the configured site and returns its completed deployment identity.
+///
+/// `publish` is synchronous at the contract boundary: success means the
+/// provider completed the publication operation and can return both its
+/// provider-specific deployment ID and resulting URL. It does not imply
+/// domain provisioning, DNS, storage, repository management, or project
+/// provisioning.
 pub trait HostingProvider {
-    fn publish(&self) -> ProviderResult<()>;
+    fn publish(&self) -> ProviderResult<DeploymentInfo>;
 }
 
 pub trait CredentialStore {

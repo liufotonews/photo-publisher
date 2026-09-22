@@ -3,7 +3,7 @@
 use std::io::{self, Cursor, Read};
 
 use photo_publisher_provider_contracts::{
-    ObjectKey, ProviderError, RepositoryPath, RepositoryProvider, StorageProvider,
+    HostingProvider, ObjectKey, ProviderError, RepositoryPath, RepositoryProvider, StorageProvider,
 };
 
 struct FailingReader;
@@ -156,5 +156,46 @@ pub fn storage_contract(provider: &mut impl StorageProvider) {
         "file ",
     ] {
         assert!(ObjectKey::new(invalid).is_err(), "accepted key: {invalid}");
+    }
+}
+
+/// Minimal behavioral contract for hosting providers.
+pub fn hosting_contract(provider: &impl HostingProvider) {
+    let deployment = provider.publish().unwrap();
+    assert!(!deployment.id.is_empty());
+    assert!(!deployment.url.is_empty());
+}
+
+#[cfg(test)]
+mod hosting_tests {
+    use super::*;
+    use photo_publisher_provider_contracts::{DeploymentInfo, ProviderResult};
+
+    struct FakeHosting {
+        fails: bool,
+    }
+
+    impl HostingProvider for FakeHosting {
+        fn publish(&self) -> ProviderResult<DeploymentInfo> {
+            if self.fails {
+                Err(ProviderError::Network)
+            } else {
+                Ok(DeploymentInfo {
+                    id: "deployment-1".to_owned(),
+                    url: "https://example.test".to_owned(),
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn hosting_contract_requires_deployment_id_and_url() {
+        hosting_contract(&FakeHosting { fails: false });
+    }
+
+    #[test]
+    fn hosting_provider_propagates_provider_error() {
+        let provider = FakeHosting { fails: true };
+        assert!(matches!(provider.publish(), Err(ProviderError::Network)));
     }
 }
