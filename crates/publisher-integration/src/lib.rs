@@ -1,6 +1,7 @@
-//! Provider-neutral contracts and durable state for the future integration layer.
+//! Provider-neutral contracts, durable state, reconciliation planning, and
+//! storage execution for the integration layer.
 //!
-//! This crate deliberately contains no provider implementation or orchestration.
+//! This crate deliberately contains no concrete provider implementation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -17,8 +18,10 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use url::{Host, Url};
 
+pub mod executor;
 pub mod planner;
 
+pub use executor::{StorageExecutionError, StorageExecutionReport, StorageExecutor};
 pub use planner::{
     plan_reconciliation, publication_configuration_fingerprint, DesiredPublication,
     DesiredRepositoryFile, DesiredStorageObject, IntegrationOperation, IntegrationPlan,
@@ -483,6 +486,22 @@ impl IntegrationLedger {
                 status,
             },
         );
+        next.refresh_integrity()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Removes an R2 inventory entry after a confirmed remote deletion.
+    ///
+    /// The absence of a key means the object is no longer known to exist; no
+    /// tombstone is kept. Removing a key that is not recorded is an error so
+    /// callers cannot silently lose track of remote state.
+    pub fn remove_r2_object(&mut self, key: &ObjectKey) -> Result<()> {
+        if !self.r2_inventory.contains_key(key.as_str()) {
+            bail!("R2 inventory does not contain key: {}", key.as_str());
+        }
+        let mut next = self.clone();
+        next.r2_inventory.remove(key.as_str());
         next.refresh_integrity()?;
         *self = next;
         Ok(())
