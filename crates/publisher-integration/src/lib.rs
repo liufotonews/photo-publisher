@@ -17,6 +17,14 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use url::{Host, Url};
 
+pub mod planner;
+
+pub use planner::{
+    plan_reconciliation, publication_configuration_fingerprint, DesiredPublication,
+    DesiredRepositoryFile, DesiredStorageObject, IntegrationOperation, IntegrationPlan,
+    KnownRemoteState, LocalPublication, ReconciliationRequirement,
+};
+
 pub const INTEGRATION_LEDGER_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

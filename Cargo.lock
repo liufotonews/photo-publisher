@@ -2279,6 +2279,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "photo-publisher-contract-validator",
+ "photo-publisher-pipeline",
  "photo-publisher-provider-contracts",
  "serde",
  "serde_json",
