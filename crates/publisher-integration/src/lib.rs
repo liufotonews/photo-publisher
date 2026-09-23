@@ -1,5 +1,5 @@
 //! Provider-neutral contracts, durable state, reconciliation planning, and
-//! storage and repository execution for the integration layer.
+//! storage, repository, and hosting execution for the integration layer.
 //!
 //! This crate deliberately contains no concrete provider implementation.
 
@@ -19,10 +19,12 @@ use tempfile::NamedTempFile;
 use url::{Host, Url};
 
 pub mod executor;
+pub mod hosting;
 pub mod planner;
 pub mod repository;
 
 pub use executor::{StorageExecutionError, StorageExecutionReport, StorageExecutor};
+pub use hosting::{HostingExecutionError, HostingExecutionReport, HostingExecutor};
 pub use planner::{
     plan_reconciliation, publication_configuration_fingerprint, DesiredPublication,
     DesiredRepositoryFile, DesiredStorageObject, IntegrationOperation, IntegrationPlan,
@@ -560,6 +562,23 @@ impl IntegrationLedger {
             deployment_id,
             url,
         });
+        next.refresh_integrity()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Removes the Vercel publication entry when a hosting operation was
+    /// provably never published and no previous entry existed.
+    ///
+    /// The absence of the entry means no deployment is known; removing an
+    /// absent entry is an error so callers cannot silently lose track of
+    /// remote state.
+    pub fn remove_vercel(&mut self) -> Result<()> {
+        if self.vercel.is_none() {
+            bail!("ledger does not contain a Vercel publication");
+        }
+        let mut next = self.clone();
+        next.vercel = None;
         next.refresh_integrity()?;
         *self = next;
         Ok(())
