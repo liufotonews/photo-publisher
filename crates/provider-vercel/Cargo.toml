@@ -1,0 +1,16 @@
+[package]
+name = "photo-publisher-provider-vercel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+base64 = "0.22"
+photo-publisher-provider-contracts = { path = "../provider-contracts" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+mockito = "1"
+photo-publisher-provider-contract-tests = { path = "../provider-contract-tests" }
+serde_json = "1"
