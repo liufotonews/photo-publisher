@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 photo-publisher-contract-validator = { path = "../contract-validator" }
+photo-publisher-core = { path = "../publisher-core" }
 photo-publisher-pipeline = { path = "../publisher-pipeline" }
 photo-publisher-provider-contracts = { path = "../provider-contracts" }
 serde = { version = "1", features = ["derive"] }

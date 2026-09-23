@@ -4,12 +4,15 @@
 //! performs remote I/O.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::io;
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use photo_publisher_core::load_state;
 use photo_publisher_pipeline::journal::{read_journal, sha256_file, JournalPhase};
-use photo_publisher_provider_contracts::{ObjectKey, RepositoryPath};
-use serde_json::json;
+use photo_publisher_provider_contracts::{copy_with_sha256, ObjectKey, RepositoryPath};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -66,10 +69,43 @@ impl LocalPublication {
     }
 }
 
+/// A publication-relative asset path using `/` as the only separator.
+///
+/// The path is always interpreted relative to the publication root and must
+/// live under `photos/`. Absolute paths, drive letters, UNC paths, URLs,
+/// backslashes, `..` anywhere, and dot or empty components are rejected, so
+/// the same value is portable between Windows and Linux.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PublicationPath(String);
+
+impl PublicationPath {
+    pub fn new(value: impl AsRef<str>) -> Result<Self> {
+        let value = value.as_ref();
+        RepositoryPath::new(value)
+            .map_err(|error| anyhow::anyhow!("invalid publication path: {error}"))?;
+        if value.contains("..") {
+            bail!("publication path must not contain '..': {value}");
+        }
+        if !value.starts_with("photos/") {
+            bail!("publication path must be under photos/: {value}");
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A storage object that the future executor must make present remotely.
+///
+/// `source_path` binds the remote key to the exact publication-relative JPEG
+/// that supplies the bytes, so the executor never searches for, infers, or
+/// reconstructs a local path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesiredStorageObject {
     pub key: ObjectKey,
+    pub source_path: PublicationPath,
     pub sha256: String,
     pub size_bytes: u64,
     pub content_type: Option<String>,
@@ -78,12 +114,14 @@ pub struct DesiredStorageObject {
 impl DesiredStorageObject {
     pub fn new(
         key: ObjectKey,
+        source_path: PublicationPath,
         sha256: impl Into<String>,
         size_bytes: u64,
         content_type: Option<String>,
     ) -> Result<Self> {
         let object = Self {
             key,
+            source_path,
             sha256: sha256.into(),
             size_bytes,
             content_type,
@@ -147,6 +185,30 @@ impl DesiredPublication {
         Ok(publication)
     }
 
+    /// Builds the full desired state from a committed local publication.
+    ///
+    /// The journal must be `COMMITTED` and both the gallery manifest and the
+    /// publisher state are authenticated against the committed journal before
+    /// they are parsed. Every high-resolution download is bound to its
+    /// publication-relative source file with verified SHA-256 and size. This
+    /// performs local reads only: no provider, network, or remote state is
+    /// involved.
+    pub fn from_committed_output(
+        configuration: &ProjectPublicationConfig,
+        output_dir: impl AsRef<Path>,
+        bundle: &ApplicationBundle,
+    ) -> Result<Self> {
+        let output_dir = output_dir.as_ref();
+        let local = LocalPublication::from_output(output_dir)?;
+        let storage = committed_high_resolution_objects(configuration, output_dir, &local)?;
+        let mut publication = Self::new(configuration, local, bundle)?;
+        for object in storage {
+            publication.insert_storage_object(object)?;
+        }
+        publication.validate()?;
+        Ok(publication)
+    }
+
     pub fn insert_storage_object(&mut self, object: DesiredStorageObject) -> Result<()> {
         let key = object.key.as_str().to_owned();
         if self.storage.contains_key(&key) {
@@ -181,6 +243,132 @@ impl DesiredPublication {
         validate_sha256("desired bundle fingerprint", &self.bundle_fingerprint)?;
         self.local.validate()
     }
+}
+
+/// Builds the high-resolution storage bindings of one committed publication.
+///
+/// Scope of this phase: `gallery.photos[].download` → R2. The approved
+/// `ObjectKey` rule is `<highResolution.prefix>/<download.url>` with exactly
+/// one `/` separator; an absent or empty prefix means the URL alone. Each
+/// bound file must remain inside `output_dir`, its SHA-256 is computed in
+/// streaming and must match both the manifest file name and a
+/// `PublisherState` source, and its size must match that source.
+///
+/// This function only reads local committed artifacts. It never contacts a
+/// provider or reconstructs paths for a future executor.
+fn committed_high_resolution_objects(
+    configuration: &ProjectPublicationConfig,
+    output_dir: &Path,
+    local: &LocalPublication,
+) -> Result<Vec<DesiredStorageObject>> {
+    let journal = read_journal(&output_dir.join(".publisher/journal.json"))
+        .context("committed journal is required to bind storage sources")?;
+    if journal.phase != JournalPhase::Committed {
+        bail!("local publication is not committed");
+    }
+    if journal.generation != local.generation
+        || journal.gallery_sha256 != local.manifest_hash
+        || journal.state_sha256 != local.state_hash
+    {
+        bail!("journal and local publication do not describe the same generation");
+    }
+
+    let gallery_path = output_dir.join(&journal.gallery_path);
+    if sha256_file(&gallery_path)? != local.manifest_hash {
+        bail!("gallery manifest does not match the committed local publication");
+    }
+    let gallery: Value = serde_json::from_slice(&fs::read(&gallery_path)?)
+        .context("committed gallery manifest is not valid JSON")?;
+    let photos = gallery
+        .get("photos")
+        .and_then(Value::as_array)
+        .context("gallery photos must be an array")?;
+
+    let state_path = output_dir.join(&journal.state_path);
+    if sha256_file(&state_path)? != local.state_hash {
+        bail!("publisher state does not match the committed local publication");
+    }
+    let state = load_state(&state_path).context("failed to load the committed publisher state")?;
+
+    let prefix = configuration
+        .high_resolution_prefix
+        .as_deref()
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    let canonical_root = output_dir
+        .canonicalize()
+        .context("failed to resolve the publication root")?;
+
+    let mut objects = Vec::new();
+    for photo in photos {
+        let Some(download) = photo.get("download") else {
+            continue;
+        };
+        let url = download
+            .get("url")
+            .and_then(Value::as_str)
+            .context("gallery download asset URL is required")?;
+        let source_path = PublicationPath::new(url)?;
+
+        let filename = url
+            .rsplit('/')
+            .next()
+            .context("download asset URL must contain a file name")?;
+        let stem = filename
+            .rsplit_once('.')
+            .map(|(stem, _extension)| stem)
+            .context("download asset has no file extension")?;
+        validate_sha256("manifest download asset SHA-256", stem)?;
+
+        let key = ObjectKey::new(if prefix.is_empty() {
+            url.to_owned()
+        } else {
+            format!("{prefix}/{url}")
+        })?;
+
+        let physical = output_dir.join(source_path.as_str());
+        let metadata = fs::metadata(&physical)
+            .with_context(|| format!("gallery download asset does not exist: {url}"))?;
+        if !metadata.is_file() {
+            bail!("gallery download asset is not a regular file: {url}");
+        }
+        let canonical_asset = physical
+            .canonicalize()
+            .with_context(|| format!("failed to resolve gallery download asset: {url}"))?;
+        if canonical_asset.strip_prefix(&canonical_root).is_err() {
+            bail!("gallery download asset escapes the publication root: {url}");
+        }
+
+        let mut file = fs::File::open(&physical)
+            .with_context(|| format!("failed to open gallery download asset: {url}"))?;
+        let (bytes_read, sha256) = copy_with_sha256(&mut file, &mut io::sink())
+            .with_context(|| format!("failed to hash gallery download asset: {url}"))?;
+        if bytes_read != metadata.len() {
+            bail!("gallery download asset changed while it was hashed: {url}");
+        }
+        if sha256 != stem {
+            bail!("gallery download asset SHA-256 does not match its manifest path: {url}");
+        }
+        let source = state
+            .photos
+            .values()
+            .find(|entry| entry.sha256 == sha256)
+            .with_context(|| {
+                format!("gallery download does not match any PublisherState source: {url}")
+            })?;
+        if metadata.len() != source.bytes {
+            bail!("gallery download asset size does not match PublisherState: {url}");
+        }
+
+        objects.push(DesiredStorageObject::new(
+            key,
+            source_path,
+            sha256,
+            metadata.len(),
+            Some("image/jpeg".to_owned()),
+        )?);
+    }
+    Ok(objects)
 }
 
 /// Deterministic fingerprint of all non-secret publication configuration.
@@ -442,6 +630,7 @@ mod tests {
         ApplicationBundle, HostingPublicationConfig, IntegrationLedger, PublicBaseUrl,
         StorageObject,
     };
+    use photo_publisher_core::{state_from, SourcePhoto};
     use photo_publisher_pipeline::journal::JournalRecord;
     use tempfile::tempdir;
 
@@ -487,6 +676,7 @@ mod tests {
             .insert_storage_object(
                 DesiredStorageObject::new(
                     ObjectKey::new("originals/a.jpg").unwrap(),
+                    PublicationPath::new("photos/download/a.jpg").unwrap(),
                     digest("a"),
                     1,
                     Some("image/jpeg".to_owned()),
@@ -784,5 +974,390 @@ mod tests {
         assert_eq!(known.storage_objects().count(), 1);
         assert_eq!(known.repository_files().count(), 1);
         assert_eq!(known.hosting.unwrap().status, OperationState::Unknown);
+    }
+
+    const ASSET_BYTES: &[u8] = b"committed download bytes";
+
+    fn download_url(sha: &str) -> String {
+        format!("photos/download/{sha}.jpg")
+    }
+
+    fn bundle() -> ApplicationBundle {
+        ApplicationBundle::from_files(vec![("index.html".to_owned(), b"index".to_vec())]).unwrap()
+    }
+
+    fn gallery_manifest(urls: &[&str]) -> Value {
+        json!({
+            "schemaVersion": 1,
+            "gallery": {"id": "gallery-local", "title": "Title"},
+            "photos": urls
+                .iter()
+                .enumerate()
+                .map(|(index, url)| json!({
+                    "id": format!("photo-{}", index + 1),
+                    "filename": "a.jpg",
+                    "sequence": index + 1,
+                    "preview": {"url": "photos/preview/x.jpg", "width": 1, "height": 1},
+                    "download": {"url": url, "width": 1, "height": 1}
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    /// Writes a committed publication whose journal, manifest, and state agree
+    /// about the recorded source (`state_sha`, `state_bytes`).
+    fn commit(output: &Path, urls: &[&str], state_sha: &str, state_bytes: u64) {
+        let state = state_from(&[SourcePhoto {
+            relative_path: "a.jpg".to_owned(),
+            bytes: state_bytes,
+            sha256: state_sha.to_owned(),
+        }]);
+        let gallery_path = output.join("gallery.json");
+        let state_path = output.join(".publisher/state.json");
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        fs::write(
+            &gallery_path,
+            serde_json::to_vec_pretty(&gallery_manifest(urls)).unwrap(),
+        )
+        .unwrap();
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let journal = JournalRecord::new(
+            1,
+            "g-000001".to_owned(),
+            None,
+            JournalPhase::Committed,
+            sha256_file(&gallery_path).unwrap(),
+            sha256_file(&state_path).unwrap(),
+            ".publisher/staging/g-000001".to_owned(),
+            ".publisher/backups/none".to_owned(),
+            None,
+            None,
+        );
+        fs::write(
+            output.join(".publisher/journal.json"),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_asset(output: &Path, url: &str, bytes: &[u8]) {
+        let path = output.join(url);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn committed_output_binds_each_download_to_its_publication_file() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(root.path(), &url, ASSET_BYTES);
+
+        let desired =
+            DesiredPublication::from_committed_output(&configuration(), root.path(), &bundle())
+                .unwrap();
+        let objects: Vec<_> = desired.storage_objects().collect();
+        assert_eq!(objects.len(), 1);
+        let object = objects[0];
+        assert_eq!(object.source_path.as_str(), url);
+        assert_eq!(object.key.as_str(), format!("originals/{url}"));
+        assert_eq!(object.sha256, sha);
+        assert_eq!(object.size_bytes, ASSET_BYTES.len() as u64);
+        assert_eq!(object.content_type, Some("image/jpeg".to_owned()));
+    }
+
+    #[test]
+    fn empty_prefix_uses_the_manifest_url_as_the_object_key() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(root.path(), &url, ASSET_BYTES);
+
+        let mut without_prefix = configuration();
+        without_prefix.high_resolution_prefix = None;
+        let desired =
+            DesiredPublication::from_committed_output(&without_prefix, root.path(), &bundle())
+                .unwrap();
+        let object = desired.storage_objects().next().unwrap();
+        assert_eq!(object.key.as_str(), url);
+        assert!(!object.key.as_str().contains("//"));
+
+        let mut trailing = configuration();
+        trailing.high_resolution_prefix = Some("originals/".to_owned());
+        let desired =
+            DesiredPublication::from_committed_output(&trailing, root.path(), &bundle()).unwrap();
+        let object = desired.storage_objects().next().unwrap();
+        assert_eq!(object.key.as_str(), format!("originals/{url}"));
+    }
+
+    #[test]
+    fn missing_download_file_fails_the_binding() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+
+        assert!(DesiredPublication::from_committed_output(
+            &configuration(),
+            root.path(),
+            &bundle()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn download_hash_mismatch_fails_the_binding() {
+        let root = tempdir().unwrap();
+        let declared = sha256_bytes(b"declared source");
+        let url = download_url(&declared);
+        let content = b"different bytes";
+        commit(root.path(), &[&url], &declared, content.len() as u64);
+        write_asset(root.path(), &url, content);
+
+        assert!(DesiredPublication::from_committed_output(
+            &configuration(),
+            root.path(),
+            &bundle()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn download_size_mismatch_fails_the_binding() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64 + 1);
+        write_asset(root.path(), &url, ASSET_BYTES);
+
+        assert!(DesiredPublication::from_committed_output(
+            &configuration(),
+            root.path(),
+            &bundle()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn download_absent_from_publisher_state_fails_the_binding() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(
+            root.path(),
+            &[&url],
+            &sha256_bytes(b"another source"),
+            ASSET_BYTES.len() as u64,
+        );
+        write_asset(root.path(), &url, ASSET_BYTES);
+
+        assert!(DesiredPublication::from_committed_output(
+            &configuration(),
+            root.path(),
+            &bundle()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn publication_path_contract_rejects_absolute_urls_and_escapes() {
+        for value in [
+            "C:/Fotos/a.jpg",
+            "C:\\Fotos\\a.jpg",
+            "/photos/download/a.jpg",
+            "https://example.com/a.jpg",
+            "photos/../outside/a.jpg",
+            "photos\\download\\a.jpg",
+            "photos/download//a.jpg",
+            "photos/../download/a.jpg",
+            "outside/photos/download/a.jpg",
+            "photos",
+            "//server/share/a.jpg",
+            "..",
+            "photos/download/..jpg",
+        ] {
+            assert!(PublicationPath::new(value).is_err(), "accepted {value}");
+        }
+        for value in [
+            "photos/download/abc123.jpg",
+            "photos/download/1234567890abcdef.jpg",
+        ] {
+            assert!(PublicationPath::new(value).is_ok(), "rejected {value}");
+        }
+    }
+
+    #[test]
+    fn absolute_escaping_and_backslashed_manifest_urls_fail_the_binding() {
+        for url in [
+            "https://example.com/a.jpg",
+            "C:/Fotos/a.jpg",
+            "/photos/download/a.jpg",
+            "photos/../outside/a.jpg",
+            "photos\\download\\a.jpg",
+            "photos/download//a.jpg",
+        ] {
+            let root = tempdir().unwrap();
+            let sha = sha256_bytes(ASSET_BYTES);
+            commit(root.path(), &[url], &sha, ASSET_BYTES.len() as u64);
+            assert!(
+                DesiredPublication::from_committed_output(&configuration(), root.path(), &bundle())
+                    .is_err(),
+                "accepted {url}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let output = root.path().join("output");
+        let outside = root.path().join("outside.jpg");
+        fs::write(&outside, ASSET_BYTES).unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(&output, &[&url], &sha, ASSET_BYTES.len() as u64);
+        let asset = output.join(&url);
+        fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        symlink(&outside, &asset).unwrap();
+
+        assert!(
+            DesiredPublication::from_committed_output(&configuration(), &output, &bundle())
+                .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn symlink_escape_is_rejected_on_windows() {
+        use std::os::windows::fs::symlink_file;
+
+        let root = tempdir().unwrap();
+        let output = root.path().join("output");
+        let outside = root.path().join("outside.jpg");
+        fs::write(&outside, ASSET_BYTES).unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(&output, &[&url], &sha, ASSET_BYTES.len() as u64);
+        let asset = output.join(&url);
+        fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        if symlink_file(&outside, &asset).is_err() {
+            // Creating symbolic links requires a privilege that may be
+            // disabled on this machine; the canonicalization guard itself is
+            // unconditional in the builder and is exercised on unix.
+            return;
+        }
+
+        assert!(
+            DesiredPublication::from_committed_output(&configuration(), &output, &bundle())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_object_keys_fail_the_binding() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(
+            root.path(),
+            &[url.as_str(), url.as_str()],
+            &sha,
+            ASSET_BYTES.len() as u64,
+        );
+        write_asset(root.path(), &url, ASSET_BYTES);
+
+        assert!(DesiredPublication::from_committed_output(
+            &configuration(),
+            root.path(),
+            &bundle()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn from_committed_output_is_deterministic() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(root.path(), &url, ASSET_BYTES);
+
+        let first =
+            DesiredPublication::from_committed_output(&configuration(), root.path(), &bundle())
+                .unwrap();
+        let second =
+            DesiredPublication::from_committed_output(&configuration(), root.path(), &bundle())
+                .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn confirmed_inventory_keeps_bound_objects_out_of_the_plan() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(root.path(), &url, ASSET_BYTES);
+        let desired =
+            DesiredPublication::from_committed_output(&configuration(), root.path(), &bundle())
+                .unwrap();
+
+        let mut ledger = IntegrationLedger::new(
+            desired.configuration_fingerprint.clone(),
+            desired.local.generation.clone(),
+            desired.local.state_hash.clone(),
+            desired.local.manifest_hash.clone(),
+        )
+        .unwrap();
+        for object in desired.storage_objects() {
+            ledger
+                .record_r2_object(
+                    &object.key,
+                    &StorageObject {
+                        key: object.key.clone(),
+                        size_bytes: object.size_bytes,
+                        sha256: object.sha256.clone(),
+                        content_type: object.content_type.clone(),
+                    },
+                    OperationState::Confirmed,
+                )
+                .unwrap();
+        }
+        let known = KnownRemoteState::from_ledger(&ledger).unwrap();
+        let plan = plan_reconciliation(&desired, &known).unwrap();
+        assert!(!plan
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, IntegrationOperation::PutStorage(_))));
+    }
+
+    #[test]
+    fn planned_high_resolution_puts_use_image_jpeg() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(root.path(), &url, ASSET_BYTES);
+        let desired =
+            DesiredPublication::from_committed_output(&configuration(), root.path(), &bundle())
+                .unwrap();
+
+        let plan = plan_reconciliation(&desired, &known(&desired)).unwrap();
+        let puts: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                IntegrationOperation::PutStorage(object) => Some(object),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].content_type, Some("image/jpeg".to_owned()));
+        assert_eq!(puts[0].source_path.as_str(), url);
     }
 }

@@ -22,7 +22,7 @@ pub mod planner;
 pub use planner::{
     plan_reconciliation, publication_configuration_fingerprint, DesiredPublication,
     DesiredRepositoryFile, DesiredStorageObject, IntegrationOperation, IntegrationPlan,
-    KnownRemoteState, LocalPublication, ReconciliationRequirement,
+    KnownRemoteState, LocalPublication, PublicationPath, ReconciliationRequirement,
 };
 
 pub const INTEGRATION_LEDGER_SCHEMA_VERSION: u32 = 1;
@@ -882,5 +882,40 @@ mod tests {
             .record_vercel(digest("bundle"), OperationState::Confirmed, None, None)
             .is_err());
         assert!(ledger.validate().is_ok());
+    }
+
+    #[test]
+    fn ledger_stays_schema_v1_without_storage_source_binding() {
+        let key = ObjectKey::new("originals/photos/download/a.jpg").unwrap();
+        let mut ledger = IntegrationLedger::new(
+            digest("config"),
+            "g-000001".to_owned(),
+            digest("state"),
+            digest("manifest"),
+        )
+        .unwrap();
+        ledger
+            .record_r2_object(
+                &key,
+                &StorageObject {
+                    key: key.clone(),
+                    size_bytes: 3,
+                    sha256: digest("jpg"),
+                    content_type: Some("image/jpeg".to_owned()),
+                },
+                OperationState::Confirmed,
+            )
+            .unwrap();
+
+        let text = serde_json::to_string(&ledger).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert!(!text.contains("source_path"));
+        assert!(!text.contains("sourcePath"));
+        assert!(!text.contains("PublicationPath"));
+        assert_eq!(
+            value["r2Inventory"]["originals/photos/download/a.jpg"]["sha256"],
+            digest("jpg")
+        );
     }
 }
