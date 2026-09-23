@@ -16,6 +16,36 @@ fn valid_project_is_accepted() {
 }
 
 #[test]
+fn valid_project_v2_is_accepted_with_or_without_team_id() {
+    let r = root();
+    for fixture in ["project.v2.valid.json", "project.v2.without-team.json"] {
+        validate(
+            r.join("schemas/project.schema.json"),
+            r.join("fixtures/valid").join(fixture),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn v2_requires_integrated_publication_fields() {
+    let r = root();
+    for fixture in [
+        "project.v2.missing-bundle-path.json",
+        "project.v2.missing-account-id.json",
+        "project.v2.missing-bucket.json",
+        "project.v2.missing-hosting-project.json",
+        "project.v2.extra-property.json",
+    ] {
+        assert!(validate(
+            r.join("schemas/project.schema.json"),
+            r.join("fixtures/invalid").join(fixture),
+        )
+        .is_err());
+    }
+}
+
+#[test]
 fn valid_gallery_is_accepted() {
     let r = root();
     validate(

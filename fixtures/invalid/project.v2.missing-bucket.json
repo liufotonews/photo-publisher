@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "project": { "id": "example-2026", "name": "Example" },
+  "gallery": { "template": "editorial-v1", "title": "Example", "bundlePath": "gallery-app" },
+  "repository": { "provider": "github", "repository": "owner/example" },
+  "hosting": { "provider": "vercel", "project": "example-2026" },
+  "storage": {
+    "preview": { "provider": "github", "publicBaseUrl": "https://cdn.example.com/photos" },
+    "highResolution": { "provider": "r2", "accountId": "account", "publicBaseUrl": "https://downloads.example.com/files" }
+  }
+}

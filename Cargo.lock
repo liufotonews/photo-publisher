@@ -2274,6 +2274,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "photo-publisher-integration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "photo-publisher-contract-validator",
+ "photo-publisher-provider-contracts",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "url",
+]
+
+[[package]]
 name = "photo-publisher-pipeline"
 version = "0.1.0"
 dependencies = [

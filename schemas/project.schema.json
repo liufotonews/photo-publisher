@@ -16,7 +16,7 @@
   "properties": {
     "schemaVersion": {
       "type": "integer",
-      "const": 1
+      "enum": [1, 2]
     },
     "project": {
       "type": "object",
@@ -60,6 +60,11 @@
         "description": {
           "type": "string",
           "maxLength": 5000
+        },
+        "bundlePath": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
         }
       }
     },
@@ -113,6 +118,11 @@
         "project": {
           "type": "string",
           "maxLength": 500
+        },
+        "teamId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
         }
       }
     },
@@ -155,8 +165,49 @@
         "prefix": {
           "type": "string",
           "maxLength": 1000
+        },
+        "accountId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "publicBaseUrl": {
+          "type": "string",
+          "format": "uri",
+          "minLength": 1,
+          "maxLength": 2000
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "schemaVersion": { "const": 2 }
+        },
+        "required": ["schemaVersion"]
+      },
+      "then": {
+        "properties": {
+          "gallery": {
+            "required": ["bundlePath"]
+          },
+          "hosting": {
+            "required": ["project"]
+          },
+          "storage": {
+            "properties": {
+              "preview": {
+                "required": ["publicBaseUrl"]
+              },
+              "highResolution": {
+                "required": ["accountId", "bucket", "publicBaseUrl"]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

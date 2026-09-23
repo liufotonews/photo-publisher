@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 2,
+  "project": { "id": "joao-maria-2026", "name": "João & Maria" },
+  "gallery": {
+    "template": "editorial-v1",
+    "title": "João & Maria",
+    "description": "Galeria de entrega.",
+    "bundlePath": "gallery-app"
+  },
+  "repository": {
+    "provider": "github",
+    "repository": "fotografo/joao-maria-2026",
+    "branch": "main"
+  },
+  "hosting": {
+    "provider": "vercel",
+    "project": "joao-maria-2026",
+    "teamId": "team_example"
+  },
+  "storage": {
+    "preview": {
+      "provider": "github",
+      "prefix": "public/photos",
+      "publicBaseUrl": "https://cdn.example.com/previews/"
+    },
+    "highResolution": {
+      "provider": "r2",
+      "accountId": "account-example",
+      "bucket": "fotografia",
+      "prefix": "joao-maria-2026",
+      "publicBaseUrl": "https://downloads.example.com/joao-maria-2026/"
+    }
+  }
+}

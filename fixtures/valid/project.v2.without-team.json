@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 2,
+  "project": { "id": "sem-time-2026", "name": "Sem time" },
+  "gallery": { "template": "editorial-v1", "title": "Sem time", "bundlePath": "site" },
+  "repository": { "provider": "github", "repository": "fotografo/sem-time" },
+  "hosting": { "provider": "vercel", "project": "sem-time-2026" },
+  "storage": {
+    "preview": { "provider": "github", "publicBaseUrl": "https://cdn.example.com/previews" },
+    "highResolution": {
+      "provider": "r2",
+      "accountId": "account-example",
+      "bucket": "fotografia",
+      "publicBaseUrl": "https://downloads.example.com/files"
+    }
+  }
+}
