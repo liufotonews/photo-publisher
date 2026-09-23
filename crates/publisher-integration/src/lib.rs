@@ -1,5 +1,5 @@
 //! Provider-neutral contracts, durable state, reconciliation planning, and
-//! storage execution for the integration layer.
+//! storage and repository execution for the integration layer.
 //!
 //! This crate deliberately contains no concrete provider implementation.
 
@@ -20,6 +20,7 @@ use url::{Host, Url};
 
 pub mod executor;
 pub mod planner;
+pub mod repository;
 
 pub use executor::{StorageExecutionError, StorageExecutionReport, StorageExecutor};
 pub use planner::{
@@ -27,6 +28,7 @@ pub use planner::{
     DesiredRepositoryFile, DesiredStorageObject, IntegrationOperation, IntegrationPlan,
     KnownRemoteState, LocalPublication, PublicationPath, ReconciliationRequirement,
 };
+pub use repository::{RepositoryExecutionError, RepositoryExecutionReport, RepositoryExecutor};
 
 pub const INTEGRATION_LEDGER_SCHEMA_VERSION: u32 = 1;
 
@@ -523,6 +525,22 @@ impl IntegrationLedger {
                 status,
             },
         );
+        next.refresh_integrity()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Removes a GitHub inventory entry after a confirmed remote deletion.
+    ///
+    /// The absence of a path means the file is no longer known to exist; no
+    /// tombstone is kept. Removing a path that is not recorded is an error so
+    /// callers cannot silently lose track of remote state.
+    pub fn remove_github_file(&mut self, path: &RepositoryPath) -> Result<()> {
+        if !self.github_inventory.contains_key(path.as_str()) {
+            bail!("GitHub inventory does not contain path: {}", path.as_str());
+        }
+        let mut next = self.clone();
+        next.github_inventory.remove(path.as_str());
         next.refresh_integrity()?;
         *self = next;
         Ok(())
