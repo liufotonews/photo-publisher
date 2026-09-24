@@ -18,11 +18,13 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use url::{Host, Url};
 
+pub mod coordinator;
 pub mod executor;
 pub mod hosting;
 pub mod planner;
 pub mod repository;
 
+pub use coordinator::{CoordinationError, Coordinator, PublicationReport};
 pub use executor::{StorageExecutionError, StorageExecutionReport, StorageExecutor};
 pub use hosting::{HostingExecutionError, HostingExecutionReport, HostingExecutor};
 pub use planner::{
@@ -579,6 +581,33 @@ impl IntegrationLedger {
         }
         let mut next = self.clone();
         next.vercel = None;
+        next.refresh_integrity()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Adopts the identity of a new safe publication in the ledger header.
+    ///
+    /// Only the header fields change; the R2/GitHub inventories and the
+    /// Vercel entry are preserved exactly, because they describe remote
+    /// reality by content and remain valid across generations. Integrity is
+    /// recomputed, so the ledger remains writable and loadable.
+    ///
+    /// Callers must adopt a publication only when the ledger holds no
+    /// `Pending`/`Unknown` entry of a previous, unfinished publication:
+    /// adopting a header must never recontextualize an ambiguous state.
+    pub fn adopt_publication(
+        &mut self,
+        configuration_fingerprint: String,
+        local_generation: String,
+        state_hash: String,
+        manifest_hash: String,
+    ) -> Result<()> {
+        let mut next = self.clone();
+        next.configuration_fingerprint = configuration_fingerprint;
+        next.local_generation = local_generation;
+        next.state_hash = state_hash;
+        next.manifest_hash = manifest_hash;
         next.refresh_integrity()?;
         *self = next;
         Ok(())
