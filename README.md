@@ -12,19 +12,13 @@ cargo run -p photo-publisher-cli -- version
 
 The Windows artifact is `photo-publisher.exe`.
 
-For distribution, place the contract resource beside the executable:
+For distribution, the executable alone is sufficient:
 
 ```text
-Photo Publisher/
-├── photo-publisher.exe
-└── schemas/
-    └── project.schema.json
+photo-publisher.exe
 ```
 
-The CLI resolves this resource relative to the executable, not relative to
-the current working directory or the compilation workspace. In development,
-the resolver may find the same `schemas` directory in an executable's parent
-directory ancestry; a missing resource is an explicit error.
+The contract schemas (`project.schema.json` and `gallery.schema.json`, kept versioned in the `schemas/` directory of this repository) are embedded into the binary at compile time. Nothing needs to be placed beside the executable, and validation never depends on the current working directory, the executable's location, or the workspace layout. Changing a schema is a contract change: it takes effect with the next build of the binary.
 
 ```text
 photo-publisher validate <project.json>

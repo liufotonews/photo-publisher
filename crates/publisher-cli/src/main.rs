@@ -1,5 +1,7 @@
 use anyhow::{bail, Result};
-use photo_publisher_contract_validator::{compile_schema, load_json, validate_value};
+use photo_publisher_contract_validator::{
+    compile_embedded_schema, load_json, validate_value, EmbeddedSchema,
+};
 use photo_publisher_core::{load_state, plan_sync, scan_jpegs, SyncAction};
 use photo_publisher_pipeline::{build_local_gallery, recover_publication, PipelineOptions};
 use serde::Serialize;
@@ -10,7 +12,7 @@ use std::path::{Path, PathBuf};
 mod runtime;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const HELP: &str = "Photo Publisher CLI v1\n\nUSAGE:\n  photo-publisher <command> <project.json> [flags]\n\nCOMMANDS:\n  validate  Validate project.json and required source path\n  publish   Recover if needed, then publish the local gallery\n  recover   Run publication recovery only\n  inspect   Show read-only publication information\n  version   Show the executable version\n\nFLAGS:\n  --silent   Minimize normal output\n  --verbose  Print detailed diagnostics to stderr\n  --dry-run  Calculate publish result without changing publication files\n  --json     Emit a stable JSON result on stdout\n  --help     Show this help\n\nOUTPUT PATH:\n  The current v1 contract has no output field; output defaults to\n  <project.json parent>/output.\n\nDISTRIBUTION:\n  Place schemas/project.schema.json next to the executable.\n";
+const HELP: &str = "Photo Publisher CLI v1\n\nUSAGE:\n  photo-publisher <command> <project.json> [flags]\n\nCOMMANDS:\n  validate  Validate project.json and required source path\n  publish   Recover if needed, then publish the local gallery\n  recover   Run publication recovery only\n  inspect   Show read-only publication information\n  version   Show the executable version\n\nFLAGS:\n  --silent   Minimize normal output\n  --verbose  Print detailed diagnostics to stderr\n  --dry-run  Calculate publish result without changing publication files\n  --json     Emit a stable JSON result on stdout\n  --help     Show this help\n\nOUTPUT PATH:\n  The current v1 contract has no output field; output defaults to\n  <project.json parent>/output.\n\nDISTRIBUTION:\n  Schemas are embedded in the executable; no schema directory is\n  required beside it.\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
@@ -352,9 +354,8 @@ fn load_project(path: &Path) -> CliResult<Value> {
         ));
     }
     let project = load_json(path).map_err(|e| CliError::from_any(ErrorKind::ProjectInvalid, e))?;
-    let schema = schema_path()?;
-    let validator =
-        compile_schema(&schema).map_err(|e| CliError::from_any(ErrorKind::Internal, e))?;
+    let validator = compile_embedded_schema(EmbeddedSchema::Project)
+        .map_err(|e| CliError::from_any(ErrorKind::Internal, e))?;
     validate_value(&validator, &project).map_err(|e| {
         CliError::from_any(
             ErrorKind::ProjectInvalid,
@@ -396,30 +397,6 @@ fn project_info(project_path: &Path, project: &Value) -> ProjectInfo {
         source: project["source"]["path"].as_str().map(str::to_owned),
         output: output_path(project_path).display().to_string(),
     }
-}
-
-fn schema_path() -> CliResult<PathBuf> {
-    let executable = env::current_exe().map_err(|e| CliError::from_any(ErrorKind::Internal, e))?;
-    let mut directory = executable
-        .parent()
-        .ok_or_else(|| CliError::new(ErrorKind::Internal, "executable has no parent directory"))?
-        .to_path_buf();
-    loop {
-        let candidate = directory.join("schemas/project.schema.json");
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-        if !directory.pop() {
-            break;
-        }
-    }
-    Err(CliError::new(
-        ErrorKind::ResourceMissing,
-        format!(
-            "schema resource not found beside executable: {}",
-            executable.display()
-        ),
-    ))
 }
 
 fn command_name(command: Command) -> &'static str {

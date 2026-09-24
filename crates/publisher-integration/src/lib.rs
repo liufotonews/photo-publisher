@@ -9,7 +9,9 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use photo_publisher_contract_validator::{compile_schema, load_json, validate_value};
+use photo_publisher_contract_validator::{
+    compile_embedded_schema, load_json, validate_value, EmbeddedSchema,
+};
 use photo_publisher_provider_contracts::{
     DeploymentInfo, ObjectKey, ProviderError, ProviderResult, RepositoryPath, StorageObject,
 };
@@ -292,9 +294,7 @@ pub struct ProjectPublicationConfig {
 
 pub fn load_project_v2(path: impl AsRef<Path>) -> Result<ProjectPublicationConfig> {
     let path = path.as_ref();
-    let schema_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/project.schema.json");
-    let validator = compile_schema(schema_path)?;
+    let validator = compile_embedded_schema(EmbeddedSchema::Project)?;
     let value = load_json(path)?;
     validate_value(&validator, &value)?;
 

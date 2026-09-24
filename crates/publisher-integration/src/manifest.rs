@@ -21,10 +21,8 @@
 //! normalization, and rejects anything that is not a safe publication
 //! relative path by reusing [`crate::PublicationPath`].
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
-use photo_publisher_contract_validator::{compile_schema, validate_value};
+use photo_publisher_contract_validator::{compile_embedded_schema, validate_value, EmbeddedSchema};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -135,13 +133,10 @@ pub fn compose_application_bundle(
     Ok(ApplicationBundle::from_files(files)?)
 }
 
-/// Validates a derived public manifest against `gallery.schema.json`.
-///
-/// Not part of the pure derivation: this helper reads the schema file.
+/// Validates a derived public manifest against the embedded
+/// `gallery.schema.json` contract.
 pub fn validate_public_gallery_manifest(manifest: &PublicGalleryManifest) -> Result<()> {
-    let schema_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/gallery.schema.json");
-    let validator = compile_schema(schema_path)?;
+    let validator = compile_embedded_schema(EmbeddedSchema::Gallery)?;
     let value: Value = serde_json::from_slice(manifest.bytes())
         .expect("derived manifest was serialized from a JSON value");
     validate_value(&validator, &value)

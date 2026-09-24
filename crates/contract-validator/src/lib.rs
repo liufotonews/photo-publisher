@@ -5,6 +5,40 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+/// The versioned contract documents, embedded at compile time from the files
+/// versioned in `schemas/`.
+///
+/// These embedded copies are the only schema source used by production code:
+/// a distributed executable never consults the filesystem, the current
+/// working directory, its own location, or workspace layout. The versioned
+/// files remain the source of truth; changing a contract requires a rebuild,
+/// which is intentional: the binary then validates exactly the contract it
+/// was built for.
+const PROJECT_SCHEMA_JSON: &str = include_str!("../../../schemas/project.schema.json");
+const GALLERY_SCHEMA_JSON: &str = include_str!("../../../schemas/gallery.schema.json");
+
+/// A contract document embedded in the binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddedSchema {
+    /// `schemas/project.schema.json`
+    Project,
+    /// `schemas/gallery.schema.json`
+    Gallery,
+}
+
+/// Compiles an embedded contract document. Uses exactly the same draft and
+/// build logic as the path-based loader, so embedded and file compilation
+/// converge to the same validator construction.
+pub fn compile_embedded_schema(schema: EmbeddedSchema) -> Result<Validator> {
+    let document = match schema {
+        EmbeddedSchema::Project => PROJECT_SCHEMA_JSON,
+        EmbeddedSchema::Gallery => GALLERY_SCHEMA_JSON,
+    };
+    let value: Value =
+        serde_json::from_str(document).context("embedded schema is not valid JSON")?;
+    compile_schema_json(&value)
+}
+
 pub fn load_json(path: impl AsRef<Path>) -> Result<Value> {
     let path = path.as_ref();
     let text =
@@ -14,11 +48,16 @@ pub fn load_json(path: impl AsRef<Path>) -> Result<Value> {
 
 pub fn compile_schema(schema_path: impl AsRef<Path>) -> Result<Validator> {
     let schema = load_json(schema_path)?;
-    let validator = jsonschema::options()
+    compile_schema_json(&schema)
+}
+
+/// Single shared validator construction: Draft 2020-12, same options for
+/// file-loaded and embedded schemas.
+fn compile_schema_json(schema: &Value) -> Result<Validator> {
+    jsonschema::options()
         .with_draft(Draft::Draft202012)
-        .build(&schema)
-        .context("failed to compile JSON Schema")?;
-    Ok(validator)
+        .build(schema)
+        .context("failed to compile JSON Schema")
 }
 
 pub fn validate(schema_path: impl AsRef<Path>, document_path: impl AsRef<Path>) -> Result<()> {

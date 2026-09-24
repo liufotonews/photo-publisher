@@ -9,7 +9,7 @@ use journal::{
     classify_active, read_journal, replace_file_preserving_old, sha256_file, update_journal,
     ActiveStatus, ArtifactRecord, JournalPhase, JournalRecord,
 };
-use photo_publisher_contract_validator::{compile_schema, validate_value};
+use photo_publisher_contract_validator::{compile_embedded_schema, validate_value, EmbeddedSchema};
 use photo_publisher_core::{load_state, plan_sync, scan_jpegs, state_from, SyncAction};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -425,9 +425,7 @@ fn publish_staged(
 }
 
 fn validate_gallery(value: &Value) -> Result<()> {
-    let schema_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/gallery.schema.json");
-    let validator = compile_schema(schema_path)?;
+    let validator = compile_embedded_schema(EmbeddedSchema::Gallery)?;
     validate_value(&validator, value)
 }
 

@@ -230,35 +230,55 @@ fn inspect_rejects_corrupt_journal_and_state() {
     assert_eq!(body["error"]["category"], "validation");
 }
 
+/// Distribution hardening: the contract documents are embedded in the
+/// executable. A bare copy of photo-publisher.exe, with no adjacent schemas/
+/// directory, running from an unrelated working directory, on paths with
+/// spaces and Unicode, validates and publishes exactly like the workspace
+/// build.
 #[test]
-fn distributed_executable_uses_adjacent_schema_and_reports_missing_schema() {
+fn distributed_executable_needs_no_adjacent_schema() {
     let root = tempdir().unwrap();
-    let source = root.path().join("source");
+    let project_dir = root.path().join("Galeria João & Maria");
+    let source = project_dir.join("source");
     fs::create_dir_all(&source).unwrap();
-    let project_path = project(root.path(), &source);
-    let dist = root.path().join("dist");
-    fs::create_dir_all(dist.join("schemas")).unwrap();
+    write_jpeg(&source.join("a.jpg"), 1);
+    let project_path = project(&project_dir, &source);
+
+    // Only the executable is distributed; no schemas/ directory exists
+    // beside it, and the process runs from a different working directory.
+    let dist = root.path().join("dist binário");
+    fs::create_dir_all(&dist).unwrap();
     let exe = dist.join("photo-publisher.exe");
     fs::copy(cli(), &exe).unwrap();
-    fs::copy(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/project.schema.json"),
-        dist.join("schemas/project.schema.json"),
-    )
-    .unwrap();
-    let with_schema = Command::new(&exe)
-        .current_dir(root.path())
-        .args(["validate", project_path.to_str().unwrap(), "--json"])
-        .output()
-        .unwrap();
-    assert!(with_schema.status.success());
+    assert!(!dist.join("schemas").exists());
 
-    fs::remove_file(dist.join("schemas/project.schema.json")).unwrap();
-    let without_schema = Command::new(&exe)
-        .current_dir(root.path())
+    let elsewhere = root.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+
+    let validate = Command::new(&exe)
+        .current_dir(&elsewhere)
         .args(["validate", project_path.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
-    assert_eq!(without_schema.status.code(), Some(4));
-    let body: serde_json::Value = serde_json::from_slice(&without_schema.stdout).unwrap();
-    assert_eq!(body["error"]["category"], "resource_missing");
+    assert!(
+        validate.status.success(),
+        "validate failed without adjacent schemas: {}",
+        String::from_utf8_lossy(&validate.stdout)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&validate.stdout).unwrap();
+    assert_eq!(body["ok"], true);
+
+    // The local publication path validates gallery.json against the embedded
+    // contract as well; it must not depend on the workspace layout.
+    let publish = Command::new(&exe)
+        .current_dir(&elsewhere)
+        .args(["publish", project_path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        publish.status.success(),
+        "publish failed without adjacent schemas: {}",
+        String::from_utf8_lossy(&publish.stdout)
+    );
+    assert!(project_dir.join("output/gallery.json").is_file());
 }
