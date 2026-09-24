@@ -25,6 +25,8 @@ pub mod manifest;
 pub mod planner;
 pub mod repository;
 
+pub(crate) mod file_source;
+
 pub use coordinator::{CoordinationError, Coordinator, PublicationReport};
 pub use executor::{StorageExecutionError, StorageExecutionReport, StorageExecutor};
 pub use hosting::{HostingExecutionError, HostingExecutionReport, HostingExecutor};
@@ -35,6 +37,7 @@ pub use planner::{
     plan_reconciliation, publication_configuration_fingerprint, DesiredPublication,
     DesiredRepositoryFile, DesiredStorageObject, IntegrationOperation, IntegrationPlan,
     KnownRemoteState, LocalPublication, PublicationPath, ReconciliationRequirement,
+    RepositoryFileSource,
 };
 pub use repository::{RepositoryExecutionError, RepositoryExecutionReport, RepositoryExecutor};
 

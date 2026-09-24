@@ -249,7 +249,9 @@ impl<'a> Coordinator<'a> {
                 &mut *self.repository,
                 &mut *self.ledger,
                 &self.ledger_path,
+                &self.output_dir,
             )
+            .map_err(CoordinationError::Repository)?
             .execute(plan, bundle)
             .map_err(CoordinationError::Repository)?;
             report.repository = Some(repository);
@@ -336,6 +338,8 @@ mod tests {
     use std::io::Read;
     use std::rc::Rc;
 
+    use photo_publisher_core::{state_from, SourcePhoto};
+    use photo_publisher_pipeline::journal::{sha256_file, JournalPhase, JournalRecord};
     use photo_publisher_provider_contracts::{
         CommitInfo, DeploymentInfo, FileMetadata, ObjectKey, ProviderError, ProviderResult,
         RepositoryPath, StorageObject,
@@ -343,7 +347,10 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::{tempdir, TempDir};
 
-    use crate::{DesiredRepositoryFile, DesiredStorageObject, LocalPublication, PublicationPath};
+    use crate::{
+        plan_reconciliation, DesiredRepositoryFile, DesiredStorageObject, LocalPublication,
+        PublicationPath, RepositoryFileSource,
+    };
 
     fn digest(value: &str) -> String {
         format!("{:x}", Sha256::digest(value.as_bytes()))
@@ -829,6 +836,8 @@ mod tests {
                     DesiredRepositoryFile::new(
                         RepositoryPath::new("index.html").unwrap(),
                         sha256_bytes(b"index"),
+                        5,
+                        RepositoryFileSource::BundleMember,
                     )
                     .unwrap(),
                 ),
@@ -1047,6 +1056,8 @@ mod tests {
                     DesiredRepositoryFile::new(
                         RepositoryPath::new("index.html").unwrap(),
                         sha256_bytes(b"index"),
+                        5,
+                        RepositoryFileSource::BundleMember,
                     )
                     .unwrap(),
                 ),
@@ -1397,6 +1408,8 @@ mod tests {
                 DesiredRepositoryFile::new(
                     RepositoryPath::new("index.html").unwrap(),
                     sha256_bytes(b"index"),
+                    5,
+                    RepositoryFileSource::BundleMember,
                 )
                 .unwrap(),
             )],
@@ -1503,6 +1516,8 @@ mod tests {
                     DesiredRepositoryFile::new(
                         RepositoryPath::new("index.html").unwrap(),
                         sha256_bytes(b"index"),
+                        5,
+                        RepositoryFileSource::BundleMember,
                     )
                     .unwrap(),
                 ),
@@ -1527,5 +1542,253 @@ mod tests {
 
         assert_eq!(*log.borrow(), vec!["repository", "hosting"]);
         assert!(providers.storage.objects.is_empty());
+    }
+
+    /// Writes a journal-committed publication into `output`: N sources with
+    /// byte-exact download assets and distinct re-encoded preview bytes,
+    /// exactly as the real pipeline produces.
+    fn commit_publication(output: &std::path::Path, generation: &str, sources: &[(&str, &[u8])]) {
+        let preview_url = |sha: &str| format!("photos/preview/{sha}.jpg");
+        let download_url = |sha: &str| format!("photos/download/{sha}.jpg");
+        let photos: Vec<serde_json::Value> = sources
+            .iter()
+            .enumerate()
+            .map(|(index, (sha, _bytes))| {
+                serde_json::json!({
+                    "id": format!("photo-{}", index + 1),
+                    "filename": format!("{index}.jpg"),
+                    "sequence": index + 1,
+                    "preview": {"url": preview_url(sha), "width": 1, "height": 1},
+                    "download": {"url": download_url(sha), "width": 1, "height": 1}
+                })
+            })
+            .collect();
+        let gallery = serde_json::json!({
+            "schemaVersion": 1,
+            "gallery": {"id": "gallery-local", "title": "Title"},
+            "photos": photos
+        });
+        let state = state_from(
+            &sources
+                .iter()
+                .enumerate()
+                .map(|(index, (sha, bytes))| SourcePhoto {
+                    relative_path: format!("{index}.jpg"),
+                    bytes: bytes.len() as u64,
+                    sha256: (*sha).to_owned(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let gallery_path = output.join("gallery.json");
+        let state_path = output.join(".publisher/state.json");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(output.join("photos/download")).unwrap();
+        std::fs::create_dir_all(output.join("photos/preview")).unwrap();
+        std::fs::write(&gallery_path, serde_json::to_vec_pretty(&gallery).unwrap()).unwrap();
+        std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        for (sha, bytes) in sources {
+            std::fs::write(output.join(download_url(sha)), bytes).unwrap();
+            std::fs::write(
+                output.join(preview_url(sha)),
+                format!("committed preview bytes {sha}"),
+            )
+            .unwrap();
+        }
+        let journal = JournalRecord::new(
+            1,
+            generation.to_owned(),
+            None,
+            JournalPhase::Committed,
+            sha256_file(&gallery_path).unwrap(),
+            sha256_file(&state_path).unwrap(),
+            ".publisher/staging/g-x".to_owned(),
+            ".publisher/backups/none".to_owned(),
+            None,
+            None,
+        );
+        std::fs::write(
+            output.join(".publisher/journal.json"),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn end_to_end_g1_to_g2_executes_previews_and_stays_idempotent() {
+        let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+        let mut providers = Providers::new(&log);
+        let template = bundle_of(&[("index.html", b"index")]);
+        let config = configuration();
+        providers.hosting.results.push_back(Ok(DeploymentInfo {
+            id: "dpl-1".to_owned(),
+            url: "g1.vercel.app".to_owned(),
+        }));
+        providers.hosting.results.push_back(Ok(DeploymentInfo {
+            id: "dpl-2".to_owned(),
+            url: "g2.vercel.app".to_owned(),
+        }));
+
+        // G1: A and B published end to end.
+        let fixture_g1 = Fixture::new();
+        let sha_a = digest("source-a");
+        let sha_b = digest("source-b");
+        commit_publication(
+            &fixture_g1.output,
+            "g-000001",
+            &[(&sha_a, b"source-a"), (&sha_b, b"source-b")],
+        );
+        let manifest1 =
+            crate::PublicGalleryManifest::derive_from_committed_output(&config, &fixture_g1.output)
+                .unwrap();
+        let bundle1 = crate::compose_application_bundle(&template, &manifest1).unwrap();
+        let desired1 =
+            crate::DesiredPublication::from_committed_output(&config, &fixture_g1.output, &bundle1)
+                .unwrap();
+        let mut ledger = ledger_for(&desired1);
+        let plan = plan_reconciliation(
+            &desired1,
+            &crate::KnownRemoteState::from_ledger(&ledger).unwrap(),
+        )
+        .unwrap();
+        execute(
+            &fixture_g1,
+            &plan,
+            &desired1,
+            &bundle1,
+            &mut providers,
+            &mut ledger,
+        )
+        .unwrap();
+
+        let phases: Vec<&'static str> = {
+            let mut phases = log.borrow().clone();
+            phases.dedup();
+            phases
+        };
+        assert_eq!(phases, vec!["storage", "repository", "hosting"]);
+        // Previews were written to the repository with the exact physical
+        // bytes; downloads went to storage; nothing preview touched storage.
+        for sha in [&sha_a, &sha_b] {
+            assert_eq!(
+                providers.repository.files[format!("previews/photos/preview/{sha}.jpg").as_str()],
+                format!("committed preview bytes {sha}").as_bytes()
+            );
+            assert!(providers
+                .storage
+                .objects
+                .contains_key(format!("originals/photos/download/{sha}.jpg").as_str()));
+        }
+        assert!(!providers
+            .repository
+            .files
+            .keys()
+            .any(|path| path.contains("download")));
+        let vercel = ledger.vercel.clone().unwrap();
+        assert_eq!(vercel.status, OperationState::Confirmed);
+        assert_eq!(vercel.deployment_id.as_deref(), Some("dpl-1"));
+
+        // G2: A stays, C arrives, B leaves.
+        let fixture_g2 = Fixture::new();
+        let sha_c = digest("source-c");
+        commit_publication(
+            &fixture_g2.output,
+            "g-000002",
+            &[(&sha_a, b"source-a"), (&sha_c, b"source-c")],
+        );
+        let manifest2 =
+            crate::PublicGalleryManifest::derive_from_committed_output(&config, &fixture_g2.output)
+                .unwrap();
+        let bundle2 = crate::compose_application_bundle(&template, &manifest2).unwrap();
+        let desired2 =
+            crate::DesiredPublication::from_committed_output(&config, &fixture_g2.output, &bundle2)
+                .unwrap();
+        let plan = plan_reconciliation(
+            &desired2,
+            &crate::KnownRemoteState::from_ledger(&ledger).unwrap(),
+        )
+        .unwrap();
+        // A is never rewritten or re-uploaded; B is removed; C is added.
+        assert!(!plan.operations.iter().any(|operation| matches!(
+            operation,
+            IntegrationOperation::PutStorage(object)
+                if object.key.as_str().contains(&sha_a)
+        )));
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            IntegrationOperation::DeleteStorage { key }
+                if key.as_str() == format!("originals/photos/download/{sha_b}.jpg")
+        )));
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            IntegrationOperation::DeleteRepository { path }
+                if path.as_str() == format!("previews/photos/preview/{sha_b}.jpg")
+        )));
+        execute(
+            &fixture_g2,
+            &plan,
+            &desired2,
+            &bundle2,
+            &mut providers,
+            &mut ledger,
+        )
+        .unwrap();
+
+        let phases: Vec<&'static str> = {
+            let mut phases = log.borrow().clone();
+            phases.dedup();
+            phases
+        };
+        assert_eq!(
+            phases,
+            vec![
+                "storage",
+                "repository",
+                "hosting",
+                "storage",
+                "repository",
+                "hosting"
+            ]
+        );
+        // After G2: previews B are gone, the repository pubilcation set is A+C.
+        assert!(!providers
+            .repository
+            .files
+            .contains_key(format!("previews/photos/preview/{sha_b}.jpg").as_str()));
+        assert!(providers
+            .repository
+            .files
+            .contains_key(format!("previews/photos/preview/{sha_c}.jpg").as_str()));
+        assert!(providers
+            .storage
+            .objects
+            .contains_key(format!("originals/photos/download/{sha_a}.jpg").as_str()));
+        assert!(!providers
+            .storage
+            .objects
+            .contains_key(format!("originals/photos/download/{sha_b}.jpg").as_str()));
+        assert_eq!(
+            ledger.vercel.as_ref().unwrap().deployment_id.as_deref(),
+            Some("dpl-2")
+        );
+
+        // Idempotency: replanning G2 over the executed ledger is empty and
+        // executing it touches nothing.
+        let plan = plan_reconciliation(
+            &desired2,
+            &crate::KnownRemoteState::from_ledger(&ledger).unwrap(),
+        )
+        .unwrap();
+        assert!(plan.operations.is_empty() && plan.reconciliation_requirements.is_empty());
+        let calls_before = log.borrow().len();
+        execute(
+            &fixture_g2,
+            &plan,
+            &desired2,
+            &bundle2,
+            &mut providers,
+            &mut ledger,
+        )
+        .unwrap();
+        assert_eq!(log.borrow().len(), calls_before);
     }
 }

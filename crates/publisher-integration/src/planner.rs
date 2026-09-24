@@ -131,18 +131,44 @@ impl DesiredStorageObject {
     }
 }
 
-/// A repository file that the future executor must make present remotely.
+/// Where the bytes of a desired repository file come from when executed.
+///
+/// The plan stays fully self-describing: repository files either come from
+/// the final application bundle (application/template files plus the public
+/// `gallery.json`) or from a publication-relative physical file validated
+/// against the committed output at planning time and revalidated against it
+/// at execution time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryFileSource {
+    /// Bytes come from the [`ApplicationBundle`] member with the same path.
+    BundleMember,
+    /// Bytes come from `output_dir/<source_path>`; the path is a validated
+    /// publication-relative [`PublicationPath`] (never absolute, never a
+    /// drive path or URL, never with `..` and always with `/` separators).
+    PublicationFile { source_path: PublicationPath },
+}
+
+/// A repository file that the executor must make present remotely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesiredRepositoryFile {
     pub path: RepositoryPath,
     pub sha256: String,
+    pub size_bytes: u64,
+    pub source: RepositoryFileSource,
 }
 
 impl DesiredRepositoryFile {
-    pub fn new(path: RepositoryPath, sha256: impl Into<String>) -> Result<Self> {
+    pub fn new(
+        path: RepositoryPath,
+        sha256: impl Into<String>,
+        size_bytes: u64,
+        source: RepositoryFileSource,
+    ) -> Result<Self> {
         let file = Self {
             path,
             sha256: sha256.into(),
+            size_bytes,
+            source,
         };
         validate_sha256("desired repository file hash", &file.sha256)?;
         Ok(file)
@@ -179,6 +205,8 @@ impl DesiredPublication {
             publication.insert_repository_file(DesiredRepositoryFile::new(
                 file.path().clone(),
                 sha256_bytes(file.content()),
+                file.content().len() as u64,
+                RepositoryFileSource::BundleMember,
             )?)?;
         }
         publication.validate()?;
@@ -488,7 +516,14 @@ fn committed_preview_files(
             bail!("gallery preview asset changed while it was hashed: {url}");
         }
 
-        files.push(DesiredRepositoryFile::new(path, sha256)?);
+        files.push(DesiredRepositoryFile::new(
+            path,
+            sha256,
+            metadata.len(),
+            RepositoryFileSource::PublicationFile {
+                source_path: source_path.clone(),
+            },
+        )?);
     }
     Ok(files)
 }
@@ -1908,5 +1943,37 @@ mod tests {
             .as_str()
             .contains(&format!("photos/download/{sha_c}.jpg")));
         assert!(!manifest2.as_str().contains(&sha_b));
+    }
+
+    #[test]
+    fn bundle_files_are_bundle_members_and_previews_are_publication_files() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(root.path(), &url, ASSET_BYTES);
+
+        let desired =
+            DesiredPublication::from_committed_output(&configuration(), root.path(), &bundle())
+                .unwrap();
+
+        let index = desired
+            .repository_files()
+            .find(|file| file.path.as_str() == "index.html")
+            .unwrap();
+        assert_eq!(index.source, RepositoryFileSource::BundleMember);
+        assert_eq!(index.size_bytes, b"index".len() as u64);
+
+        let preview = desired
+            .repository_files()
+            .find(|file| file.path.as_str().starts_with("previews/"))
+            .unwrap();
+        assert_eq!(
+            preview.source,
+            RepositoryFileSource::PublicationFile {
+                source_path: PublicationPath::new(preview_url(&sha)).unwrap(),
+            }
+        );
+        assert_eq!(preview.size_bytes, preview_bytes(&sha).len() as u64);
     }
 }

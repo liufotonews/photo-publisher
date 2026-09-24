@@ -12,7 +12,8 @@
 //! transactional unit is therefore the whole batch:
 //!
 //! ```text
-//! local validation of every write against the application bundle
+//! local validation of every write against its declared source
+//! (application bundle member or committed publication file)
 //!     -> Pending (base revision) recorded for every path and persisted
 //!     -> staging: write()/delete() in plan order
 //!     -> one commit()
@@ -39,9 +40,11 @@ use photo_publisher_provider_contracts::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::file_source;
 use crate::{
     ApplicationBundle, DesiredRepositoryFile, GitHubInventoryEntry, IntegrationLedger,
     IntegrationOperation, IntegrationPlan, OperationState, ReconciliationRequirement,
+    RepositoryFileSource,
 };
 
 /// Why repository execution failed.
@@ -56,11 +59,14 @@ pub enum RepositoryExecutionError {
     /// executor (or repeats a path inside the batch); no ledger or remote
     /// change was made.
     InconsistentPlan(String),
-    /// Bundle content validation failed before any ledger or remote change.
+    /// Bundle or publication file validation failed before any ledger or
+    /// remote change.
     LocalValidation {
         path: RepositoryPath,
         message: String,
     },
+    /// The publication output directory could not be resolved.
+    InvalidRoot(std::io::Error),
     /// The repository check or the base revision probe failed before any
     /// `Pending` was recorded; nothing was staged and the ledger is
     /// untouched.
@@ -89,6 +95,10 @@ impl fmt::Display for RepositoryExecutionError {
             Self::LocalValidation { path, message } => {
                 write!(formatter, "{}: {message}", path.as_str())
             }
+            Self::InvalidRoot(error) => write!(
+                formatter,
+                "failed to resolve the publication output directory: {error}"
+            ),
             Self::Initialization(message) => write!(formatter, "{message}"),
             Self::Rejected(message) => write!(formatter, "{message}"),
             Self::Ambiguous(message) => write!(formatter, "{message}"),
@@ -105,6 +115,7 @@ impl fmt::Display for RepositoryExecutionError {
 impl std::error::Error for RepositoryExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::InvalidRoot(error) => Some(error),
             Self::Ledger(error) => Some(error.as_ref()),
             _ => None,
         }
@@ -137,18 +148,31 @@ impl RepositoryOp {
     }
 }
 
+/// Validated content of a planned write: borrowed bundle bytes for
+/// application files, or an open and revalidated file handle for
+/// publication assets (the handle is rewound and ready to stream).
+enum Payload<'b> {
+    Bundle(&'b [u8]),
+    File(std::fs::File),
+}
+
 /// Executes the repository operations of an [`IntegrationPlan`] against a
 /// [`RepositoryProvider`], as a single commit batch with a durably persisted
 /// ledger transition before and after the remote work.
 ///
-/// The executor borrows the provider, the ledger, and the ledger's durable
-/// path. The bytes of every write come from the [`ApplicationBundle`] given
-/// to [`execute`](Self::execute), re-validated against the desired SHA-256
-/// before any ledger or remote change.
+/// The executor borrows the provider, the ledger, the ledger's durable path,
+/// and the committed publication's output directory. The bytes of every write
+/// come from its declared source: the [`ApplicationBundle`] for
+/// `BundleMember` application files, or a revalidated physical file under
+/// `output_dir` for `PublicationFile` assets (previews). Every write is
+/// re-validated against its desired SHA-256 and size before any ledger or
+/// remote change.
 pub struct RepositoryExecutor<'a> {
     provider: &'a mut dyn RepositoryProvider,
     ledger: &'a mut IntegrationLedger,
     ledger_path: PathBuf,
+    output_dir: PathBuf,
+    canonical_root: PathBuf,
 }
 
 impl<'a> RepositoryExecutor<'a> {
@@ -156,12 +180,19 @@ impl<'a> RepositoryExecutor<'a> {
         provider: &'a mut dyn RepositoryProvider,
         ledger: &'a mut IntegrationLedger,
         ledger_path: impl AsRef<std::path::Path>,
-    ) -> Self {
-        Self {
+        output_dir: impl AsRef<std::path::Path>,
+    ) -> Result<Self, RepositoryExecutionError> {
+        let output_dir = output_dir.as_ref().to_path_buf();
+        let canonical_root = output_dir
+            .canonicalize()
+            .map_err(RepositoryExecutionError::InvalidRoot)?;
+        Ok(Self {
             provider,
             ledger,
             ledger_path: ledger_path.as_ref().to_path_buf(),
-        }
+            output_dir,
+            canonical_root,
+        })
     }
 
     /// Applies the plan's repository operations in order, as one commit.
@@ -256,32 +287,62 @@ impl<'a> RepositoryExecutor<'a> {
             previous.push(entry.cloned());
         }
 
-        // Validate the full batch against the bundle before any provider
-        // call and before touching the ledger: on invalid content nothing
-        // remote happens and no Pending is ever recorded. No partial staging
-        // is ever started for invalid content.
-        let mut write_payloads: Vec<Option<&[u8]>> = Vec::with_capacity(batch.len());
+        // Validate the full batch before any provider call and before
+        // touching the ledger: on invalid content nothing remote happens and
+        // no Pending is ever recorded. No partial staging is ever started for
+        // invalid content. Each write resolves its bytes through its declared
+        // source: the application bundle for BundleMember, or a physically
+        // revalidated publication file for PublicationFile.
+        let mut write_payloads: Vec<Option<Payload>> = Vec::with_capacity(batch.len());
         for operation in &batch {
             match operation {
-                RepositoryOp::Write(file) => {
-                    let content = bundle_content(bundle, &file.path).ok_or_else(|| {
-                        RepositoryExecutionError::LocalValidation {
-                            path: file.path.clone(),
-                            message: "file is not present in the application bundle".to_owned(),
+                RepositoryOp::Write(file) => match &file.source {
+                    RepositoryFileSource::BundleMember => {
+                        let content = bundle_content(bundle, &file.path).ok_or_else(|| {
+                            RepositoryExecutionError::LocalValidation {
+                                path: file.path.clone(),
+                                message: "file is not present in the application bundle".to_owned(),
+                            }
+                        })?;
+                        let sha256 = sha256_bytes(content);
+                        if sha256 != file.sha256 {
+                            return Err(RepositoryExecutionError::LocalValidation {
+                                path: file.path.clone(),
+                                message: format!(
+                                    "bundle content SHA-256 {sha256} does not match the desired {}",
+                                    file.sha256
+                                ),
+                            });
                         }
-                    })?;
-                    let sha256 = sha256_bytes(content);
-                    if sha256 != file.sha256 {
-                        return Err(RepositoryExecutionError::LocalValidation {
-                            path: file.path.clone(),
-                            message: format!(
-                                "bundle content SHA-256 {sha256} does not match the desired {}",
-                                file.sha256
-                            ),
-                        });
+                        if content.len() as u64 != file.size_bytes {
+                            return Err(RepositoryExecutionError::LocalValidation {
+                                path: file.path.clone(),
+                                message: format!(
+                                    "bundle content size {} does not match the desired {} bytes",
+                                    content.len(),
+                                    file.size_bytes
+                                ),
+                            });
+                        }
+                        write_payloads.push(Some(Payload::Bundle(content)));
                     }
-                    write_payloads.push(Some(content));
-                }
+                    RepositoryFileSource::PublicationFile { source_path } => {
+                        let handle = file_source::open_validated_source(
+                            &self.output_dir,
+                            &self.canonical_root,
+                            source_path,
+                            &file.sha256,
+                            file.size_bytes,
+                        )
+                        .map_err(|error| {
+                            RepositoryExecutionError::LocalValidation {
+                                path: file.path.clone(),
+                                message: format!("invalid publication file: {error:#}"),
+                            }
+                        })?;
+                        write_payloads.push(Some(Payload::File(handle)));
+                    }
+                },
                 RepositoryOp::Delete(_) => write_payloads.push(None),
             }
         }
@@ -330,16 +391,22 @@ impl<'a> RepositoryExecutor<'a> {
         // to the provider. A staging failure proves nothing was published
         // (only commit() publishes), so the previous state is restored.
         let mut staged: Vec<Option<FileMetadata>> = Vec::with_capacity(batch.len());
-        for (operation, content) in batch.iter().zip(&write_payloads) {
+        for (operation, payload) in batch.iter().zip(write_payloads.iter_mut()) {
             match operation {
                 RepositoryOp::Write(file) => {
-                    let content = content.expect("writes were validated above");
-                    let mut reader = Cursor::new(content);
-                    match self.provider.write(&file.path, &mut reader) {
+                    let payload = payload.as_mut().expect("writes were validated above");
+                    let result = match payload {
+                        Payload::Bundle(content) => {
+                            let mut reader = Cursor::new(*content);
+                            self.provider.write(&file.path, &mut reader)
+                        }
+                        Payload::File(handle) => self.provider.write(&file.path, handle),
+                    };
+                    match result {
                         Ok(metadata) => {
                             if metadata.path != file.path
                                 || metadata.sha256 != file.sha256
-                                || metadata.size_bytes != content.len() as u64
+                                || metadata.size_bytes != file.size_bytes
                             {
                                 self.rollback(&batch, &previous)?;
                                 self.persist()?;
@@ -571,6 +638,7 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use crate::plan_reconciliation;
+    use crate::PublicationPath;
 
     const BASE_REVISION: &str = "base-revision";
 
@@ -735,14 +803,21 @@ mod tests {
 
     struct Fixture {
         root: TempDir,
+        output: std::path::PathBuf,
         ledger_path: std::path::PathBuf,
     }
 
     impl Fixture {
         fn new() -> Self {
             let root = tempdir().unwrap();
+            let output = root.path().join("output");
+            std::fs::create_dir_all(&output).unwrap();
             let ledger_path = root.path().join(".publisher/integration-state.json");
-            Self { root, ledger_path }
+            Self {
+                root,
+                output,
+                ledger_path,
+            }
         }
 
         fn durable_ledger(&self) -> IntegrationLedger {
@@ -779,8 +854,13 @@ mod tests {
     }
 
     fn desired_file(path: &str, content: &[u8]) -> DesiredRepositoryFile {
-        DesiredRepositoryFile::new(RepositoryPath::new(path).unwrap(), sha256_bytes(content))
-            .unwrap()
+        DesiredRepositoryFile::new(
+            RepositoryPath::new(path).unwrap(),
+            sha256_bytes(content),
+            content.len() as u64,
+            RepositoryFileSource::BundleMember,
+        )
+        .unwrap()
     }
 
     fn plan(operations: Vec<IntegrationOperation>) -> IntegrationPlan {
@@ -797,7 +877,9 @@ mod tests {
         provider: &mut FakeRepository,
         ledger: &mut IntegrationLedger,
     ) -> Result<RepositoryExecutionReport, RepositoryExecutionError> {
-        RepositoryExecutor::new(provider, ledger, &fixture.ledger_path).execute(plan, bundle)
+        RepositoryExecutor::new(provider, ledger, &fixture.ledger_path, &fixture.output)
+            .unwrap()
+            .execute(plan, bundle)
     }
 
     #[test]
@@ -1723,5 +1805,301 @@ mod tests {
             desired.local.manifest_hash.clone(),
         )
         .unwrap()
+    }
+
+    /// A repository-sourced publication asset: bytes committed physically
+    /// under the publication output, declared with its planned identity.
+    fn publication_file(fixture: &Fixture, name: &str, bytes: &[u8]) -> DesiredRepositoryFile {
+        let relative = format!("photos/preview/{name}.jpg");
+        let physical = fixture.output.join(&relative);
+        std::fs::create_dir_all(physical.parent().unwrap()).unwrap();
+        std::fs::write(&physical, bytes).unwrap();
+        DesiredRepositoryFile::new(
+            RepositoryPath::new(format!("public/{relative}")).unwrap(),
+            sha256_bytes(bytes),
+            bytes.len() as u64,
+            RepositoryFileSource::PublicationFile {
+                source_path: PublicationPath::new(relative).unwrap(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn publication_file_write_is_staged_and_confirmed() {
+        let fixture = Fixture::new();
+        let file = publication_file(&fixture, "a", b"preview-a-bytes");
+        let bundle = bundle(&[("index.html", b"index")]);
+        let mut provider = FakeRepository::new();
+        let mut ledger = empty_ledger();
+
+        let report = execute(
+            &fixture,
+            &plan(vec![IntegrationOperation::WriteRepository(file.clone())]),
+            &bundle,
+            &mut provider,
+            &mut ledger,
+        )
+        .unwrap();
+
+        // The bytes staged remotely are exactly the publication file bytes.
+        assert_eq!(
+            provider.files["public/photos/preview/a.jpg"],
+            b"preview-a-bytes"
+        );
+        assert_eq!(report.written, vec![file.path.clone()]);
+        let entry = &ledger.github_inventory["public/photos/preview/a.jpg"];
+        assert_eq!(entry.status, OperationState::Confirmed);
+        assert_eq!(entry.sha256, file.sha256);
+        assert_eq!(fixture.durable_ledger(), ledger);
+    }
+
+    #[test]
+    fn mixed_bundle_and_publication_files_commit_once() {
+        let fixture = Fixture::new();
+        let preview_a = publication_file(&fixture, "a", b"preview-a");
+        let preview_b = publication_file(&fixture, "b", b"preview-b");
+        let gallery = DesiredRepositoryFile::new(
+            RepositoryPath::new("gallery.json").unwrap(),
+            sha256_bytes(b"{\"photos\":[]}"),
+            13,
+            RepositoryFileSource::BundleMember,
+        )
+        .unwrap();
+        let bundle = bundle(&[
+            ("index.html", b"index".as_slice()),
+            ("gallery.json", b"{\"photos\":[]}".as_slice()),
+        ] as &[(&str, &[u8])]);
+        let mut provider = FakeRepository::new();
+        provider.files.insert("old.txt".to_owned(), b"old".to_vec());
+        let mut ledger = empty_ledger();
+        ledger
+            .record_github_file(
+                &RepositoryPath::new("old.txt").unwrap(),
+                digest("old"),
+                BASE_REVISION.to_owned(),
+                OperationState::Confirmed,
+            )
+            .unwrap();
+
+        execute(
+            &fixture,
+            &plan(vec![
+                IntegrationOperation::WriteRepository(desired_file("index.html", b"index")),
+                IntegrationOperation::WriteRepository(preview_a),
+                IntegrationOperation::WriteRepository(preview_b),
+                IntegrationOperation::WriteRepository(gallery),
+                IntegrationOperation::DeleteRepository {
+                    path: RepositoryPath::new("old.txt").unwrap(),
+                },
+            ]),
+            &bundle,
+            &mut provider,
+            &mut ledger,
+        )
+        .unwrap();
+
+        // One commit covered bundle members, publication files, and deletes.
+        assert_eq!(provider.commit_count(), 1);
+        assert_eq!(provider.files["public/photos/preview/a.jpg"], b"preview-a");
+        assert_eq!(provider.files["public/photos/preview/b.jpg"], b"preview-b");
+        assert_eq!(provider.files["gallery.json"], b"{\"photos\":[]}");
+        assert!(!provider.files.contains_key("old.txt"));
+        assert!(!ledger.github_inventory.contains_key("old.txt"));
+    }
+
+    #[test]
+    fn publication_file_missing_at_execution_fails_locally_without_remote_calls() {
+        let fixture = Fixture::new();
+        let file = publication_file(&fixture, "a", b"preview-a");
+        std::fs::remove_file(fixture.output.join("photos/preview/a.jpg")).unwrap();
+        let bundle = bundle(&[("index.html", b"index")]);
+        let mut provider = FakeRepository::new();
+        let mut ledger = empty_ledger();
+
+        let error = execute(
+            &fixture,
+            &plan(vec![IntegrationOperation::WriteRepository(file)]),
+            &bundle,
+            &mut provider,
+            &mut ledger,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RepositoryExecutionError::LocalValidation { .. }
+        ));
+        assert_eq!(provider.calls, Vec::new());
+        assert!(ledger.github_inventory.is_empty());
+        assert!(!fixture.ledger_path.exists());
+    }
+
+    #[test]
+    fn publication_file_size_or_hash_mismatch_fails_locally_without_remote_calls() {
+        for wrong in ["size", "sha"] {
+            let fixture = Fixture::new();
+            let mut file = publication_file(&fixture, "a", b"preview-a");
+            if wrong == "size" {
+                file.size_bytes += 1;
+            } else {
+                file.sha256 = digest("different content");
+            }
+            let bundle = bundle(&[("index.html", b"index")]);
+            let mut provider = FakeRepository::new();
+            let mut ledger = empty_ledger();
+
+            let error = execute(
+                &fixture,
+                &plan(vec![IntegrationOperation::WriteRepository(file)]),
+                &bundle,
+                &mut provider,
+                &mut ledger,
+            )
+            .unwrap_err();
+
+            assert!(matches!(
+                error,
+                RepositoryExecutionError::LocalValidation { .. }
+            ));
+            assert_eq!(provider.calls, Vec::new());
+            assert!(ledger.github_inventory.is_empty());
+            assert!(!fixture.ledger_path.exists());
+        }
+    }
+
+    #[test]
+    fn non_regular_publication_file_fails_locally_without_remote_calls() {
+        let fixture = Fixture::new();
+        let file = publication_file(&fixture, "a", b"preview-a");
+        let physical = fixture.output.join("photos/preview/a.jpg");
+        std::fs::remove_file(&physical).unwrap();
+        std::fs::create_dir_all(&physical).unwrap();
+        let bundle = bundle(&[("index.html", b"index")]);
+        let mut provider = FakeRepository::new();
+        let mut ledger = empty_ledger();
+
+        let error = execute(
+            &fixture,
+            &plan(vec![IntegrationOperation::WriteRepository(file)]),
+            &bundle,
+            &mut provider,
+            &mut ledger,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RepositoryExecutionError::LocalValidation { .. }
+        ));
+        assert_eq!(provider.calls, Vec::new());
+        assert!(!fixture.ledger_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_file_symlink_escape_fails_locally_without_remote_calls() {
+        let fixture = Fixture::new();
+        let file = publication_file(&fixture, "a", b"preview-a");
+        let physical = fixture.output.join("photos/preview/a.jpg");
+        let outside = fixture.root.path().join("outside.jpg");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::remove_file(&physical).unwrap();
+        std::os::unix::fs::symlink(&outside, &physical).unwrap();
+        let bundle = bundle(&[("index.html", b"index")]);
+        let mut provider = FakeRepository::new();
+        let mut ledger = empty_ledger();
+
+        let error = execute(
+            &fixture,
+            &plan(vec![IntegrationOperation::WriteRepository(file)]),
+            &bundle,
+            &mut provider,
+            &mut ledger,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RepositoryExecutionError::LocalValidation { .. }
+        ));
+        assert_eq!(provider.calls, Vec::new());
+        assert!(!fixture.ledger_path.exists());
+    }
+
+    #[test]
+    fn divergent_write_metadata_for_publication_file_rolls_back_without_commit() {
+        for field in ["sha256", "size", "path"] {
+            let fixture = Fixture::new();
+            let file = publication_file(&fixture, "a", b"preview-a");
+            let bundle = bundle(&[("index.html", b"index")]);
+            let mut provider = FakeRepository::new();
+            let mut divergent = FileMetadata {
+                path: file.path.clone(),
+                size_bytes: file.size_bytes,
+                sha256: file.sha256.clone(),
+            };
+            match field {
+                "sha256" => divergent.sha256 = digest("different"),
+                "size" => divergent.size_bytes += 1,
+                _ => divergent.path = RepositoryPath::new("other.txt").unwrap(),
+            }
+            provider.write_scripts.push_back(Ok(Some(divergent)));
+            let mut ledger = empty_ledger();
+
+            let error = execute(
+                &fixture,
+                &plan(vec![IntegrationOperation::WriteRepository(file)]),
+                &bundle,
+                &mut provider,
+                &mut ledger,
+            )
+            .unwrap_err();
+
+            // Divergent metadata: detected after the write; the batch is
+            // never committed and the ledger rolls back (no commit happened).
+            assert!(matches!(error, RepositoryExecutionError::Rejected(_)));
+            assert_eq!(provider.commit_count(), 0);
+            assert!(ledger.github_inventory.is_empty());
+            assert_eq!(fixture.durable_ledger(), ledger);
+        }
+    }
+
+    #[test]
+    fn delete_of_a_publication_file_needs_no_source_content() {
+        let fixture = Fixture::new();
+        let path = RepositoryPath::new("public/photos/preview/a.jpg").unwrap();
+        let mut ledger = empty_ledger();
+        ledger
+            .record_github_file(
+                &path,
+                digest("preview-a"),
+                BASE_REVISION.to_owned(),
+                OperationState::Confirmed,
+            )
+            .unwrap();
+        ledger.write_to(&fixture.ledger_path).unwrap();
+        let bundle = bundle(&[("index.html", b"index")]);
+        let mut provider = FakeRepository::new();
+        provider.files.insert(
+            "public/photos/preview/a.jpg".to_owned(),
+            b"preview-a".to_vec(),
+        );
+
+        execute(
+            &fixture,
+            &plan(vec![IntegrationOperation::DeleteRepository {
+                path: path.clone(),
+            }]),
+            &bundle,
+            &mut provider,
+            &mut ledger,
+        )
+        .unwrap();
+
+        assert!(!ledger
+            .github_inventory
+            .contains_key("public/photos/preview/a.jpg"));
+        assert!(!provider.files.contains_key("public/photos/preview/a.jpg"));
     }
 }
