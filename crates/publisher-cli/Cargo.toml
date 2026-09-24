@@ -15,6 +15,11 @@ serde_json = "1.0"
 photo-publisher-core = { path = "../publisher-core" }
 photo-publisher-pipeline = { path = "../publisher-pipeline" }
 photo-publisher-contract-validator = { path = "../contract-validator" }
+photo-publisher-integration = { path = "../publisher-integration" }
+photo-publisher-provider-contracts = { path = "../provider-contracts" }
+photo-publisher-provider-github = { path = "../provider-github" }
+photo-publisher-provider-r2 = { path = "../provider-r2" }
+photo-publisher-provider-vercel = { path = "../provider-vercel" }
 
 [dev-dependencies]
 tempfile = "3.27"

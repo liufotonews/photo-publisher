@@ -7,6 +7,8 @@ use serde_json::{json, Value};
 use std::env;
 use std::path::{Path, PathBuf};
 
+mod runtime;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str = "Photo Publisher CLI v1\n\nUSAGE:\n  photo-publisher <command> <project.json> [flags]\n\nCOMMANDS:\n  validate  Validate project.json and required source path\n  publish   Recover if needed, then publish the local gallery\n  recover   Run publication recovery only\n  inspect   Show read-only publication information\n  version   Show the executable version\n\nFLAGS:\n  --silent   Minimize normal output\n  --verbose  Print detailed diagnostics to stderr\n  --dry-run  Calculate publish result without changing publication files\n  --json     Emit a stable JSON result on stdout\n  --help     Show this help\n\nOUTPUT PATH:\n  The current v1 contract has no output field; output defaults to\n  <project.json parent>/output.\n\nDISTRIBUTION:\n  Place schemas/project.schema.json next to the executable.\n";
 
@@ -261,16 +263,36 @@ fn publish_command(project_path: &Path, flags: &Flags) -> CliResult<Value> {
                 SyncAction::Remove { .. } => removes += 1,
             }
         }
+        // Integrated dry-run view: computed without touching providers and
+        // without writing the ledger (null when not applicable).
+        let integration = runtime::dry_run_integration(project_path, &output);
         return Ok(
-            json!({"dry_run": true, "would_publish": adds + updates + removes > 0 || !output.join("gallery.json").exists(), "plan": {"add": adds, "update": updates, "remove": removes}, "output": output}),
+            json!({"dry_run": true, "would_publish": adds + updates + removes > 0 || !output.join("gallery.json").exists(), "plan": {"add": adds, "update": updates, "remove": removes}, "output": output, "integration": integration}),
         );
     }
+    // For schema v2 projects, provider configuration and credentials are
+    // validated before the local build so misconfiguration never reaches a
+    // remote effect.
+    let integrated_config = if project["schemaVersion"].as_u64() == Some(2) {
+        Some(runtime::preflight(&project, project_path)?)
+    } else {
+        None
+    };
     build_local_gallery(&PipelineOptions {
         source_dir: source.clone(),
         output_dir: output.clone(),
         project_title: title.to_string(),
     })
     .map_err(|e| CliError::from_any(ErrorKind::Publication, e))?;
+    if let Some(configuration) = integrated_config {
+        let integrated = runtime::publish_integrated(&configuration, &output)?;
+        return Ok(json!({
+            "published": true,
+            "source": source,
+            "output": output,
+            "integrated": integrated,
+        }));
+    }
     Ok(json!({"published": true, "source": source, "output": output}))
 }
 
