@@ -1,0 +1,222 @@
+# Release pipeline: Windows x64 distribution artifact.
+#
+# Produces and verifies the portable executable
+#
+#   photo-publisher-v<version>-win64/photo-publisher.exe
+#
+# The smoke matrix always runs against an ISOLATED COPY of the release binary
+# (never the workspace), with no schemas/, no Cargo, and an unrelated working
+# directory. Decisions frozen by the 5F.10 audit:
+# - static CRT only here (RUSTFLAGS), never in Cargo.toml;
+# - the artifact contains exactly one file: photo-publisher.exe;
+# - the version is read from the binary itself;
+# - no secrets are required anywhere in this workflow.
+#
+# test.yml remains the push/PR gate and is intentionally untouched.
+
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary with static CRT
+        shell: powershell
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --release --locked -p photo-publisher-cli
+          if ($LASTEXITCODE -ne 0) { throw "release build failed" }
+          if (-not (Test-Path target\release\photo-publisher.exe)) {
+            throw "release executable was not produced"
+          }
+
+      - name: Read version from the release executable
+        id: version
+        shell: powershell
+        run: |
+          $raw = & target\release\photo-publisher.exe version --json | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "version command failed" }
+          $parsed = $raw | ConvertFrom-Json
+          $version = $parsed.data.version
+          if ([string]::IsNullOrWhiteSpace($version)) { throw "version missing in JSON output" }
+          # GITHUB_OUTPUT must be UTF-8 without BOM; Out-File in Windows
+          # PowerShell 5.1 would write UTF-16 by default, which the runner
+          # cannot parse.
+          [IO.File]::AppendAllText(
+            $env:GITHUB_OUTPUT,
+            "version=$version`n",
+            (New-Object System.Text.UTF8Encoding($false)))
+          Write-Host "release version: $version"
+
+      - name: Verify static CRT in the release binary
+        shell: powershell
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("$PWD\target\release\photo-publisher.exe")
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          $runtime = [regex]::Matches($text, "VCRUNTIME140").Count
+          if ($runtime -ne 0) { throw "dynamic CRT detected: VCRUNTIME140 referenced $runtime time(s)" }
+          $kernel = [regex]::Matches($text, "kernel32\.dll").Count
+          if ($kernel -eq 0) { throw "import scan sanity check failed: kernel32.dll not found" }
+          Write-Host "static CRT verified: no VCRUNTIME140 references; kernel32.dll present"
+
+      - name: Build isolated distribution copy
+        id: dist
+        shell: powershell
+        run: |
+          $dist = Join-Path $env:TEMP "pp-dist-smoke\dist binário"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item target\release\photo-publisher.exe (Join-Path $dist "photo-publisher.exe")
+          $files = Get-ChildItem -Recurse -File $dist
+          if ($files.Count -ne 1) { throw "isolated directory must contain exactly one file" }
+          if ($files[0].Name -ne "photo-publisher.exe") { throw "unexpected isolated file" }
+          if (Test-Path (Join-Path $dist "schemas")) { throw "schemas must not be beside the exe" }
+          [IO.File]::AppendAllText(
+            $env:GITHUB_OUTPUT,
+            "dist=$dist`n",
+            (New-Object System.Text.UTF8Encoding($false)))
+
+      - name: Smoke matrix against the isolated executable
+        shell: powershell
+        env:
+          DIST: ${{ steps.dist.outputs.dist }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Join-Path $env:DIST "photo-publisher.exe"
+          if (-not (Test-Path $exe)) { throw "isolated executable missing" }
+
+          function Invoke-Cli([string[]]$arguments, [int]$expected) {
+            & $exe @arguments | Out-Null
+            if ($LASTEXITCODE -ne $expected) {
+              throw "expected exit $expected for $($arguments -join ' '), got $LASTEXITCODE"
+            }
+          }
+
+          # Everything below runs from an unrelated CWD with the exe and the
+          # fixtures in paths containing spaces and Unicode.
+          $workCwd = "C:\Windows"
+          Push-Location $workCwd
+
+          # version: text and JSON agree with the extracted build version.
+          Invoke-Cli @("version") 0
+          $raw = & $exe version --json | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "version --json failed" }
+          $version = ($raw | ConvertFrom-Json).data.version
+          if ([string]::IsNullOrWhiteSpace($version)) { throw "smoke version unreadable" }
+
+          # help: stable USAGE marker.
+          $help = & $exe --help | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "--help failed" }
+          if (-not $help.Contains("USAGE")) { throw "--help missing USAGE marker" }
+
+          # v1 fixture: real project with a real JPEG, outside the exe folder.
+          Add-Type -AssemblyName System.Drawing
+          $base = Join-Path $env:TEMP "pp-smoke-fixtures"
+          Remove-Item -Recurse -Force $base -ErrorAction SilentlyContinue
+          $projectDir = Join-Path $base "Meu Projeto Álbum"
+          New-Item -ItemType Directory -Force (Join-Path $projectDir "source") | Out-Null
+          $bitmap = New-Object System.Drawing.Bitmap 2, 2
+          $bitmap.SetPixel(0, 0, [System.Drawing.Color]::Red)
+          $bitmap.Save((Join-Path $projectDir "source\foto um.jpg"), [System.Drawing.Imaging.ImageFormat]::Jpeg)
+          $bitmap.Dispose()
+          $v1 = [ordered]@{
+            schemaVersion = 1
+            project = @{ id = "smoke-one"; name = "Smoke One" }
+            gallery = @{ template = "local"; title = "Smoke" }
+            source = @{ type = "folder"; path = "source" }
+            repository = @{ provider = "local"; repository = "local" }
+            hosting = @{ provider = "local" }
+            storage = @{ preview = @{ provider = "local" }; highResolution = @{ provider = "local" } }
+          }
+          [System.IO.File]::WriteAllText(
+            (Join-Path $projectDir "project.json"),
+            ($v1 | ConvertTo-Json -Depth 10 -Compress))
+
+          $v1json = "$projectDir\project.json"
+          Invoke-Cli @("validate", $v1json, "--json") 0
+          Invoke-Cli @("publish", $v1json) 0
+          if (-not (Test-Path "$projectDir\output\gallery.json")) { throw "gallery.json not produced" }
+          if (-not (Test-Path "$projectDir\output\.publisher\state.json")) { throw "state.json not produced" }
+          Invoke-Cli @("publish", $v1json) 0
+
+          # v2 fixture: valid v2 project, no credentials — only preflight.
+          $v2dir = Join-Path $base "Projeto Integrado"
+          New-Item -ItemType Directory -Force (Join-Path $v2dir "source") | Out-Null
+          New-Item -ItemType Directory -Force (Join-Path $v2dir "gallery-app") | Out-Null
+          $bitmap = New-Object System.Drawing.Bitmap 2, 2
+          $bitmap.Save((Join-Path $v2dir "source\foto dois.jpg"), [System.Drawing.Imaging.ImageFormat]::Jpeg)
+          $bitmap.Dispose()
+          [System.IO.File]::WriteAllText(
+            (Join-Path $v2dir "gallery-app\index.html"),
+            "<h1>smoke</h1>")
+          $v2 = [ordered]@{
+            schemaVersion = 2
+            project = @{ id = "smoke-two"; name = "Smoke Two" }
+            gallery = @{ template = "editorial-v1"; title = "Smoke Two"; bundlePath = "gallery-app" }
+            source = @{ type = "folder"; path = "source" }
+            repository = @{ provider = "github"; repository = "owner/repo"; branch = "main" }
+            hosting = @{ provider = "vercel"; project = "smoke-two"; teamId = "team_example" }
+            storage = @{
+              preview = @{ provider = "github"; prefix = "previews"; publicBaseUrl = "https://cdn.example.com/previews" }
+              highResolution = @{ provider = "r2"; accountId = "account-example"; bucket = "bucket-example"; prefix = "originals"; publicBaseUrl = "https://downloads.example.com/originals" }
+            }
+          }
+          [System.IO.File]::WriteAllText(
+            (Join-Path $v2dir "project.json"),
+            ($v2 | ConvertTo-Json -Depth 10 -Compress))
+
+          $v2json = "$v2dir\project.json"
+          Invoke-Cli @("validate", $v2json, "--json") 0
+
+          # publish v2 without credentials: deterministic preflight failure,
+          # resource_missing, naming only the variable — never a secret.
+          $output = & $exe publish $v2json --json | Out-String
+          if ($LASTEXITCODE -ne 4) { throw "publish v2 must fail with exit 4, got $LASTEXITCODE" }
+          $parsed = $output | ConvertFrom-Json
+          if ($parsed.ok -ne $false) { throw "publish v2 must report ok:false" }
+          if ($parsed.error.category -ne "resource_missing") { throw "publish v2 must be resource_missing" }
+          if (-not $parsed.error.message.Contains("PHOTO_PUBLISHER_")) { throw "error must name the required variable" }
+          if ($output -match "token value") { throw "output must not contain credential material" }
+          if ($output -match "Authorization:") { throw "output must not contain authorization material" }
+          if (Test-Path "$v2dir\output\.publisher\integration-state.json") {
+            throw "no integration ledger may be written by a preflight failure"
+          }
+
+          Pop-Location
+
+      - name: Package runtime artifact
+        shell: powershell
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DIST: ${{ steps.dist.outputs.dist }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $artifact = Join-Path $PWD "photo-publisher-v$env:VERSION-win64"
+          New-Item -ItemType Directory -Force $artifact | Out-Null
+          Copy-Item (Join-Path $env:DIST "photo-publisher.exe") (Join-Path $artifact "photo-publisher.exe")
+          $files = Get-ChildItem -Recurse -File $artifact
+          if ($files.Count -ne 1) { throw "artifact must contain exactly one file" }
+          if ($files[0].Name -ne "photo-publisher.exe") { throw "unexpected artifact file" }
+
+      - name: Upload artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: photo-publisher-v${{ steps.version.outputs.version }}-win64
+          path: ${{ github.workspace }}/photo-publisher-v${{ steps.version.outputs.version }}-win64/photo-publisher.exe
+          if-no-files-found: error
