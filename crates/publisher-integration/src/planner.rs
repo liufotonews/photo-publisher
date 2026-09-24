@@ -190,9 +190,12 @@ impl DesiredPublication {
     /// The journal must be `COMMITTED` and both the gallery manifest and the
     /// publisher state are authenticated against the committed journal before
     /// they are parsed. Every high-resolution download is bound to its
-    /// publication-relative source file with verified SHA-256 and size. This
-    /// performs local reads only: no provider, network, or remote state is
-    /// involved.
+    /// publication-relative JPEG with verified SHA-256 and size, and every
+    /// preview is bound to its publication-relative JPEG with a streamed
+    /// SHA-256 (preview bytes are re-encoded by the pipeline, so the recorded
+    /// hash is the hash of the file itself, while the file-name stem proves
+    /// the source membership). This performs local reads only: no provider,
+    /// network, or remote state is involved.
     pub fn from_committed_output(
         configuration: &ProjectPublicationConfig,
         output_dir: impl AsRef<Path>,
@@ -201,9 +204,13 @@ impl DesiredPublication {
         let output_dir = output_dir.as_ref();
         let local = LocalPublication::from_output(output_dir)?;
         let storage = committed_high_resolution_objects(configuration, output_dir, &local)?;
+        let previews = committed_preview_files(configuration, output_dir, &local)?;
         let mut publication = Self::new(configuration, local, bundle)?;
         for object in storage {
             publication.insert_storage_object(object)?;
+        }
+        for file in previews {
+            publication.insert_repository_file(file)?;
         }
         publication.validate()?;
         Ok(publication)
@@ -369,6 +376,121 @@ fn committed_high_resolution_objects(
         )?);
     }
     Ok(objects)
+}
+
+/// Builds the preview bindings of one committed publication: each
+/// `gallery.photos[].preview` asset becomes a desired **repository** file.
+///
+/// The repository path joins `preview.prefix` with the publication-relative
+/// preview URL using the same single-slash rule as high-resolution object
+/// keys; `publicBaseUrl` is never used to locate content. Previews are
+/// re-encoded by the pipeline and named after the *source* SHA-256, so the
+/// recorded desired hash is the streamed SHA-256 of the preview file itself
+/// (the content that will be uploaded), while the stem must name a source
+/// present in the committed `PublisherState` — proving the preview belongs to
+/// this publication. The local manifest is never modified, and this performs
+/// local reads only.
+fn committed_preview_files(
+    configuration: &ProjectPublicationConfig,
+    output_dir: &Path,
+    local: &LocalPublication,
+) -> Result<Vec<DesiredRepositoryFile>> {
+    let journal = read_journal(&output_dir.join(".publisher/journal.json"))
+        .context("committed journal is required to bind preview sources")?;
+    if journal.phase != JournalPhase::Committed {
+        bail!("local publication is not committed");
+    }
+    if journal.generation != local.generation
+        || journal.gallery_sha256 != local.manifest_hash
+        || journal.state_sha256 != local.state_hash
+    {
+        bail!("journal and local publication do not describe the same generation");
+    }
+
+    let gallery_path = output_dir.join(&journal.gallery_path);
+    if sha256_file(&gallery_path)? != local.manifest_hash {
+        bail!("gallery manifest does not match the committed local publication");
+    }
+    let gallery: Value = serde_json::from_slice(&fs::read(&gallery_path)?)
+        .context("committed gallery manifest is not valid JSON")?;
+    let photos = gallery
+        .get("photos")
+        .and_then(Value::as_array)
+        .context("gallery photos must be an array")?;
+
+    let state_path = output_dir.join(&journal.state_path);
+    if sha256_file(&state_path)? != local.state_hash {
+        bail!("publisher state does not match the committed local publication");
+    }
+    let state = load_state(&state_path).context("failed to load the committed publisher state")?;
+
+    let prefix = configuration
+        .preview_prefix
+        .as_deref()
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    let canonical_root = output_dir
+        .canonicalize()
+        .context("failed to resolve the publication root")?;
+
+    let mut files = Vec::new();
+    for photo in photos {
+        let preview = photo
+            .get("preview")
+            .context("gallery preview asset is required")?;
+        let url = preview
+            .get("url")
+            .and_then(Value::as_str)
+            .context("gallery preview asset URL is required")?;
+        let source_path = PublicationPath::new(url)?;
+
+        let filename = url
+            .rsplit('/')
+            .next()
+            .context("preview asset URL must contain a file name")?;
+        let (stem, extension) = filename
+            .rsplit_once('.')
+            .context("preview asset has no file extension")?;
+        if extension != "jpg" {
+            bail!("preview asset is not a JPEG file: {url}");
+        }
+        // The pipeline names previews after the *source* photo hash; that
+        // stem must name a source in the committed state.
+        validate_sha256("manifest preview asset source SHA-256", stem)?;
+        if !state.photos.values().any(|entry| entry.sha256 == stem) {
+            bail!("gallery preview does not match any PublisherState source: {url}");
+        }
+
+        let path = RepositoryPath::new(if prefix.is_empty() {
+            url.to_owned()
+        } else {
+            format!("{prefix}/{url}")
+        })?;
+
+        let physical = output_dir.join(source_path.as_str());
+        let metadata = fs::metadata(&physical)
+            .with_context(|| format!("gallery preview asset does not exist: {url}"))?;
+        if !metadata.is_file() {
+            bail!("gallery preview asset is not a regular file: {url}");
+        }
+        let canonical_asset = physical
+            .canonicalize()
+            .with_context(|| format!("failed to resolve gallery preview asset: {url}"))?;
+        if canonical_asset.strip_prefix(&canonical_root).is_err() {
+            bail!("gallery preview asset escapes the publication root: {url}");
+        }
+
+        let mut file = fs::File::open(&physical)
+            .with_context(|| format!("failed to open gallery preview asset: {url}"))?;
+        let (bytes_read, sha256) = copy_with_sha256(&mut file, &mut io::sink())
+            .with_context(|| format!("failed to hash gallery preview asset: {url}"))?;
+        if bytes_read != metadata.len() {
+            bail!("gallery preview asset changed while it was hashed: {url}");
+        }
+
+        files.push(DesiredRepositoryFile::new(path, sha256)?);
+    }
+    Ok(files)
 }
 
 /// Deterministic fingerprint of all non-secret publication configuration.
@@ -986,6 +1108,20 @@ mod tests {
         ApplicationBundle::from_files(vec![("index.html".to_owned(), b"index".to_vec())]).unwrap()
     }
 
+    fn preview_url(sha: &str) -> String {
+        format!("photos/preview/{sha}.jpg")
+    }
+
+    fn preview_bytes(sha: &str) -> Vec<u8> {
+        format!("committed preview bytes {sha}").into_bytes()
+    }
+
+    fn write_asset(output: &Path, url: &str, bytes: &[u8]) {
+        let path = output.join(url);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
     fn gallery_manifest(urls: &[&str]) -> Value {
         json!({
             "schemaVersion": 1,
@@ -993,13 +1129,16 @@ mod tests {
             "photos": urls
                 .iter()
                 .enumerate()
-                .map(|(index, url)| json!({
-                    "id": format!("photo-{}", index + 1),
-                    "filename": "a.jpg",
-                    "sequence": index + 1,
-                    "preview": {"url": "photos/preview/x.jpg", "width": 1, "height": 1},
-                    "download": {"url": url, "width": 1, "height": 1}
-                }))
+                .map(|(index, url)| {
+                    let stem = url.rsplit('/').next().unwrap().rsplit_once('.').unwrap().0;
+                    json!({
+                        "id": format!("photo-{}", index + 1),
+                        "filename": "a.jpg",
+                        "sequence": index + 1,
+                        "preview": {"url": format!("photos/preview/{stem}.jpg"), "width": 1, "height": 1},
+                        "download": {"url": url, "width": 1, "height": 1}
+                    })
+                })
                 .collect::<Vec<_>>()
         })
     }
@@ -1021,6 +1160,10 @@ mod tests {
         )
         .unwrap();
         fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        for url in urls {
+            let stem = url.rsplit('/').next().unwrap().rsplit_once('.').unwrap().0;
+            write_asset(output, &preview_url(stem), &preview_bytes(stem));
+        }
         let journal = JournalRecord::new(
             1,
             "g-000001".to_owned(),
@@ -1040,10 +1183,70 @@ mod tests {
         .unwrap();
     }
 
-    fn write_asset(output: &Path, url: &str, bytes: &[u8]) {
-        let path = output.join(url);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, bytes).unwrap();
+    /// Commits a multi-source publication: each `(sha, bytes)` becomes one
+    /// photo whose download asset is a byte-exact copy of the source (like
+    /// the pipeline) and whose preview is a distinct re-encoded byte string
+    /// named after the source hash.
+    fn commit_multi(output: &Path, sources: &[(&str, &[u8])], preview_stem: Option<&str>) {
+        let photos: Vec<Value> = sources
+            .iter()
+            .enumerate()
+            .map(|(index, (sha, _bytes))| {
+                let stem = preview_stem.unwrap_or(sha);
+                json!({
+                    "id": format!("photo-{}", index + 1),
+                    "filename": format!("{index}.jpg"),
+                    "sequence": index + 1,
+                    "preview": {"url": preview_url(stem), "width": 1, "height": 1},
+                    "download": {"url": download_url(sha), "width": 1, "height": 1}
+                })
+            })
+            .collect();
+        let gallery = json!({
+            "schemaVersion": 1,
+            "gallery": {"id": "gallery-local", "title": "Title"},
+            "photos": photos
+        });
+        let state = state_from(
+            &sources
+                .iter()
+                .enumerate()
+                .map(|(index, (sha, bytes))| SourcePhoto {
+                    relative_path: format!("{index}.jpg"),
+                    bytes: bytes.len() as u64,
+                    sha256: (*sha).to_owned(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let gallery_path = output.join("gallery.json");
+        let state_path = output.join(".publisher/state.json");
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        fs::write(&gallery_path, serde_json::to_vec_pretty(&gallery).unwrap()).unwrap();
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        for (sha, bytes) in sources {
+            write_asset(output, &download_url(sha), bytes);
+        }
+        for (sha, _bytes) in sources {
+            let stem = preview_stem.unwrap_or(sha);
+            write_asset(output, &preview_url(stem), &preview_bytes(sha));
+        }
+        let journal = JournalRecord::new(
+            1,
+            "g-000001".to_owned(),
+            None,
+            JournalPhase::Committed,
+            sha256_file(&gallery_path).unwrap(),
+            sha256_file(&state_path).unwrap(),
+            ".publisher/staging/g-000001".to_owned(),
+            ".publisher/backups/none".to_owned(),
+            None,
+            None,
+        );
+        fs::write(
+            output.join(".publisher/journal.json"),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1359,5 +1562,351 @@ mod tests {
         assert_eq!(puts.len(), 1);
         assert_eq!(puts[0].content_type, Some("image/jpeg".to_owned()));
         assert_eq!(puts[0].source_path.as_str(), url);
+    }
+
+    #[test]
+    fn committed_output_binds_each_preview_to_its_repository_file() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(root.path(), &url, ASSET_BYTES);
+
+        let desired =
+            DesiredPublication::from_committed_output(&configuration(), root.path(), &bundle())
+                .unwrap();
+        let previews: Vec<_> = desired
+            .repository_files()
+            .filter(|file| file.path.as_str().starts_with("previews/"))
+            .collect();
+        assert_eq!(previews.len(), 1);
+        // Repository path = preview.prefix + local preview URL.
+        assert_eq!(
+            previews[0].path.as_str(),
+            format!("previews/{}", preview_url(&sha))
+        );
+        // The desired sha256 is the streamed hash of the preview bytes...
+        assert_eq!(previews[0].sha256, sha256_bytes(&preview_bytes(&sha)));
+        // ...deliberately not the source-hash stem: the pipeline re-encodes
+        // previews, and the stem proves source membership instead.
+        assert_ne!(previews[0].sha256, sha);
+    }
+
+    #[test]
+    fn empty_preview_prefix_places_previews_at_their_publication_path() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(root.path(), &url, ASSET_BYTES);
+
+        let mut without_prefix = configuration();
+        without_prefix.preview_prefix = None;
+        let desired =
+            DesiredPublication::from_committed_output(&without_prefix, root.path(), &bundle())
+                .unwrap();
+        let previews: Vec<_> = desired
+            .repository_files()
+            .filter(|file| !file.path.as_str().starts_with("index"))
+            .collect();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].path.as_str(), preview_url(&sha));
+    }
+
+    #[test]
+    fn unicode_preview_prefix_is_preserved_in_the_repository_path() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(root.path(), &url, ASSET_BYTES);
+
+        let mut unicode = configuration();
+        unicode.preview_prefix = Some("álbum público".to_owned());
+        let desired =
+            DesiredPublication::from_committed_output(&unicode, root.path(), &bundle()).unwrap();
+        let previews: Vec<_> = desired
+            .repository_files()
+            .filter(|file| file.path.as_str().starts_with('á'))
+            .collect();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(
+            previews[0].path.as_str(),
+            format!("álbum público/{}", preview_url(&sha))
+        );
+    }
+
+    #[test]
+    fn missing_preview_file_fails_the_binding() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(root.path(), &url, ASSET_BYTES);
+        fs::remove_file(root.path().join(preview_url(&sha))).unwrap();
+
+        assert!(DesiredPublication::from_committed_output(
+            &configuration(),
+            root.path(),
+            &bundle()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn non_regular_preview_file_fails_the_binding() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(root.path(), &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(root.path(), &url, ASSET_BYTES);
+        let preview = root.path().join(preview_url(&sha));
+        fs::remove_file(&preview).unwrap();
+        fs::create_dir_all(&preview).unwrap();
+
+        assert!(DesiredPublication::from_committed_output(
+            &configuration(),
+            root.path(),
+            &bundle()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn preview_from_an_unknown_source_fails_the_binding() {
+        let root = tempdir().unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let foreign = sha256_bytes(b"foreign source");
+        // The preview exists physically, but its stem names a source that is
+        // not part of the committed publication.
+        commit_multi(root.path(), &[(&sha, ASSET_BYTES)], Some(&foreign));
+
+        assert!(DesiredPublication::from_committed_output(
+            &configuration(),
+            root.path(),
+            &bundle()
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_symlink_escape_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let output = root.path().join("output");
+        let outside = root.path().join("outside.jpg");
+        fs::write(&outside, ASSET_BYTES).unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(&output, &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(&output, &url, ASSET_BYTES);
+        let preview = output.join(preview_url(&sha));
+        fs::remove_file(&preview).unwrap();
+        symlink(&outside, &preview).unwrap();
+
+        assert!(
+            DesiredPublication::from_committed_output(&configuration(), &output, &bundle())
+                .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preview_symlink_escape_is_rejected_on_windows() {
+        use std::os::windows::fs::symlink_file;
+
+        let root = tempdir().unwrap();
+        let output = root.path().join("output");
+        let outside = root.path().join("outside.jpg");
+        fs::write(&outside, ASSET_BYTES).unwrap();
+        let sha = sha256_bytes(ASSET_BYTES);
+        let url = download_url(&sha);
+        commit(&output, &[&url], &sha, ASSET_BYTES.len() as u64);
+        write_asset(&output, &url, ASSET_BYTES);
+        let preview = output.join(preview_url(&sha));
+        fs::remove_file(&preview).unwrap();
+        if symlink_file(&outside, &preview).is_err() {
+            // Symlink creation requires a privilege that may be disabled on
+            // this machine; the canonicalization guard itself is exercised on
+            // unix above.
+            return;
+        }
+
+        assert!(
+            DesiredPublication::from_committed_output(&configuration(), &output, &bundle())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn g1_to_g2_moves_previews_and_manifest_without_repeating_kept_content() {
+        let template = bundle();
+        let config = configuration();
+
+        // G1: photos A and B fully published.
+        let g1 = tempdir().unwrap();
+        let sha_a = sha256_bytes(b"source-a");
+        let sha_b = sha256_bytes(b"source-b");
+        commit_multi(
+            g1.path(),
+            &[(&sha_a, b"source-a"), (&sha_b, b"source-b")],
+            None,
+        );
+        let manifest1 =
+            crate::PublicGalleryManifest::derive_from_committed_output(&config, g1.path()).unwrap();
+        let bundle1 = crate::compose_application_bundle(&template, &manifest1).unwrap();
+        let desired1 =
+            DesiredPublication::from_committed_output(&config, g1.path(), &bundle1).unwrap();
+
+        // The desired repository set: previews + gallery.json + template.
+        let repo_paths: Vec<_> = desired1
+            .repository_files()
+            .map(|file| file.path.as_str().to_owned())
+            .collect();
+        assert!(repo_paths.contains(&format!("previews/{}", preview_url(&sha_a))));
+        assert!(repo_paths.contains(&format!("previews/{}", preview_url(&sha_b))));
+        assert!(repo_paths.contains(&"gallery.json".to_owned()));
+        assert!(repo_paths.contains(&"index.html".to_owned()));
+
+        // Ledger: everything from G1 is Confirmed.
+        let mut ledger = IntegrationLedger::new(
+            desired1.configuration_fingerprint.clone(),
+            desired1.local.generation.clone(),
+            desired1.local.state_hash.clone(),
+            desired1.local.manifest_hash.clone(),
+        )
+        .unwrap();
+        for object in desired1.storage_objects() {
+            ledger
+                .record_r2_object(
+                    &object.key,
+                    &StorageObject {
+                        key: object.key.clone(),
+                        size_bytes: object.size_bytes,
+                        sha256: object.sha256.clone(),
+                        content_type: object.content_type.clone(),
+                    },
+                    OperationState::Confirmed,
+                )
+                .unwrap();
+        }
+        for file in desired1.repository_files() {
+            ledger
+                .record_github_file(
+                    &file.path,
+                    file.sha256.clone(),
+                    "commit-01".to_owned(),
+                    OperationState::Confirmed,
+                )
+                .unwrap();
+        }
+        ledger
+            .record_vercel(
+                desired1.bundle_fingerprint.clone(),
+                OperationState::Confirmed,
+                Some("dpl-1".to_owned()),
+                Some("g1.vercel.app".to_owned()),
+            )
+            .unwrap();
+        let known = KnownRemoteState::from_ledger(&ledger).unwrap();
+
+        // G1 already published: the plan is empty.
+        assert!(plan_reconciliation(&desired1, &known).unwrap().is_empty());
+
+        // G2: A stays, C arrives, B leaves.
+        let g2 = tempdir().unwrap();
+        let sha_c = sha256_bytes(b"source-c");
+        commit_multi(
+            g2.path(),
+            &[(&sha_a, b"source-a"), (&sha_c, b"source-c")],
+            None,
+        );
+        let manifest2 =
+            crate::PublicGalleryManifest::derive_from_committed_output(&config, g2.path()).unwrap();
+        let bundle2 = crate::compose_application_bundle(&template, &manifest2).unwrap();
+        assert_ne!(manifest1, manifest2);
+        assert_ne!(bundle1.fingerprint(), bundle2.fingerprint());
+        let desired2 =
+            DesiredPublication::from_committed_output(&config, g2.path(), &bundle2).unwrap();
+
+        let plan = plan_reconciliation(&desired2, &known).unwrap();
+        assert!(plan.reconciliation_requirements.is_empty());
+
+        // Storage: C is uploaded, B is deleted, A is never touched.
+        let puts: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                IntegrationOperation::PutStorage(object) => Some(object.key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(puts, vec![format!("originals/{}", download_url(&sha_c))]);
+        let deletes: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                IntegrationOperation::DeleteStorage { key } => Some(key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deletes, vec![format!("originals/{}", download_url(&sha_b))]);
+
+        // Repository: preview C and the rewritten gallery.json are written;
+        // preview B is deleted; preview A and the template are untouched.
+        let writes: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                IntegrationOperation::WriteRepository(file) => Some(file),
+                _ => None,
+            })
+            .collect();
+        let write_paths: Vec<_> = writes.iter().map(|file| file.path.as_str()).collect();
+        assert!(write_paths.contains(&format!("previews/{}", preview_url(&sha_c)).as_str()));
+        assert!(write_paths.contains(&"gallery.json"));
+        assert!(!write_paths.contains(&format!("previews/{}", preview_url(&sha_a)).as_str()));
+        assert!(!write_paths.contains(&"index.html"));
+        let gallery_write = writes
+            .iter()
+            .find(|file| file.path.as_str() == "gallery.json")
+            .unwrap();
+        assert_eq!(gallery_write.sha256, manifest2.sha256());
+        let repo_deletes: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                IntegrationOperation::DeleteRepository { path } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            repo_deletes,
+            vec![format!("previews/{}", preview_url(&sha_b))]
+        );
+
+        // Hosting: the fingerprint moved exactly because the manifest moved.
+        let hosting: Vec<_> = plan
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                IntegrationOperation::PublishHosting { bundle_fingerprint } => {
+                    Some(bundle_fingerprint.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hosting, vec![bundle2.fingerprint().to_owned()]);
+
+        // The public manifest of G2 references only A and C, never B.
+        assert!(manifest2
+            .as_str()
+            .contains(&format!("photos/download/{sha_a}.jpg")));
+        assert!(manifest2
+            .as_str()
+            .contains(&format!("photos/download/{sha_c}.jpg")));
+        assert!(!manifest2.as_str().contains(&sha_b));
     }
 }

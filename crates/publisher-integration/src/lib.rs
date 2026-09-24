@@ -21,12 +21,16 @@ use url::{Host, Url};
 pub mod coordinator;
 pub mod executor;
 pub mod hosting;
+pub mod manifest;
 pub mod planner;
 pub mod repository;
 
 pub use coordinator::{CoordinationError, Coordinator, PublicationReport};
 pub use executor::{StorageExecutionError, StorageExecutionReport, StorageExecutor};
 pub use hosting::{HostingExecutionError, HostingExecutionReport, HostingExecutor};
+pub use manifest::{
+    compose_application_bundle, validate_public_gallery_manifest, PublicGalleryManifest,
+};
 pub use planner::{
     plan_reconciliation, publication_configuration_fingerprint, DesiredPublication,
     DesiredRepositoryFile, DesiredStorageObject, IntegrationOperation, IntegrationPlan,
