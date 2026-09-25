@@ -265,6 +265,13 @@ jobs:
           Write-Host "[smoke] v2-assertions ledger-check=OK"
           Write-Host "[smoke] v2-assertions: OK"
 
+          # The v2 exit 4 above is expected and has been fully asserted
+          # (exit code, category, secret-check, ledger-check). The runner
+          # propagates PowerShell's final $LASTEXITCODE as the step's exit
+          # code, so the smoke result is explicitly normalized to success
+          # only after every verification has passed.
+          $global:LASTEXITCODE = 0
+
           Pop-Location
           $smokeStage = "END"
           Write-Host "[smoke] END"
