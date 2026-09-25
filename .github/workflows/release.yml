@@ -97,19 +97,32 @@ jobs:
           DIST: ${{ steps.dist.outputs.dist }}
         run: |
           $ErrorActionPreference = "Stop"
+          Write-Host "[smoke] START"
+          $smokeStage = "START"
           $exe = Join-Path $env:DIST "photo-publisher.exe"
           if (-not (Test-Path $exe)) { throw "isolated executable missing" }
+          Write-Host "[smoke] isolated-exe: OK"
 
           # Regression guard (5F.12.2): the isolated distribution path must
           # arrive with its Unicode intact ("dist binário", never corrupted).
+          $smokeStage = "unicode-guard"
           if (-not $env:DIST.EndsWith("dist binário")) {
             throw "DIST Unicode corruption: '$env:DIST'"
           }
+          Write-Host "[smoke] unicode-guard: OK"
 
+          $smokeStage = "cli-call-wrapper"
+          # Native-call diagnostics: capture $LASTEXITCODE immediately after
+          # each invocation; arguments are subcommand names only, so no
+          # credential material can ever be printed through this channel.
           function Invoke-Cli([string[]]$arguments, [int]$expected) {
             & $exe @arguments | Out-Null
-            if ($LASTEXITCODE -ne $expected) {
-              throw "expected exit $expected for $($arguments -join ' '), got $LASTEXITCODE"
+            $actual = $LASTEXITCODE
+            Write-Host ("[smoke] command: {0}" -f $arguments[0])
+            Write-Host "[smoke] expected-exit: $expected"
+            Write-Host "[smoke] actual-exit: $actual"
+            if ($actual -ne $expected) {
+              throw "expected exit $expected for $($arguments -join ' '), got $actual"
             }
           }
 
@@ -118,20 +131,36 @@ jobs:
           $workCwd = "C:\Windows"
           Push-Location $workCwd
 
+          try {
+
           # version: text and JSON agree with the extracted build version.
+          $smokeStage = "version"
+          Write-Host "[smoke] version: START"
           Invoke-Cli @("version") 0
+          $smokeStage = "version-json"
+          Write-Host "[smoke] version-json: START"
           $raw = & $exe version --json | Out-String
-          if ($LASTEXITCODE -ne 0) { throw "version --json failed" }
+          $exitCode = $LASTEXITCODE
+          Write-Host "[smoke] actual-exit: $exitCode"
+          if ($exitCode -ne 0) { throw "version --json failed with exit $exitCode" }
           $version = ($raw | ConvertFrom-Json).data.version
           if ([string]::IsNullOrWhiteSpace($version)) { throw "smoke version unreadable" }
+          Write-Host "[smoke] version: OK"
 
           # help: stable USAGE marker.
+          $smokeStage = "help"
+          Write-Host "[smoke] help: START"
           $help = & $exe --help | Out-String
-          if ($LASTEXITCODE -ne 0) { throw "--help failed" }
+          $exitCode = $LASTEXITCODE
+          Write-Host "[smoke] actual-exit: $exitCode"
+          if ($exitCode -ne 0) { throw "--help failed with exit $exitCode" }
           if (-not $help.Contains("USAGE")) { throw "--help missing USAGE marker" }
+          Write-Host "[smoke] help: OK"
 
           # v1 fixture: real project with a real embedded JPEG (no framework
           # dependency), outside the exe folder.
+          $smokeStage = "v1-fixture"
+          Write-Host "[smoke] v1-fixture: START"
           $jpegBase64 = "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDwBmZ2LMxZmOSSckmiiilHZGlX+JL1P//Z"
           $jpegBytes = [Convert]::FromBase64String($jpegBase64)
           $base = Join-Path $env:TEMP "pp-smoke-fixtures"
@@ -153,15 +182,32 @@ jobs:
           [System.IO.File]::WriteAllText(
             (Join-Path $projectDir "project.json"),
             ($v1 | ConvertTo-Json -Depth 10 -Compress))
+          Write-Host "[smoke] v1-fixture: OK"
 
           $v1json = "$projectDir\project.json"
+          $smokeStage = "v1-validate"
+          Write-Host "[smoke] v1-validate: START"
           Invoke-Cli @("validate", $v1json, "--json") 0
+          Write-Host "[smoke] v1-validate: OK"
+          $smokeStage = "v1-publish-1"
+          Write-Host "[smoke] v1-publish-1: START"
           Invoke-Cli @("publish", $v1json) 0
+          Write-Host "[smoke] v1-publish-1: OK"
+          $smokeStage = "v1-outputs"
+          Write-Host "[smoke] v1-outputs: START"
           if (-not (Test-Path "$projectDir\output\gallery.json")) { throw "gallery.json not produced" }
+          Write-Host "[smoke] v1-output gallery.json: EXISTS"
           if (-not (Test-Path "$projectDir\output\.publisher\state.json")) { throw "state.json not produced" }
+          Write-Host "[smoke] v1-output state.json: EXISTS"
+          Write-Host "[smoke] v1-outputs: OK"
+          $smokeStage = "v1-publish-2"
+          Write-Host "[smoke] v1-publish-2: START"
           Invoke-Cli @("publish", $v1json) 0
+          Write-Host "[smoke] v1-publish-2: OK"
 
           # v2 fixture: valid v2 project, no credentials — only preflight.
+          $smokeStage = "v2-fixture"
+          Write-Host "[smoke] v2-fixture: START"
           $v2dir = Join-Path $base "Projeto Integrado"
           New-Item -ItemType Directory -Force (Join-Path $v2dir "source") | Out-Null
           New-Item -ItemType Directory -Force (Join-Path $v2dir "gallery-app") | Out-Null
@@ -188,23 +234,46 @@ jobs:
             ($v2 | ConvertTo-Json -Depth 10 -Compress))
 
           $v2json = "$v2dir\project.json"
+          Write-Host "[smoke] v2-fixture: OK"
+          $smokeStage = "v2-validate"
+          Write-Host "[smoke] v2-validate: START"
           Invoke-Cli @("validate", $v2json, "--json") 0
+          Write-Host "[smoke] v2-validate: OK"
 
           # publish v2 without credentials: deterministic preflight failure,
           # resource_missing, naming only the variable — never a secret.
+          $smokeStage = "v2-publish-preflight"
+          Write-Host "[smoke] v2-publish-preflight: START"
           $output = & $exe publish $v2json --json | Out-String
-          if ($LASTEXITCODE -ne 4) { throw "publish v2 must fail with exit 4, got $LASTEXITCODE" }
+          $exitCode = $LASTEXITCODE
+          Write-Host "[smoke] v2-publish expected-exit: 4"
+          Write-Host "[smoke] v2-publish actual-exit: $exitCode"
+          if ($exitCode -ne 4) { throw "publish v2 must fail with exit 4, got $exitCode" }
+          $smokeStage = "v2-assertions"
+          Write-Host "[smoke] v2-assertions: START"
           $parsed = $output | ConvertFrom-Json
           if ($parsed.ok -ne $false) { throw "publish v2 must report ok:false" }
+          Write-Host "[smoke] v2-assertions category=$($parsed.error.category)"
           if ($parsed.error.category -ne "resource_missing") { throw "publish v2 must be resource_missing" }
           if (-not $parsed.error.message.Contains("PHOTO_PUBLISHER_")) { throw "error must name the required variable" }
           if ($output -match "token value") { throw "output must not contain credential material" }
           if ($output -match "Authorization:") { throw "output must not contain authorization material" }
+          Write-Host "[smoke] v2-assertions secret-check=OK"
           if (Test-Path "$v2dir\output\.publisher\integration-state.json") {
             throw "no integration ledger may be written by a preflight failure"
           }
+          Write-Host "[smoke] v2-assertions ledger-check=OK"
+          Write-Host "[smoke] v2-assertions: OK"
 
           Pop-Location
+          $smokeStage = "END"
+          Write-Host "[smoke] END"
+
+          }
+          finally {
+          Write-Host "[smoke] FINAL-STAGE=$smokeStage"
+          Write-Host "[smoke] FINAL-LASTEXITCODE=$LASTEXITCODE"
+          }
 
       - name: Package runtime artifact
         shell: pwsh
