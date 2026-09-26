@@ -23,6 +23,14 @@ jobs:
         with:
           components: clippy
 
+      - name: Install Tauri system dependencies (Ubuntu)
+        # publisher-desktop links webkit2gtk when built on Linux; the crate is
+        # a workspace member, so the Ubuntu lane needs these system packages.
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+
       - name: Run tests
         run: cargo test --workspace
 
