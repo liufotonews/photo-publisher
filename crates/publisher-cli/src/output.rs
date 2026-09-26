@@ -48,25 +48,27 @@ fn format_operation(event: &IntegrationEvent) -> String {
     match event {
         IntegrationEvent::StoragePutStarted {
             key, index, total, ..
-        } => format!("[STORAGE] Upload {index}/{total}: {key}"),
+        } => format!("[STORAGE] Upload {index}/{total}: {key_str}"),
         IntegrationEvent::StoragePutFinished { key, .. } => {
-            format!("[STORAGE] Concluído: {key}")
+            format!("[STORAGE] Concluído: {}", key.as_str())
         }
         IntegrationEvent::StoragePutFailed {
             key, failure, ..
         } => format!(
-            "[ERROR] STORAGE: upload não confirmado: {key} ({failure:?})"
+            "[ERROR] STORAGE: upload não confirmado: {} ({failure:?})",
+            key.as_str()
         ),
         IntegrationEvent::StorageDeleteStarted {
             key, index, total, ..
-        } => format!("[STORAGE] Removendo {index}/{total}: {key}"),
+        } => format!("[STORAGE] Removendo {index}/{total}: {}", key.as_str()),
         IntegrationEvent::StorageDeleteFinished { key, .. } => {
-            format!("[STORAGE] Removido: {key}")
+            format!("[STORAGE] Removido: {}", key.as_str())
         }
         IntegrationEvent::StorageDeleteFailed {
             key, failure, ..
         } => format!(
-            "[ERROR] STORAGE: remoção não confirmada: {key} ({failure:?})"
+            "[ERROR] STORAGE: remoção não confirmada: {} ({failure:?})",
+            key.as_str()
         ),
         IntegrationEvent::RepositoryBatchStarted {
             writes, deletes, ..
