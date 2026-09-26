@@ -13,6 +13,13 @@ fn read_config() -> Value {
     serde_json::from_str(&text).unwrap()
 }
 
+/// Reads a repository file as LF-normalized text: CI checkouts on Windows may
+/// produce CRLF endings, which must not break structural assertions.
+fn read_source(relative: &str) -> String {
+    let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), relative);
+    std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+}
+
 #[test]
 fn bootstrap_configuration_is_minimal_and_plugin_free() {
     let config = read_config();
@@ -32,8 +39,7 @@ fn bootstrap_never_requires_credentials_and_never_publishes() {
     // The binary entrypoint must not reference the composition root's build
     // functions or any provider verb: opening the app is not a preflight and
     // never executes a publication.
-    let main =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+    let main = read_source("/src/main.rs");
     for forbidden in [
         "preflight_publication(",
         "build_providers(",
@@ -66,8 +72,7 @@ fn composition_root_stays_exported_for_the_desktop() {
 
 #[test]
 fn minimal_frontend_exists_without_framework() {
-    let index =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/index.html")).unwrap();
+    let index = read_source("/ui/index.html");
     assert!(index.contains("Photo Publisher"));
     // No bundler/framework wiring.
     for forbidden in ["react", "vite", "tsx", "jsx"] {
@@ -80,12 +85,9 @@ fn minimal_frontend_exists_without_framework() {
 
 #[test]
 fn ui_assets_are_plain_html_js_css_with_no_framework_or_credentials() {
-    let index =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/index.html")).unwrap();
-    let script =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
-    let style =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/style.css")).unwrap();
+    let index = read_source("/ui/index.html");
+    let script = read_source("/ui/app.js");
+    let style = read_source("/ui/style.css");
     // The shell references exactly the two local assets (no CDN, no bundle).
     assert!(index.contains("href=\"style.css\""));
     assert!(index.contains("src=\"app.js\""));
@@ -93,8 +95,7 @@ fn ui_assets_are_plain_html_js_css_with_no_framework_or_credentials() {
     assert!(!style.contains("https://"));
     assert!(!style.contains("@import"));
     // The bridge used is the only global one exposed by the desktop config.
-    let config_text =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json")).unwrap();
+    let config_text = read_source("/tauri.conf.json");
     assert!(config_text.contains("\"withGlobalTauri\": true"));
     // Frontend calls only these commands; publication is confined to its own
     // handler (see publish_is_called_only_through_the_publish_handler...).
@@ -132,8 +133,7 @@ fn changing_the_project_path_invalidates_the_previous_validation() {
     // Strutural proof of the stale-validation fix: the field must have an
     // `input` listener; the handler must clear the validated state, disable
     // the Dry Run button and hide previous results, and must never call Rust.
-    let script =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let script = read_source("/ui/app.js");
     assert!(
         script.contains("addEventListener(\"input\", onProjectPathChanged)"),
         "project-path must invalidate state on input"
@@ -168,8 +168,7 @@ fn stale_async_validation_results_are_rejected() {
     // Structural proof of the async race fix: onValidate must capture the
     // submitted path up front, re-read the field after the await, and ignore
     // the outcome whenever the field no longer matches.
-    let script =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let script = read_source("/ui/app.js");
     let handler = script
         .split("async function onValidate()")
         .nth(1)
@@ -229,8 +228,7 @@ fn stale_async_validation_results_are_rejected() {
 
 #[test]
 fn publisher_event_listener_is_installed_once_and_uses_the_single_channel() {
-    let script =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let script = read_source("/ui/app.js");
     assert!(
         script.contains("\"publisher://event\""),
         "the listener must target the only published channel"
@@ -262,8 +260,7 @@ fn publisher_event_listener_is_installed_once_and_uses_the_single_channel() {
 
 #[test]
 fn publisher_event_mapping_covers_every_workflow_and_operation_event() {
-    let script =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let script = read_source("/ui/app.js");
     // Workflow lifecycle.
     for lifecycle in ["entered", "left_ok", "left_failed", "finished", "failed"] {
         assert!(
@@ -309,8 +306,7 @@ fn publisher_event_mapping_covers_every_workflow_and_operation_event() {
 
 #[test]
 fn publish_is_called_only_through_the_publish_handler_and_frameworks_stay_out() {
-    let script =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let script = read_source("/ui/app.js");
     // Publication is reachable, but only from onPublish.
     assert!(script.contains("async function onPublish()"));
     let handler = script
@@ -361,8 +357,7 @@ fn command_layer_contains_no_provider_or_network_wiring() {
     // It DOES reuse the existing composition root functions — that is the
     // intended delegation, not duplication. The test reads the library source
     // from disk to avoid self-reference.
-    let source =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs")).unwrap();
+    let source = read_source("/src/commands.rs");
     for forbidden in [
         "provider_github",
         "provider_r2",
@@ -391,9 +386,7 @@ fn binary_registers_exactly_the_four_commands_and_the_single_channel() {
     // set and the event channel feed must remain exactly what this phase
     // specifies. Line endings are normalized (CI checkouts on Windows use
     // CRLF) before any string comparison.
-    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
-        .unwrap()
-        .replace("\r\n", "\n");
+    let source = read_source("/src/main.rs").replace("\r\n", "\n");
     let handler = source
         .split("generate_handler![")
         .nth(1)
@@ -481,9 +474,7 @@ fn publish_v2_without_credentials_fails_before_any_remote_effect() {
 /// in the Tauri wrapper of publish; the library stays synchronous.
 #[test]
 fn publication_boundary_is_async_only_at_the_tauri_wrapper() {
-    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
-        .unwrap()
-        .replace("\r\n", "\n");
+    let source = read_source("/src/main.rs").replace("\r\n", "\n");
     assert!(source.contains("async fn publish_project"));
     assert!(source.contains("tauri::async_runtime::spawn_blocking"));
     assert!(source.contains("fn validate_project("));
@@ -496,11 +487,10 @@ fn publication_boundary_is_async_only_at_the_tauri_wrapper() {
 
 #[test]
 fn the_library_stays_synchronous() {
-    let lib = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
+    let lib = read_source("/src/lib.rs");
     assert!(!lib.contains("tokio"));
     assert!(!lib.contains("spawn_blocking"));
-    let commands =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs")).unwrap();
+    let commands = read_source("/src/commands.rs");
     assert!(!commands.contains("async fn"));
     assert!(!commands.contains("spawn_blocking"));
     // The synchronous application use cases are still the delegations.
@@ -536,8 +526,7 @@ fn event_adapter_has_no_business_or_runtime_surface() {
     // no provider, credential, process, or time sources; no Tauri runtime (the
     // emission lives in the binary). Reads the source from disk to avoid
     // self-reference.
-    let source =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/events.rs")).unwrap();
+    let source = read_source("/src/events.rs");
     for forbidden in [
         "std::time",
         "SystemTime",
@@ -559,8 +548,7 @@ fn event_adapter_has_no_business_or_runtime_surface() {
 
 #[test]
 fn publish_gate_requires_validation_and_dry_run() {
-    let script =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let script = read_source("/ui/app.js");
     // A publish guard must exist and require validated + dryRunReady + the
     // current field still matching the captured path, plus not busy.
     assert!(
@@ -600,8 +588,7 @@ fn publish_gate_requires_validation_and_dry_run() {
 
 #[test]
 fn publish_rejects_stale_results_and_busy_runs() {
-    let script =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let script = read_source("/ui/app.js");
     let handler = script
         .split("async function onPublish()")
         .nth(1)
@@ -629,8 +616,7 @@ fn publish_rejects_stale_results_and_busy_runs() {
 
 #[test]
 fn dry_run_rejects_stale_results_too() {
-    let script =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let script = read_source("/ui/app.js");
     let handler = script
         .split("async function onDryRun()")
         .nth(1)
@@ -660,8 +646,7 @@ fn dry_run_rejects_stale_results_too() {
 
 #[test]
 fn exactly_one_event_listener_is_installed() {
-    let script =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let script = read_source("/ui/app.js");
     let count = script.matches(".listen(\"publisher://event\"").count();
     assert_eq!(count, 1, "exactly one listener registration expected");
 }
