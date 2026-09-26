@@ -69,11 +69,54 @@ fn minimal_frontend_exists_without_framework() {
     let index =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/index.html")).unwrap();
     assert!(index.contains("Photo Publisher"));
-    // No bundler/framework wiring in this phase.
+    // No bundler/framework wiring.
     for forbidden in ["react", "vite", "tsx", "jsx"] {
         assert!(
             !index.to_lowercase().contains(forbidden),
             "frontend must not reference {forbidden} yet"
+        );
+    }
+}
+
+#[test]
+fn ui_assets_are_plain_html_js_css_with_no_framework_or_credentials() {
+    let index =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/index.html")).unwrap();
+    let script =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let style =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/style.css")).unwrap();
+    // The shell references exactly the two local assets (no CDN, no bundle).
+    assert!(index.contains("href=\"style.css\""));
+    assert!(index.contains("src=\"app.js\""));
+    assert!(!index.contains("https://"));
+    assert!(!style.contains("https://"));
+    assert!(!style.contains("@import"));
+    // The bridge used is the only global one exposed by the desktop config.
+    let config_text =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json")).unwrap();
+    assert!(config_text.contains("\"withGlobalTauri\": true"));
+    // Frontend calls only these commands — publish stays out of this phase.
+    assert!(script.contains("validate_project"));
+    assert!(script.contains("dry_run_project"));
+    assert!(script.contains("get_app_info"));
+    assert!(!script.contains("publish_project"));
+    // No credentials, no tokens, no persistent storage, no filesystem access.
+    let script_lower = script.to_lowercase();
+    for forbidden in [
+        "photo_publisher_",
+        "token",
+        "secret",
+        "password",
+        "localstorage",
+        "indexeddb",
+        "sessionstorage",
+        "require(",
+        "import(",
+    ] {
+        assert!(
+            !script_lower.contains(forbidden),
+            "frontend must not reference {forbidden}"
         );
     }
 }

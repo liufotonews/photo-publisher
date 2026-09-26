@@ -2,9 +2,61 @@
 <html lang="pt-BR">
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Photo Publisher</title>
+    <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <div id="app">Photo Publisher</div>
+    <main class="app">
+      <header class="app-header">
+        <h1 id="app-title">Photo Publisher</h1>
+        <p id="app-version" class="version"></p>
+      </header>
+
+      <section class="card" aria-labelledby="project-section-title">
+        <h2 id="project-section-title">Projeto</h2>
+        <label class="field">
+          <span>Caminho do project.json</span>
+          <input
+            id="project-path"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="C:\Projetos\cliente\project.json"
+          />
+        </label>
+        <div class="actions">
+          <button id="validate-button" type="button">Validar projeto</button>
+          <button id="dry-run-button" type="button" disabled>Executar Dry Run</button>
+        </div>
+      </section>
+
+      <section id="project-result" class="card result" hidden aria-live="polite">
+        <h2 id="project-result-title">Resultado da validação</h2>
+        <p id="project-status" class="status"></p>
+        <dl id="project-summary" class="summary">
+          <div><dt>Nome</dt><dd id="project-name"></dd></div>
+          <div><dt>ID</dt><dd id="project-id"></dd></div>
+          <div><dt>Tipo</dt><dd id="project-kind"></dd></div>
+        </dl>
+      </section>
+
+      <section id="dry-run-result" class="card result" hidden aria-live="polite">
+        <h2 id="dry-run-result-title">Dry Run</h2>
+        <p id="dry-run-status" class="status"></p>
+        <dl id="dry-run-summary" class="summary">
+          <div><dt>Geração</dt><dd id="dry-run-generation"></dd></div>
+          <div><dt>Storage</dt><dd id="dry-run-storage"></dd></div>
+          <div><dt>Repository</dt><dd id="dry-run-repository"></dd></div>
+          <div><dt>Hosting</dt><dd id="dry-run-hosting"></dd></div>
+          <div><dt>Reconciliação</dt><dd id="dry-run-reconciliation"></dd></div>
+        </dl>
+      </section>
+
+      <footer class="statusbar">
+        Status: <span id="global-status" role="status">Pronto</span>
+      </footer>
+    </main>
+    <script src="app.js"></script>
   </body>
 </html>
