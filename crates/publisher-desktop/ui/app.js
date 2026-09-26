@@ -4,8 +4,12 @@
 // window.__TAURI__.core.invoke. Nenhum estado é persistido (sem
 // armazenamento de navegador nem escrita em disco — o caminho do projeto
 // vive só em memória, neste módulo).
+//
+// Os eventos do backend chegam pelo canal único "publisher://event" e são
+// apresentados na área "Atividade" (também sem persistência).
 
 const tauri = window.__TAURI__ ? window.__TAURI__.core : null;
+const tauriEvents = window.__TAURI__ ? window.__TAURI__.event : null;
 
 const state = {
   projectPath: "",
@@ -68,6 +72,123 @@ function showDryRunError(error) {
   el("dry-run-storage").textContent = "";
   el("dry-run-hosting").textContent = "";
   el("dry-run-reconciliation").textContent = "";
+}
+
+// ---------------------------------------------------------------------------
+// Event bridge (publisher://event)
+//
+// The listener translates each DesktopEvent into a friendly message and shows
+// it in the activity area. It is presentation only: no state machine, no
+// queue, no persistence, no per-event backend calls.
+// ---------------------------------------------------------------------------
+
+const WORKFLOW_STEP_MESSAGES = {
+  load_project: {
+    entered: "Carregando projeto…",
+    left_ok: "Projeto carregado.",
+    left_failed: "Falha ao carregar o projeto.",
+  },
+  validate_project: {
+    entered: "Validando projeto…",
+    left_ok: "Projeto validado.",
+    left_failed: "Falha na validação do projeto.",
+  },
+  inspect_project: {
+    entered: "Inspecionando publicação…",
+    left_ok: "Inspeção concluída.",
+    left_failed: "Falha na inspeção.",
+  },
+  recover_publication: {
+    entered: "Verificando recuperação…",
+    left_ok: "Recuperação verificada.",
+    left_failed: "Falha na recuperação.",
+  },
+  preflight: {
+    entered: "Preparando publicação…",
+    left_ok: "Preparação concluída.",
+    left_failed: "Falha na preparação.",
+  },
+  local_publication: {
+    entered: "Preparando publicação local…",
+    left_ok: "Publicação local pronta.",
+    left_failed: "Falha na publicação local.",
+  },
+  build_plan: {
+    entered: "Calculando alterações…",
+    left_ok: "Alterações calculadas.",
+    left_failed: "Falha ao calcular alterações.",
+  },
+  publish_integrate: {
+    entered: "Publicando…",
+    left_ok: "Publicação concluída.",
+    left_failed: "Falha na publicação.",
+  },
+  dry_run: {
+    entered: "Simulando publicação…",
+    left_ok: "Simulação concluída.",
+    left_failed: "Falha na simulação.",
+  },
+};
+
+const OPERATION_MESSAGES = {
+  storage_put_started: "Enviando arquivo…",
+  storage_put_finished: "Arquivo enviado.",
+  storage_put_failed: "Falha no envio do arquivo.",
+  storage_delete_started: "Removendo arquivo…",
+  storage_delete_finished: "Arquivo removido.",
+  storage_delete_failed: "Falha ao remover arquivo.",
+  repository_batch_started: "Atualizando galeria…",
+  repository_batch_finished: "Galeria atualizada.",
+  repository_batch_failed: "Falha ao atualizar a galeria.",
+  hosting_publish_started: "Publicando site…",
+  hosting_publish_finished: "Site publicado.",
+  hosting_publish_failed: "Falha ao publicar o site.",
+};
+
+// Maximum rendered entries — kept bounded so a single long run cannot grow
+// the list forever. Presentation-only trim.
+const ACTIVITY_LIMIT = 100;
+
+function describePublisherEvent(event) {
+  if (!event || typeof event.type !== "string") {
+    return null;
+  }
+  if (event.type === "workflow" && event.data) {
+    if (event.data.lifecycle === "finished") return { text: "Operação concluída." };
+    if (event.data.lifecycle === "failed") return { text: "Operação falhou.", failed: true };
+    const step = WORKFLOW_STEP_MESSAGES[event.data.step];
+    const text = step ? step[event.data.lifecycle] : null;
+    return text
+      ? { text, failed: event.data.lifecycle === "left_failed" }
+      : null;
+  }
+  if (event.type === "operation" && event.data) {
+    const text = OPERATION_MESSAGES[event.data.event];
+    return text ? { text, failed: event.data.event.endsWith("_failed") } : null;
+  }
+  return null;
+}
+
+function addActivity(message, failed) {
+  const list = el("activity-list");
+  const item = document.createElement("li");
+  item.textContent = message;
+  if (failed) item.classList.add("failed");
+  list.appendChild(item);
+  while (list.children.length > ACTIVITY_LIMIT) {
+    list.removeChild(list.firstChild);
+  }
+  item.scrollIntoView(false);
+}
+
+async function installPublisherEventListener() {
+  if (!tauriEvents) return;
+  await tauriEvents.listen("publisher://event", (message) => {
+    const described = describePublisherEvent(message.payload);
+    if (described) {
+      addActivity(described.text, described.failed);
+    }
+  });
 }
 
 async function onValidate() {
@@ -135,6 +256,8 @@ async function main() {
   el("validate-button").addEventListener("click", onValidate);
   el("dry-run-button").addEventListener("click", onDryRun);
   el("project-path").addEventListener("input", onProjectPathChanged);
+  // The event listener is installed once, at startup.
+  installPublisherEventListener();
   if (tauri) {
     try {
       const info = await tauri.invoke("get_app_info");

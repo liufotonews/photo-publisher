@@ -222,6 +222,107 @@ fn stale_async_validation_results_are_rejected() {
 }
 
 #[test]
+fn publisher_event_listener_is_installed_once_and_uses_the_single_channel() {
+    let script =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    assert!(
+        script.contains("\"publisher://event\""),
+        "the listener must target the only published channel"
+    );
+    assert!(
+        script.contains("__TAURI__.event"),
+        "events must come through the Tauri event API"
+    );
+    assert!(
+        script.contains(".listen(\"publisher://event\""),
+        "the event API must be used with listen()"
+    );
+    assert!(
+        script.contains("function installPublisherEventListener()"),
+        "the installer must exist"
+    );
+    let main = script
+        .split("async function main()")
+        .nth(1)
+        .expect("main must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(
+        main.contains("installPublisherEventListener()"),
+        "the listener must be installed during startup"
+    );
+}
+
+#[test]
+fn publisher_event_mapping_covers_every_workflow_and_operation_event() {
+    let script =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    // Workflow lifecycle.
+    for lifecycle in ["entered", "left_ok", "left_failed", "finished", "failed"] {
+        assert!(
+            script.contains(lifecycle),
+            "lifecycle {lifecycle} must be presented"
+        );
+    }
+    // Workflow steps currently producible by the application layer.
+    for step in [
+        "load_project",
+        "validate_project",
+        "inspect_project",
+        "recover_publication",
+        "preflight",
+        "local_publication",
+        "build_plan",
+        "publish_integrate",
+        "dry_run",
+    ] {
+        assert!(script.contains(step), "workflow step {step} must be mapped");
+    }
+    // Every granular operation event, exactly as serialized (snake_case).
+    for operation in [
+        "storage_put_started",
+        "storage_put_finished",
+        "storage_put_failed",
+        "storage_delete_started",
+        "storage_delete_finished",
+        "storage_delete_failed",
+        "repository_batch_started",
+        "repository_batch_finished",
+        "repository_batch_failed",
+        "hosting_publish_started",
+        "hosting_publish_finished",
+        "hosting_publish_failed",
+    ] {
+        assert!(
+            script.contains(operation),
+            "operation {operation} must be mapped"
+        );
+    }
+}
+
+#[test]
+fn the_ui_still_does_not_call_publish_and_uses_no_library() {
+    let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js"))
+        .unwrap()
+        .to_lowercase();
+    assert!(!script.contains("publish_project"));
+    for forbidden in [
+        "react.js",
+        "react-dom",
+        "from \"react",
+        "vite.config",
+        ".tsx",
+        ".jsx",
+    ] {
+        assert!(
+            !script.contains(forbidden),
+            "frontend must avoid {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn command_layer_contains_no_provider_or_network_wiring() {
     // Structural guarantee: the commands module is a pure adapter, so it must
     // not reference concrete providers, credentials directly, or remote verbs.
