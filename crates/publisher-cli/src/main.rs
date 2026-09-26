@@ -6,7 +6,8 @@ use serde_json::{json, Value};
 use std::env;
 use std::path::{Path, PathBuf};
 
-use publisher_app::{ApplicationEvent, EventSink};
+use publisher_app::ApplicationEvent;
+use publisher_app::events::EventSink;
 
 mod output;
 mod runtime;
