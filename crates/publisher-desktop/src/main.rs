@@ -50,12 +50,32 @@ fn validate_project(
     publisher_desktop::commands::validate_project(&project_path, &mut forward_events(&app_handle))
 }
 
+/// Publication is long-running (scanning, hashing, uploads, commit, deploy):
+/// run it off the caller's context so the UI stays responsive. The heavy
+/// work stays fully synchronous inside `commands::publish_project`; only the
+/// boundary is async. Events are emitted from the background closure through
+/// the same single channel; emission failure never changes the outcome.
 #[tauri::command]
-fn publish_project(
+async fn publish_project(
     app_handle: tauri::AppHandle,
     project_path: String,
 ) -> Result<PublishOutcomeDto, CommandError> {
-    publisher_desktop::commands::publish_project(&project_path, &mut forward_events(&app_handle))
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut sink = |event: publisher_app::ApplicationEvent| {
+            let _ = app_handle.emit(
+                publisher_desktop::events::PUBLISHER_EVENT_CHANNEL,
+                publisher_desktop::events::DesktopEvent::from(&event),
+            );
+        };
+        publisher_desktop::commands::publish_project(&project_path, &mut sink)
+    })
+    .await
+    .map_err(|_| CommandError {
+        kind: publisher_app::ApplicationErrorKind::Internal
+            .as_str()
+            .to_owned(),
+        message: "publication task failed to join".to_owned(),
+    })?
 }
 
 #[tauri::command]

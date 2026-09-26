@@ -201,6 +201,59 @@ fn publish_v2_without_credentials_fails_before_any_remote_effect() {
         .any(|event| matches!(event, publisher_app::ApplicationEvent::Operation(_))));
 }
 
+/// The desktop-wide invariant of phase 6-F.7: the async boundary exists only
+/// in the Tauri wrapper of publish; the library stays synchronous.
+#[test]
+fn publication_boundary_is_async_only_at_the_tauri_wrapper() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(source.contains("async fn publish_project"));
+    assert!(source.contains("tauri::async_runtime::spawn_blocking"));
+    assert!(source.contains("fn validate_project("));
+    assert!(source.contains("fn dry_run_project("));
+    assert!(source.contains("fn get_app_info("));
+    // Exactly one async point exists: the publish wrapper.
+    assert_eq!(source.matches("async fn").count(), 1);
+    assert_eq!(source.matches("spawn_blocking").count(), 1);
+}
+
+#[test]
+fn the_library_stays_synchronous() {
+    let lib = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
+    assert!(!lib.contains("tokio"));
+    assert!(!lib.contains("spawn_blocking"));
+    let commands =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs")).unwrap();
+    assert!(!commands.contains("async fn"));
+    assert!(!commands.contains("spawn_blocking"));
+    // The synchronous application use cases are still the delegations.
+    assert!(commands.contains("publisher_app::publish_project"));
+    assert!(commands.contains("publisher_app::dry_run_project"));
+}
+
+#[test]
+fn no_global_state_or_manual_leaks() {
+    let mut source = String::new();
+    for file in [
+        "lib.rs",
+        "commands.rs",
+        "composition.rs",
+        "events.rs",
+        "main.rs",
+    ] {
+        source.push_str(
+            &std::fs::read_to_string(format!("{}/src/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap(),
+        );
+    }
+    for forbidden in ["static mut", "OnceLock", "Lazy", "Box::leak", "unsafe "] {
+        assert!(
+            !source.contains(forbidden),
+            "desktop must not introduce {forbidden}"
+        );
+    }
+}
+
 #[test]
 fn event_adapter_has_no_business_or_runtime_surface() {
     // Structural guarantee: the adapter module translates and nothing else —
