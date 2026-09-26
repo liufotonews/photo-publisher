@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/contract-validator",
+    "crates/publisher-app",
     "crates/publisher-core",
     "crates/publisher-pipeline",
     "crates/publisher-cli",

@@ -1,9 +1,6 @@
 use anyhow::{bail, Result};
-use photo_publisher_contract_validator::{
-    compile_embedded_schema, load_json, validate_value, EmbeddedSchema,
-};
 use photo_publisher_core::{load_state, plan_sync, scan_jpegs, SyncAction};
-use photo_publisher_pipeline::{build_local_gallery, recover_publication, PipelineOptions};
+use photo_publisher_pipeline::{build_local_gallery, PipelineOptions};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::env;
@@ -92,6 +89,14 @@ impl CliError {
     }
     fn from_any(kind: ErrorKind, error: impl std::fmt::Display) -> Self {
         Self::new(kind, error.to_string())
+    }
+}
+
+/// Errors produced by the application layer carry their own stable category;
+/// converting to the CLI error preserves it exactly (including exit codes).
+impl From<publisher_app::ApplicationError> for CliError {
+    fn from(error: publisher_app::ApplicationError) -> Self {
+        map_app_error(error)
     }
 }
 
@@ -224,16 +229,63 @@ fn parse_args(args: Vec<String>) -> Result<Request> {
 }
 
 fn validate_command(project_path: &Path) -> CliResult<Value> {
-    let project = load_project(project_path)?;
-    let info = project_info(project_path, &project);
-    let source = required_source(project_path, &project)?;
-    if !source.is_dir() {
-        return Err(CliError::new(
-            ErrorKind::ResourceMissing,
-            format!("source directory does not exist: {}", source.display()),
-        ));
+    let outcome = publisher_app::validate_project(project_path, &mut |_event| {})?;
+    Ok(json!({
+        "valid": true,
+        "project": ProjectInfo {
+            project_id: Some(outcome.project_id),
+            project_name: Some(outcome.project_name),
+            source: Some(outcome.source_declared),
+            output: outcome.output_dir.display().to_string(),
+        },
+        "source_exists": true,
+    }))
+}
+
+/// Maps application outcomes to the long-standing JSON shape of `inspect`.
+/// Field names and presence are unchanged.
+fn inspect_outcome_to_info(outcome: &publisher_app::InspectOutcome) -> InspectInfo {
+    InspectInfo {
+        project: ProjectInfo {
+            project_id: outcome.project_id.clone(),
+            project_name: outcome.project_name.clone(),
+            source: outcome.source_declared.clone(),
+            output: outcome.output_dir.display().to_string(),
+        },
+        generation: outcome
+            .journal
+            .as_ref()
+            .map(|journal| journal.generation.clone()),
+        publication_state: outcome
+            .journal
+            .as_ref()
+            .map(|journal| format!("{:?}", journal.phase)),
+        journal_present: outcome.journal_present,
+        recovery_pending: outcome.recovery_pending(),
+        photo_count: outcome.photo_count,
     }
-    Ok(json!({"valid": true, "project": info, "source_exists": true}))
+}
+
+fn inspect_command(project_path: &Path) -> CliResult<Value> {
+    let outcome = publisher_app::inspect_project(project_path, &mut |_event| {})?;
+    serde_json::to_value(inspect_outcome_to_info(&outcome))
+        .map_err(|e| CliError::from_any(ErrorKind::Internal, e))
+}
+
+fn recover_command(project_path: &Path) -> CliResult<Value> {
+    let outcome = publisher_app::recover_publication(project_path, &mut |_event| {})?;
+    Ok(json!({
+        "recovery_attempted": outcome.attempted,
+        "recovery_needed": outcome.state.as_ref().is_some_and(|state| state.recovery_needed),
+        "generation": outcome.state.as_ref().map(|state| state.generation.clone()),
+        "output": outcome.output_dir,
+        "project": ProjectInfo {
+            project_id: outcome.project_id,
+            project_name: outcome.project_name,
+            source: outcome.source_declared,
+            output: outcome.output_dir.display().to_string(),
+        },
+    }))
 }
 
 fn publish_command(project_path: &Path, flags: &Flags) -> CliResult<Value> {
@@ -265,9 +317,26 @@ fn publish_command(project_path: &Path, flags: &Flags) -> CliResult<Value> {
                 SyncAction::Remove { .. } => removes += 1,
             }
         }
-        // Integrated dry-run view: computed without touching providers and
-        // without writing the ledger (null when not applicable).
-        let integration = runtime::dry_run_integration(project_path, &output);
+        // Integrated dry-run view: computed by the application layer without
+        // touching providers and without writing the ledger (null when not
+        // applicable, e.g., schema v1 or nothing committed yet).
+        let integration = if project["schemaVersion"].as_u64() == Some(2) {
+            publisher_app::dry_run_project(project_path, &mut |_| {})
+                .map(|outcome| {
+                    json!({
+                        "planned": true,
+                        "operations": {
+                            "storage": outcome.storage_operations,
+                            "repository": outcome.repository_operations,
+                            "hosting": outcome.hosting_operations,
+                        },
+                        "reconciliation_requirements": outcome.reconciliation_requirements,
+                    })
+                })
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
         return Ok(
             json!({"dry_run": true, "would_publish": adds + updates + removes > 0 || !output.join("gallery.json").exists(), "plan": {"add": adds, "update": updates, "remove": removes}, "output": output, "integration": integration}),
         );
@@ -280,123 +349,105 @@ fn publish_command(project_path: &Path, flags: &Flags) -> CliResult<Value> {
     } else {
         None
     };
+    if let Some(configuration) = integrated_config {
+        // Composition root: concrete providers are built here, and the
+        // orchestration runs in the application layer over trait objects.
+        let mut wire = runtime::compose_providers(&configuration)?;
+        let credentials = runtime::credential_store();
+        let outcome = publisher_app::publish_project(
+            project_path,
+            Some(&configuration),
+            publisher_app::PublishOptions,
+            &mut publisher_app::PublicationProviders {
+                storage: &mut wire.storage,
+                repository: &mut wire.repository,
+                hosting: &mut wire.hosting,
+                credentials: &credentials,
+            },
+            &mut |_| {},
+        )
+        .map_err(map_app_error)?;
+        return Ok(json!({
+            "published": true,
+            "source": source,
+            "output": output,
+            "integrated": integrated_json(&outcome),
+        }));
+    }
     build_local_gallery(&PipelineOptions {
         source_dir: source.clone(),
         output_dir: output.clone(),
         project_title: title.to_string(),
     })
     .map_err(|e| CliError::from_any(ErrorKind::Publication, e))?;
-    if let Some(configuration) = integrated_config {
-        let integrated = runtime::publish_integrated(&configuration, &output)?;
-        return Ok(json!({
-            "published": true,
-            "source": source,
-            "output": output,
-            "integrated": integrated,
-        }));
-    }
     Ok(json!({"published": true, "source": source, "output": output}))
 }
 
-fn recover_command(project_path: &Path) -> CliResult<Value> {
-    let project = load_project(project_path)?;
-    let output = output_path(project_path);
-    let recovered =
-        recover_publication(&output).map_err(|e| CliError::from_any(ErrorKind::Recovery, e))?;
-    Ok(
-        json!({"recovery_attempted": true, "recovery_needed": recovered.as_ref().is_some_and(|r| !matches!(r.phase, photo_publisher_pipeline::journal::JournalPhase::Committed)), "generation": recovered.map(|r| r.generation), "output": output, "project": project_info(project_path, &project)}),
-    )
-}
-
-fn inspect_command(project_path: &Path) -> CliResult<Value> {
-    let project = load_project(project_path)?;
-    let output = output_path(project_path);
-    let journal_path = output.join(".publisher/journal.json");
-    let journal = if journal_path.is_file() {
-        Some(
-            photo_publisher_pipeline::journal::read_journal(&journal_path).map_err(|e| {
-                CliError::from_any(ErrorKind::Recovery, format!("invalid journal: {e}"))
-            })?,
-        )
-    } else {
-        None
+/// Presentation-only JSON for the integrated section of `publish`. This
+/// mapping is a CLI concern and intentionally lives outside the application
+/// layer.
+fn integrated_json(outcome: &publisher_app::PublishOutcome) -> Value {
+    use publisher_app::PublicationOutcome;
+    let (storage, repository, hosting) = match &outcome.publication {
+        PublicationOutcome::Published(report) => (
+            report.storage.as_ref().map(|report| {
+                json!({
+                    "uploaded": report.uploaded.len(),
+                    "deleted": report.deleted.len(),
+                })
+            }),
+            report.repository.as_ref().map(|report| {
+                json!({
+                    "written": report.written.len(),
+                    "deleted": report.deleted.len(),
+                    "revision": report.revision,
+                })
+            }),
+            report.hosting.as_ref().map(|report| {
+                json!({
+                    "deployment": report.deployment.as_ref().map(|deployment| json!({
+                        "id": deployment.id,
+                        "url": deployment.url,
+                    })),
+                })
+            }),
+        ),
+        _ => (None, None, None),
     };
-    let state_path = output.join(".publisher/state.json");
-    let state = if state_path.is_file() {
-        Some(load_state(&state_path).map_err(|e| {
-            CliError::from_any(ErrorKind::Validation, format!("invalid state: {e}"))
-        })?)
-    } else {
-        None
-    };
-    let recovery_pending = journal.as_ref().is_some_and(|r| {
-        !matches!(
-            r.phase,
-            photo_publisher_pipeline::journal::JournalPhase::Committed
-        )
-    });
-    let info = InspectInfo {
-        project: project_info(project_path, &project),
-        generation: journal.as_ref().map(|r| r.generation.clone()),
-        publication_state: journal.as_ref().map(|r| format!("{:?}", r.phase)),
-        journal_present: journal_path.is_file(),
-        recovery_pending,
-        photo_count: state.map(|s| s.photos.len()),
-    };
-    serde_json::to_value(info).map_err(|e| CliError::from_any(ErrorKind::Internal, e))
-}
-
-fn load_project(path: &Path) -> CliResult<Value> {
-    if !path.is_file() {
-        return Err(CliError::new(
-            ErrorKind::ResourceMissing,
-            format!("project file does not exist: {}", path.display()),
-        ));
-    }
-    let project = load_json(path).map_err(|e| CliError::from_any(ErrorKind::ProjectInvalid, e))?;
-    let validator = compile_embedded_schema(EmbeddedSchema::Project)
-        .map_err(|e| CliError::from_any(ErrorKind::Internal, e))?;
-    validate_value(&validator, &project).map_err(|e| {
-        CliError::from_any(
-            ErrorKind::ProjectInvalid,
-            format!("project.json contract validation failed: {e}"),
-        )
-    })?;
-    Ok(project)
-}
-
-fn required_source(project_path: &Path, project: &Value) -> CliResult<PathBuf> {
-    if project["source"]["type"].as_str() != Some("folder") {
-        return Err(CliError::new(
-            ErrorKind::ProjectInvalid,
-            "project.source.type must be folder for local CLI operations",
-        ));
-    }
-    let raw = project["source"]["path"].as_str().ok_or_else(|| {
-        CliError::new(ErrorKind::ProjectInvalid, "project.source.path is required")
-    })?;
-    let path = PathBuf::from(raw);
-    Ok(if path.is_absolute() {
-        path
-    } else {
-        project_path.parent().unwrap_or(Path::new(".")).join(path)
+    json!({
+        "generation": outcome.generation,
+        "storage": storage,
+        "repository": repository,
+        "hosting": hosting,
     })
 }
 
-fn output_path(project_path: &Path) -> PathBuf {
-    project_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("output")
+fn load_project(path: &Path) -> CliResult<Value> {
+    // The authoritative document loading/validation lives in the application
+    // layer; the CLI preserves exactly the same classification and message.
+    publisher_app::load_project_document(path).map_err(map_app_error)
 }
 
-fn project_info(project_path: &Path, project: &Value) -> ProjectInfo {
-    ProjectInfo {
-        project_id: project["project"]["id"].as_str().map(str::to_owned),
-        project_name: project["project"]["name"].as_str().map(str::to_owned),
-        source: project["source"]["path"].as_str().map(str::to_owned),
-        output: output_path(project_path).display().to_string(),
-    }
+fn map_app_error(error: publisher_app::ApplicationError) -> CliError {
+    let kind = match error.kind {
+        publisher_app::ApplicationErrorKind::ProjectInvalid => ErrorKind::ProjectInvalid,
+        publisher_app::ApplicationErrorKind::ResourceMissing => ErrorKind::ResourceMissing,
+        publisher_app::ApplicationErrorKind::Validation => ErrorKind::Validation,
+        publisher_app::ApplicationErrorKind::Publication => ErrorKind::Publication,
+        publisher_app::ApplicationErrorKind::Recovery => ErrorKind::Recovery,
+        publisher_app::ApplicationErrorKind::Internal => ErrorKind::Internal,
+    };
+    CliError::new(kind, error.to_string())
+}
+
+fn required_source(project_path: &Path, project: &Value) -> CliResult<PathBuf> {
+    // Identical rule as before, now owned by the application layer: the
+    // matched messages and classifications are preserved unchanged.
+    publisher_app::resolve_source_dir(project_path, project).map_err(map_app_error)
+}
+
+fn output_path(project_path: &Path) -> PathBuf {
+    publisher_app::resolve_output_dir(project_path)
 }
 
 fn command_name(command: Command) -> &'static str {

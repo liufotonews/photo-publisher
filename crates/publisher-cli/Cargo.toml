@@ -20,6 +20,7 @@ photo-publisher-provider-contracts = { path = "../provider-contracts" }
 photo-publisher-provider-github = { path = "../provider-github" }
 photo-publisher-provider-r2 = { path = "../provider-r2" }
 photo-publisher-provider-vercel = { path = "../provider-vercel" }
+publisher-app = { path = "../publisher-app" }
 
 [dev-dependencies]
 tempfile = "3.27"
