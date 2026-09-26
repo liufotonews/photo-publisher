@@ -6,6 +6,9 @@ use serde_json::{json, Value};
 use std::env;
 use std::path::{Path, PathBuf};
 
+use publisher_app::{ApplicationEvent, EventSink};
+
+mod output;
 mod runtime;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -154,11 +157,17 @@ fn main() {
             std::process::exit(ErrorKind::Internal.code());
         }
     };
+    let verbose = request.flags.verbose && !request.flags.silent;
+    let mut events = move |event: ApplicationEvent| {
+        if verbose {
+            eprintln!("{}", output::format_event(&event));
+        }
+    };
     let result = match request.command {
-        Command::Validate => validate_command(project),
-        Command::Publish => publish_command(project, &request.flags),
-        Command::Recover => recover_command(project),
-        Command::Inspect => inspect_command(project),
+        Command::Validate => validate_command(project, &mut events),
+        Command::Publish => publish_command(project, &request.flags, &mut events),
+        Command::Recover => recover_command(project, &mut events),
+        Command::Inspect => inspect_command(project, &mut events),
         Command::Version | Command::Help => unreachable!(),
     };
     match result {
@@ -228,8 +237,8 @@ fn parse_args(args: Vec<String>) -> Result<Request> {
     })
 }
 
-fn validate_command(project_path: &Path) -> CliResult<Value> {
-    let outcome = publisher_app::validate_project(project_path, &mut |_event| {})?;
+fn validate_command(project_path: &Path, events: &mut EventSink<'_>) -> CliResult<Value> {
+    let outcome = publisher_app::validate_project(project_path, events)?;
     Ok(json!({
         "valid": true,
         "project": ProjectInfo {
@@ -266,14 +275,14 @@ fn inspect_outcome_to_info(outcome: &publisher_app::InspectOutcome) -> InspectIn
     }
 }
 
-fn inspect_command(project_path: &Path) -> CliResult<Value> {
-    let outcome = publisher_app::inspect_project(project_path, &mut |_event| {})?;
+fn inspect_command(project_path: &Path, events: &mut EventSink<'_>) -> CliResult<Value> {
+    let outcome = publisher_app::inspect_project(project_path, events)?;
     serde_json::to_value(inspect_outcome_to_info(&outcome))
         .map_err(|e| CliError::from_any(ErrorKind::Internal, e))
 }
 
-fn recover_command(project_path: &Path) -> CliResult<Value> {
-    let outcome = publisher_app::recover_publication(project_path, &mut |_event| {})?;
+fn recover_command(project_path: &Path, events: &mut EventSink<'_>) -> CliResult<Value> {
+    let outcome = publisher_app::recover_publication(project_path, events)?;
     Ok(json!({
         "recovery_attempted": outcome.attempted,
         "recovery_needed": outcome.state.as_ref().is_some_and(|state| state.recovery_needed),
@@ -288,7 +297,11 @@ fn recover_command(project_path: &Path) -> CliResult<Value> {
     }))
 }
 
-fn publish_command(project_path: &Path, flags: &Flags) -> CliResult<Value> {
+fn publish_command(
+    project_path: &Path,
+    flags: &Flags,
+    events: &mut EventSink<'_>,
+) -> CliResult<Value> {
     let project = load_project(project_path)?;
     let source = required_source(project_path, &project)?;
     if !source.is_dir() {
@@ -321,7 +334,7 @@ fn publish_command(project_path: &Path, flags: &Flags) -> CliResult<Value> {
         // touching providers and without writing the ledger (null when not
         // applicable, e.g., schema v1 or nothing committed yet).
         let integration = if project["schemaVersion"].as_u64() == Some(2) {
-            publisher_app::dry_run_project(project_path, &mut |_| {})
+            publisher_app::dry_run_project(project_path, events)
                 .map(|outcome| {
                     json!({
                         "planned": true,
@@ -364,7 +377,7 @@ fn publish_command(project_path: &Path, flags: &Flags) -> CliResult<Value> {
                 hosting: &mut wire.hosting,
                 credentials: &credentials,
             },
-            &mut |_| {},
+            events,
         )
         .map_err(map_app_error)?;
         return Ok(json!({
