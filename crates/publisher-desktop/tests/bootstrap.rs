@@ -122,6 +122,42 @@ fn ui_assets_are_plain_html_js_css_with_no_framework_or_credentials() {
 }
 
 #[test]
+fn changing_the_project_path_invalidates_the_previous_validation() {
+    // Strutural proof of the stale-validation fix: the field must have an
+    // `input` listener; the handler must clear the validated state, disable
+    // the Dry Run button and hide previous results, and must never call Rust.
+    let script =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    assert!(
+        script.contains("addEventListener(\"input\", onProjectPathChanged)"),
+        "project-path must invalidate state on input"
+    );
+    let handler = script
+        .split("function onProjectPathChanged()")
+        .nth(1)
+        .expect("onProjectPathChanged must exist")
+        .split("\n}")
+        .next()
+        .unwrap();
+    for required in [
+        "state.validated = false",
+        "state.projectPath = \"\"",
+        "dry-run-button\").disabled = true",
+        "hide(\"project-result\")",
+        "hide(\"dry-run-result\")",
+    ] {
+        assert!(
+            handler.contains(required),
+            "handler must contain {required}"
+        );
+    }
+    assert!(
+        !handler.contains("invoke"),
+        "invalidation must not call Rust: {handler}"
+    );
+}
+
+#[test]
 fn command_layer_contains_no_provider_or_network_wiring() {
     // Structural guarantee: the commands module is a pure adapter, so it must
     // not reference concrete providers, credentials directly, or remote verbs.

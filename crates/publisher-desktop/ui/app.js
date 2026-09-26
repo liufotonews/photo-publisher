@@ -92,6 +92,20 @@ async function onValidate() {
   }
 }
 
+// Uma alteração ao caminho invalida qualquer validação anterior: a UI deixa
+// de ser "validada", o Dry Run fica desabilitado e os resultados anteriores
+// são removidos. Nada é executado e nada de Rust é chamado.
+function onProjectPathChanged() {
+  state.validated = false;
+  state.projectPath = "";
+  el("dry-run-button").disabled = true;
+  hide("project-result");
+  hide("dry-run-result");
+  if (!state.busy) {
+    el("global-status").textContent = "Pronto";
+  }
+}
+
 async function onDryRun() {
   if (state.busy || !state.validated) return;
   hide("dry-run-result");
@@ -109,6 +123,7 @@ async function onDryRun() {
 async function main() {
   el("validate-button").addEventListener("click", onValidate);
   el("dry-run-button").addEventListener("click", onDryRun);
+  el("project-path").addEventListener("input", onProjectPathChanged);
   if (tauri) {
     try {
       const info = await tauri.invoke("get_app_info");
