@@ -4,8 +4,8 @@
 //! events remain provider-neutral domain data; this formatter is the CLI's
 //! human-facing view of those events.
 
-use publisher_app::{ApplicationEvent, WorkflowStep};
 use photo_publisher_integration::IntegrationEvent;
+use publisher_app::{ApplicationEvent, WorkflowStep};
 
 pub fn format_event(event: &ApplicationEvent) -> String {
     match event {
@@ -52,9 +52,7 @@ fn format_operation(event: &IntegrationEvent) -> String {
         IntegrationEvent::StoragePutFinished { key, .. } => {
             format!("[STORAGE] Concluído: {}", key.as_str())
         }
-        IntegrationEvent::StoragePutFailed {
-            key, failure, ..
-        } => format!(
+        IntegrationEvent::StoragePutFailed { key, failure, .. } => format!(
             "[ERROR] STORAGE: upload não confirmado: {} ({failure:?})",
             key.as_str()
         ),
@@ -64,17 +62,15 @@ fn format_operation(event: &IntegrationEvent) -> String {
         IntegrationEvent::StorageDeleteFinished { key, .. } => {
             format!("[STORAGE] Removido: {}", key.as_str())
         }
-        IntegrationEvent::StorageDeleteFailed {
-            key, failure, ..
-        } => format!(
+        IntegrationEvent::StorageDeleteFailed { key, failure, .. } => format!(
             "[ERROR] STORAGE: remoção não confirmada: {} ({failure:?})",
             key.as_str()
         ),
         IntegrationEvent::RepositoryBatchStarted {
             writes, deletes, ..
-        } => format!(
-            "[REPOSITORY] Preparando lote: {writes} arquivos escritos, {deletes} removidos"
-        ),
+        } => {
+            format!("[REPOSITORY] Preparando lote: {writes} arquivos escritos, {deletes} removidos")
+        }
         IntegrationEvent::RepositoryBatchFinished { revision, .. } => match revision {
             Some(revision) => format!("[REPOSITORY] Commit concluído: {revision}"),
             None => "[REPOSITORY] Commit concluído".to_owned(),
@@ -82,9 +78,7 @@ fn format_operation(event: &IntegrationEvent) -> String {
         IntegrationEvent::RepositoryBatchFailed { failure, .. } => {
             format!("[ERROR] REPOSITORY: lote não concluído ({failure:?})")
         }
-        IntegrationEvent::HostingPublishStarted { .. } => {
-            "[HOSTING] Publicando galeria".to_owned()
-        }
+        IntegrationEvent::HostingPublishStarted { .. } => "[HOSTING] Publicando galeria".to_owned(),
         IntegrationEvent::HostingPublishFinished {
             deployment_id, url, ..
         } => format!("[HOSTING] Deployment concluído: {deployment_id} ({url})"),
@@ -122,10 +116,7 @@ mod tests {
             index: 2,
             total: 7,
         });
-        assert_eq!(
-            format_event(&event),
-            "[STORAGE] Upload 2/7: photos/a.jpg"
-        );
+        assert_eq!(format_event(&event), "[STORAGE] Upload 2/7: photos/a.jpg");
     }
 
     #[test]
