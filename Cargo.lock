@@ -2500,6 +2500,16 @@ dependencies = [
 [[package]]
 name = "publisher-desktop"
 version = "0.1.0"
+dependencies = [
+ "photo-publisher-integration",
+ "photo-publisher-provider-contracts",
+ "photo-publisher-provider-github",
+ "photo-publisher-provider-r2",
+ "photo-publisher-provider-vercel",
+ "publisher-app",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "pulp"

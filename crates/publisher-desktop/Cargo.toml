@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+publisher-app = { path = "../publisher-app" }
+photo-publisher-integration = { path = "../publisher-integration" }
+photo-publisher-provider-contracts = { path = "../provider-contracts" }
+photo-publisher-provider-github = { path = "../provider-github" }
+photo-publisher-provider-r2 = { path = "../provider-r2" }
+photo-publisher-provider-vercel = { path = "../provider-vercel" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
