@@ -42,10 +42,27 @@ use sha2::{Digest, Sha256};
 
 use crate::file_source;
 use crate::{
-    ApplicationBundle, DesiredRepositoryFile, GitHubInventoryEntry, IntegrationLedger,
-    IntegrationOperation, IntegrationPlan, OperationState, ReconciliationRequirement,
-    RepositoryFileSource,
+    ApplicationBundle, DesiredRepositoryFile, EventObserver, GitHubInventoryEntry,
+    IntegrationEvent, IntegrationLedger, IntegrationOperation, IntegrationPlan, OperationFailure,
+    OperationState, ReconciliationRequirement, RepositoryFileSource,
 };
+
+/// Maps an executor failure to the safe, structured event category.
+fn repository_failure(error: &RepositoryExecutionError) -> OperationFailure {
+    match error {
+        RepositoryExecutionError::Rejected(_) | RepositoryExecutionError::Initialization(_) => {
+            OperationFailure::Rejected
+        }
+        RepositoryExecutionError::Ambiguous(_) => OperationFailure::Ambiguous,
+        RepositoryExecutionError::LocalValidation { .. }
+        | RepositoryExecutionError::InvalidRoot(_) => OperationFailure::LocalValidation,
+        // Defensive mapping: the coordinator refuses reconciliation-required
+        // plans before any executor runs.
+        RepositoryExecutionError::InconsistentPlan(_)
+        | RepositoryExecutionError::ReconciliationRequired(_) => OperationFailure::Inconsistent,
+        RepositoryExecutionError::Ledger(_) => OperationFailure::Ledger,
+    }
+}
 
 /// Why repository execution failed.
 ///
@@ -205,6 +222,21 @@ impl<'a> RepositoryExecutor<'a> {
         plan: &IntegrationPlan,
         bundle: &ApplicationBundle,
     ) -> Result<RepositoryExecutionReport, RepositoryExecutionError> {
+        self.execute_with_observer(plan, bundle, &mut |_| {})
+    }
+
+    /// Like [`Self::execute`], but additionally reports the batch lifecycle
+    /// (`RepositoryBatchStarted`/`Finished`/`Failed`) around the existing
+    /// ledger/persist/provider transitions. The observer only observes: it
+    /// cannot alter decisions, ordering, results, rollback, or persistence.
+    /// The publication unit is the commit itself — staging steps are never
+    /// reported as completed publication.
+    pub fn execute_with_observer(
+        &mut self,
+        plan: &IntegrationPlan,
+        bundle: &ApplicationBundle,
+        observer: &mut EventObserver<'_>,
+    ) -> Result<RepositoryExecutionReport, RepositoryExecutionError> {
         if !plan.reconciliation_requirements.is_empty() {
             return Err(RepositoryExecutionError::ReconciliationRequired(
                 plan.reconciliation_requirements.clone(),
@@ -228,17 +260,58 @@ impl<'a> RepositoryExecutor<'a> {
                 | IntegrationOperation::PublishHosting { .. } => None,
             })
             .collect();
-        let mut report = RepositoryExecutionReport::default();
+        let report = RepositoryExecutionReport::default();
         if batch.is_empty() {
             return Ok(report);
         }
 
+        let generation = self.ledger.local_generation.clone();
+        let writes = batch
+            .iter()
+            .filter(|operation| matches!(operation, RepositoryOp::Write(_)))
+            .count();
+        let deletes = batch.len() - writes;
+        let paths: Vec<RepositoryPath> = batch
+            .iter()
+            .map(|operation| operation.path().clone())
+            .collect();
+        observer(IntegrationEvent::RepositoryBatchStarted {
+            generation: generation.clone(),
+            writes,
+            deletes,
+            paths,
+        });
+        let result = self.run_batch(&batch, bundle, report);
+        observer(match &result {
+            Ok(report) => IntegrationEvent::RepositoryBatchFinished {
+                generation,
+                writes,
+                deletes,
+                revision: report.revision.clone(),
+            },
+            Err(error) => IntegrationEvent::RepositoryBatchFailed {
+                generation,
+                writes,
+                deletes,
+                failure: repository_failure(error),
+            },
+        });
+        result
+    }
+
+    /// The batch itself, from ledger guards to the single commit.
+    fn run_batch(
+        &mut self,
+        batch: &[RepositoryOp],
+        bundle: &ApplicationBundle,
+        mut report: RepositoryExecutionReport,
+    ) -> Result<RepositoryExecutionReport, RepositoryExecutionError> {
         // Guards: a write requires an absent or Confirmed entry; a delete
         // requires a Confirmed entry. The previous entries are captured for a
         // possible rollback.
         let mut seen = HashSet::new();
         let mut previous = Vec::with_capacity(batch.len());
-        for operation in &batch {
+        for operation in batch {
             let path = operation.path();
             if !seen.insert(path.as_str()) {
                 return Err(RepositoryExecutionError::InconsistentPlan(format!(
@@ -294,7 +367,7 @@ impl<'a> RepositoryExecutor<'a> {
         // source: the application bundle for BundleMember, or a physically
         // revalidated publication file for PublicationFile.
         let mut write_payloads: Vec<Option<Payload>> = Vec::with_capacity(batch.len());
-        for operation in &batch {
+        for operation in batch {
             match operation {
                 RepositoryOp::Write(file) => match &file.source {
                     RepositoryFileSource::BundleMember => {
@@ -408,7 +481,7 @@ impl<'a> RepositoryExecutor<'a> {
                                 || metadata.sha256 != file.sha256
                                 || metadata.size_bytes != file.size_bytes
                             {
-                                self.rollback(&batch, &previous)?;
+                                self.rollback(batch, &previous)?;
                                 self.persist()?;
                                 return Err(RepositoryExecutionError::Rejected(format!(
                                     "write of {} returned divergent metadata; the batch was not committed",
@@ -418,7 +491,7 @@ impl<'a> RepositoryExecutor<'a> {
                             staged.push(Some(metadata));
                         }
                         Err(error) => {
-                            self.rollback(&batch, &previous)?;
+                            self.rollback(batch, &previous)?;
                             self.persist()?;
                             return Err(RepositoryExecutionError::Rejected(format!(
                                 "staging of {} failed before publication: {error}",
@@ -429,7 +502,7 @@ impl<'a> RepositoryExecutor<'a> {
                 }
                 RepositoryOp::Delete(path) => {
                     if let Err(error) = self.provider.delete(path) {
-                        self.rollback(&batch, &previous)?;
+                        self.rollback(batch, &previous)?;
                         self.persist()?;
                         return Err(RepositoryExecutionError::Rejected(format!(
                             "staging the deletion of {} failed before publication: {error}",
@@ -463,7 +536,7 @@ impl<'a> RepositoryExecutor<'a> {
                     }
                 }
                 self.persist()?;
-                for operation in &batch {
+                for operation in batch.iter() {
                     match operation {
                         RepositoryOp::Write(file) => report.written.push(file.path.clone()),
                         RepositoryOp::Delete(path) => report.deleted.push(path.clone()),
@@ -474,7 +547,7 @@ impl<'a> RepositoryExecutor<'a> {
             }
             Err(error) => match classify_commit_failure(&error) {
                 FailureKind::NoEffect => {
-                    self.rollback(&batch, &previous)?;
+                    self.rollback(batch, &previous)?;
                     self.persist()?;
                     Err(RepositoryExecutionError::Rejected(format!(
                         "commit was rejected and the ref was not updated: {error}"
@@ -482,7 +555,7 @@ impl<'a> RepositoryExecutor<'a> {
                 }
                 FailureKind::Ambiguous => {
                     self.record_batch_pending_state(
-                        &batch,
+                        batch,
                         &previous,
                         &base_revision,
                         OperationState::Unknown,

@@ -373,12 +373,21 @@ mod tests {
         let ledger_bytes_before = std::fs::read(&ledger_path).unwrap();
         let storage_files_before: Vec<_> = storage.0.keys().cloned().collect();
 
-        let dry = dry_run_project(&fixture.project_path, &mut |_| {}).unwrap();
+        // A dry run never emits execution events: it computes a plan only.
+        let mut events: Vec<crate::ApplicationEvent> = Vec::new();
+        let dry = dry_run_project(&fixture.project_path, &mut |event| events.push(event)).unwrap();
         assert_eq!(dry.generation, "g-000001");
         assert_eq!(dry.storage_operations, 0);
         assert_eq!(dry.repository_operations, 0);
         assert_eq!(dry.hosting_operations, 0);
         assert_eq!(dry.reconciliation_requirements, 0);
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, crate::ApplicationEvent::Operation(_))),
+            "dry-run must never emit operation events"
+        );
 
         // No remote writes happened (fakes unchanged) and the ledger is
         // byte-identical: dry-run is read-only by construction.

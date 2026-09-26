@@ -34,10 +34,24 @@ use std::path::PathBuf;
 use photo_publisher_provider_contracts::{DeploymentInfo, ProviderError};
 
 use crate::{
-    ApplicationBundle, DesiredPublication, HostingPublicationConfig, HostingPublisher,
-    IntegrationLedger, IntegrationOperation, IntegrationPlan, OperationState,
-    ReconciliationRequirement, VercelPublication,
+    ApplicationBundle, DesiredPublication, EventObserver, HostingPublicationConfig,
+    HostingPublisher, IntegrationEvent, IntegrationLedger, IntegrationOperation, IntegrationPlan,
+    OperationFailure, OperationState, ReconciliationRequirement, VercelPublication,
 };
+
+/// Maps an executor failure to the safe, structured event category.
+fn hosting_failure(error: &HostingExecutionError) -> OperationFailure {
+    match error {
+        HostingExecutionError::Rejected(_) => OperationFailure::Rejected,
+        HostingExecutionError::Ambiguous(_) => OperationFailure::Ambiguous,
+        HostingExecutionError::LocalValidation(_) => OperationFailure::LocalValidation,
+        // Defensive mapping: the coordinator refuses reconciliation-required
+        // plans before any executor runs.
+        HostingExecutionError::InconsistentPlan(_)
+        | HostingExecutionError::ReconciliationRequired(_) => OperationFailure::Inconsistent,
+        HostingExecutionError::Ledger(_) => OperationFailure::Ledger,
+    }
+}
 
 /// Why hosting execution failed.
 ///
@@ -146,6 +160,24 @@ impl<'a> HostingExecutor<'a> {
         bundle: &ApplicationBundle,
         configuration: &HostingPublicationConfig,
     ) -> Result<HostingExecutionReport, HostingExecutionError> {
+        self.execute_with_observer(plan, desired, bundle, configuration, &mut |_| {})
+    }
+
+    /// Like [`Self::execute`], but additionally reports the publication
+    /// lifecycle (`HostingPublishStarted`/`Finished`/`Failed`) around the
+    /// existing ledger/persist/provider transitions. The observer only
+    /// observes: it cannot alter decisions, ordering, results, rollback, or
+    /// persistence. `Finished` is emitted only when the deployment is
+    /// confirmed with a verifiable identity; ambiguous outcomes surface as
+    /// `Failed`, never as a false completion.
+    pub fn execute_with_observer(
+        &mut self,
+        plan: &IntegrationPlan,
+        desired: &DesiredPublication,
+        bundle: &ApplicationBundle,
+        configuration: &HostingPublicationConfig,
+        observer: &mut EventObserver<'_>,
+    ) -> Result<HostingExecutionReport, HostingExecutionError> {
         if !plan.reconciliation_requirements.is_empty() {
             return Err(HostingExecutionError::ReconciliationRequired(
                 plan.reconciliation_requirements.clone(),
@@ -163,16 +195,48 @@ impl<'a> HostingExecutor<'a> {
                 _ => None,
             })
             .collect();
-        let mut report = HostingExecutionReport::default();
         let [fingerprint] = hosting.as_slice() else {
             if hosting.len() > 1 {
                 return Err(HostingExecutionError::InconsistentPlan(
                     "plan contains more than one PublishHosting operation".to_owned(),
                 ));
             }
-            return Ok(report);
+            return Ok(HostingExecutionReport::default());
         };
 
+        let generation = desired.local.generation.clone();
+        let fingerprint: String = (*fingerprint).clone();
+        observer(IntegrationEvent::HostingPublishStarted {
+            generation: generation.clone(),
+            bundle_fingerprint: fingerprint.clone(),
+        });
+        let result = self.run_publish(fingerprint, desired, bundle, configuration);
+        observer(match &result {
+            Ok(deployment) => IntegrationEvent::HostingPublishFinished {
+                generation,
+                deployment_id: deployment.id.clone(),
+                url: deployment.url.clone(),
+            },
+            Err(error) => IntegrationEvent::HostingPublishFailed {
+                generation,
+                failure: hosting_failure(error),
+            },
+        });
+
+        Ok(HostingExecutionReport {
+            deployment: Some(result?),
+        })
+    }
+
+    /// The publication itself: provenance and guards, durable Pending, the
+    /// remote publish, and the persisted known result — no observer here.
+    fn run_publish(
+        &mut self,
+        fingerprint: String,
+        desired: &DesiredPublication,
+        bundle: &ApplicationBundle,
+        configuration: &HostingPublicationConfig,
+    ) -> Result<DeploymentInfo, HostingExecutionError> {
         // Provenance guard: the ledger must describe the same publication the
         // plan was computed for. A mismatch means the pair was mixed up by the
         // caller; nothing remote may happen.
@@ -197,15 +261,13 @@ impl<'a> HostingExecutor<'a> {
         }
 
         // Local validation: publish exactly the bundle the planner saw.
-        let fingerprint = fingerprint.as_str();
-        if bundle.fingerprint() != fingerprint {
+        if bundle.fingerprint() != fingerprint.as_str() {
             return Err(HostingExecutionError::LocalValidation(format!(
                 "application bundle fingerprint {} does not match the planned {fingerprint}",
                 bundle.fingerprint()
             )));
         }
 
-        let fingerprint = fingerprint.to_owned();
         let previous = self.ledger.vercel.clone();
 
         // Pending carries the desired fingerprint and no deployment identity:
@@ -230,8 +292,7 @@ impl<'a> HostingExecutor<'a> {
                 let url = deployment.url.clone();
                 self.record(fingerprint, OperationState::Confirmed, Some(id), Some(url))?;
                 self.persist()?;
-                report.deployment = Some(deployment);
-                Ok(report)
+                Ok(deployment)
             }
             Err(error) => match classify_publish_failure(&error) {
                 FailureKind::NoEffect => {

@@ -29,11 +29,11 @@ use std::path::{Path, PathBuf};
 use photo_publisher_provider_contracts::{RepositoryProvider, StorageProvider};
 
 use crate::{
-    ApplicationBundle, DesiredPublication, HostingExecutionError, HostingExecutionReport,
-    HostingExecutor, HostingPublicationConfig, HostingPublisher, IntegrationLedger,
-    IntegrationOperation, IntegrationPlan, OperationState, ReconciliationRequirement,
-    RepositoryExecutionError, RepositoryExecutionReport, RepositoryExecutor, StorageExecutionError,
-    StorageExecutionReport, StorageExecutor,
+    ApplicationBundle, DesiredPublication, EventObserver, HostingExecutionError,
+    HostingExecutionReport, HostingExecutor, HostingPublicationConfig, HostingPublisher,
+    IntegrationLedger, IntegrationOperation, IntegrationPlan, OperationState,
+    ReconciliationRequirement, RepositoryExecutionError, RepositoryExecutionReport,
+    RepositoryExecutor, StorageExecutionError, StorageExecutionReport, StorageExecutor,
 };
 
 /// Why an integrated publication run failed.
@@ -160,6 +160,21 @@ impl<'a> Coordinator<'a> {
         bundle: &ApplicationBundle,
         hosting_configuration: &HostingPublicationConfig,
     ) -> Result<PublicationReport, CoordinationError> {
+        self.execute_with_observer(plan, desired, bundle, hosting_configuration, &mut |_| {})
+    }
+
+    /// Like [`Self::execute`], with observation of the real operations
+    /// through granular, provider-neutral events forwarded to the executors.
+    /// The observer only observes: events never alter decisions, retries,
+    /// rollback, ordering, reconciliation, or persistence.
+    pub fn execute_with_observer(
+        &mut self,
+        plan: &IntegrationPlan,
+        desired: &DesiredPublication,
+        bundle: &ApplicationBundle,
+        hosting_configuration: &HostingPublicationConfig,
+        observer: &mut EventObserver<'_>,
+    ) -> Result<PublicationReport, CoordinationError> {
         // 1. Global reconciliation block: before any adoption or executor.
         if !plan.reconciliation_requirements.is_empty() {
             return Err(CoordinationError::Blocked(
@@ -232,7 +247,7 @@ impl<'a> Coordinator<'a> {
                 &self.ledger_path,
             )
             .map_err(CoordinationError::Storage)?
-            .execute(plan)
+            .execute_with_observer(plan, &mut *observer)
             .map_err(CoordinationError::Storage)?;
             report.storage = Some(storage);
         }
@@ -252,7 +267,7 @@ impl<'a> Coordinator<'a> {
                 &self.output_dir,
             )
             .map_err(CoordinationError::Repository)?
-            .execute(plan, bundle)
+            .execute_with_observer(plan, bundle, &mut *observer)
             .map_err(CoordinationError::Repository)?;
             report.repository = Some(repository);
         }
@@ -264,7 +279,13 @@ impl<'a> Coordinator<'a> {
         if has_hosting {
             let hosting =
                 HostingExecutor::new(&mut *self.hosting, &mut *self.ledger, &self.ledger_path)
-                    .execute(plan, desired, bundle, hosting_configuration)
+                    .execute_with_observer(
+                        plan,
+                        desired,
+                        bundle,
+                        hosting_configuration,
+                        &mut *observer,
+                    )
                     .map_err(CoordinationError::Hosting)?;
             report.hosting = Some(hosting);
         }
@@ -1790,5 +1811,607 @@ mod tests {
         )
         .unwrap();
         assert_eq!(log.borrow().len(), calls_before);
+    }
+
+    // ---- Granular observation (Phase 6-D) ---------------------------------
+    //
+    // Events observe the existing saga; they never alter it. These tests pin
+    // down the exact emission points and their payload guarantees.
+
+    use crate::{IntegrationEvent, OperationFailure};
+
+    fn execute_events(
+        fixture: &Fixture,
+        plan: &IntegrationPlan,
+        desired: &DesiredPublication,
+        bundle: &ApplicationBundle,
+        providers: &mut Providers,
+        ledger: &mut IntegrationLedger,
+    ) -> (
+        Result<PublicationReport, CoordinationError>,
+        Vec<IntegrationEvent>,
+    ) {
+        let mut events = Vec::new();
+        let result = Coordinator::new(
+            &mut providers.storage,
+            &mut providers.repository,
+            &mut providers.hosting,
+            ledger,
+            &fixture.ledger_path,
+            &fixture.output,
+        )
+        .execute_with_observer(
+            plan,
+            desired,
+            bundle,
+            &HostingPublicationConfig::new("hosting-project", None).unwrap(),
+            &mut |event| events.push(event),
+        );
+        (result, events)
+    }
+
+    #[test]
+    fn full_publication_emits_the_exact_operation_sequence() {
+        let fixture = Fixture::new();
+        let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+        let bundle = bundle_of(&[("index.html", b"index")]);
+        let object = fixture.source("a", b"bytes-a");
+        let desired = desired(&bundle);
+        let mut ledger = ledger_for(&desired);
+        let mut providers = Providers::new(&log);
+        providers.hosting.results.push_back(Ok(ready_hosting()));
+
+        let (result, events) = execute_events(
+            &fixture,
+            &full_plan(&object, &desired.bundle_fingerprint),
+            &desired,
+            &bundle,
+            &mut providers,
+            &mut ledger,
+        );
+        result.unwrap();
+
+        let expected = vec![
+            IntegrationEvent::StoragePutStarted {
+                key: object.key.clone(),
+                size_bytes: object.size_bytes,
+                generation: "g-000001".to_owned(),
+                index: 1,
+                total: 1,
+            },
+            IntegrationEvent::StoragePutFinished {
+                key: object.key.clone(),
+                size_bytes: object.size_bytes,
+                generation: "g-000001".to_owned(),
+                index: 1,
+                total: 1,
+            },
+            IntegrationEvent::RepositoryBatchStarted {
+                generation: "g-000001".to_owned(),
+                writes: 1,
+                deletes: 0,
+                paths: vec![RepositoryPath::new("index.html").unwrap()],
+            },
+            IntegrationEvent::RepositoryBatchFinished {
+                generation: "g-000001".to_owned(),
+                writes: 1,
+                deletes: 0,
+                revision: Some("commit-01".to_owned()),
+            },
+            IntegrationEvent::HostingPublishStarted {
+                generation: "g-000001".to_owned(),
+                bundle_fingerprint: desired.bundle_fingerprint.clone(),
+            },
+            IntegrationEvent::HostingPublishFinished {
+                generation: "g-000001".to_owned(),
+                deployment_id: "dpl-1".to_owned(),
+                url: "project.vercel.app".to_owned(),
+            },
+        ];
+        assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn multiple_storage_operations_are_emitted_in_plan_order_with_counts() {
+        let fixture = Fixture::new();
+        let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+        let bundle = bundle_of(&[("index.html", b"index")]);
+        let object_a = fixture.source("a", b"bytes-a");
+        let object_b = fixture.source("b", b"bytes-b");
+        let desired = desired(&bundle);
+        let mut ledger = ledger_for(&desired);
+        // One obsolete key must be deleted: it exists Confirmed in the ledger
+        // but is absent from the desired state.
+        let old_key = ObjectKey::new("originals/old.jpg").unwrap();
+        ledger
+            .record_r2_object(
+                &old_key,
+                &StorageObject {
+                    key: old_key.clone(),
+                    size_bytes: 3,
+                    sha256: digest("old"),
+                    content_type: Some("image/jpeg".to_owned()),
+                },
+                OperationState::Confirmed,
+            )
+            .unwrap();
+        let mut providers = Providers::new(&log);
+
+        let plan = IntegrationPlan {
+            operations: vec![
+                IntegrationOperation::PutStorage(object_a.clone()),
+                IntegrationOperation::PutStorage(object_b.clone()),
+                IntegrationOperation::DeleteStorage {
+                    key: old_key.clone(),
+                },
+            ],
+            reconciliation_requirements: Vec::new(),
+        };
+        let (result, events) = execute_events(
+            &fixture,
+            &plan,
+            &desired,
+            &bundle,
+            &mut providers,
+            &mut ledger,
+        );
+        result.unwrap();
+
+        let expected = vec![
+            IntegrationEvent::StoragePutStarted {
+                key: object_a.key.clone(),
+                size_bytes: 7,
+                generation: "g-000001".to_owned(),
+                index: 1,
+                total: 3,
+            },
+            IntegrationEvent::StoragePutFinished {
+                key: object_a.key.clone(),
+                size_bytes: 7,
+                generation: "g-000001".to_owned(),
+                index: 1,
+                total: 3,
+            },
+            IntegrationEvent::StoragePutStarted {
+                key: object_b.key.clone(),
+                size_bytes: 7,
+                generation: "g-000001".to_owned(),
+                index: 2,
+                total: 3,
+            },
+            IntegrationEvent::StoragePutFinished {
+                key: object_b.key.clone(),
+                size_bytes: 7,
+                generation: "g-000001".to_owned(),
+                index: 2,
+                total: 3,
+            },
+            IntegrationEvent::StorageDeleteStarted {
+                key: old_key.clone(),
+                size_bytes: 3,
+                generation: "g-000001".to_owned(),
+                index: 3,
+                total: 3,
+            },
+            IntegrationEvent::StorageDeleteFinished {
+                key: old_key.clone(),
+                size_bytes: 3,
+                generation: "g-000001".to_owned(),
+                index: 3,
+                total: 3,
+            },
+        ];
+        assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn storage_rejection_emits_failed_with_rejected_and_no_finished() {
+        let fixture = Fixture::new();
+        let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+        let bundle = bundle_of(&[("index.html", b"index")]);
+        let object = fixture.source("a", b"bytes-a");
+        let desired = desired(&bundle);
+        let mut ledger = ledger_for(&desired);
+        let mut providers = Providers::new(&log);
+        providers
+            .storage
+            .put_scripts
+            .push_back(Err(ProviderError::PermissionDenied));
+
+        let plan = IntegrationPlan {
+            operations: vec![IntegrationOperation::PutStorage(object.clone())],
+            reconciliation_requirements: Vec::new(),
+        };
+        let (result, events) = execute_events(
+            &fixture,
+            &plan,
+            &desired,
+            &bundle,
+            &mut providers,
+            &mut ledger,
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            CoordinationError::Storage(StorageExecutionError::Rejected { .. })
+        ));
+        assert_eq!(
+            events,
+            vec![
+                IntegrationEvent::StoragePutStarted {
+                    key: object.key.clone(),
+                    size_bytes: object.size_bytes,
+                    generation: "g-000001".to_owned(),
+                    index: 1,
+                    total: 1,
+                },
+                IntegrationEvent::StoragePutFailed {
+                    key: object.key.clone(),
+                    size_bytes: object.size_bytes,
+                    generation: "g-000001".to_owned(),
+                    index: 1,
+                    total: 1,
+                    failure: OperationFailure::Rejected,
+                },
+            ]
+        );
+        assert_eq!(ledger, ledger_for(&desired));
+    }
+
+    #[test]
+    fn storage_ambiguity_emits_failed_ambiguous_and_persists_unknown() {
+        let fixture = Fixture::new();
+        let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+        let bundle = bundle_of(&[("index.html", b"index")]);
+        let object = fixture.source("a", b"bytes-a");
+        let desired = desired(&bundle);
+        let mut ledger = ledger_for(&desired);
+        let mut providers = Providers::new(&log);
+        providers
+            .storage
+            .put_scripts
+            .push_back(Err(ProviderError::Network));
+
+        let plan = IntegrationPlan {
+            operations: vec![IntegrationOperation::PutStorage(object.clone())],
+            reconciliation_requirements: Vec::new(),
+        };
+        let (result, events) = execute_events(
+            &fixture,
+            &plan,
+            &desired,
+            &bundle,
+            &mut providers,
+            &mut ledger,
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            CoordinationError::Storage(StorageExecutionError::Ambiguous { .. })
+        ));
+        assert_eq!(
+            events.last(),
+            Some(&IntegrationEvent::StoragePutFailed {
+                key: object.key.clone(),
+                size_bytes: object.size_bytes,
+                generation: "g-000001".to_owned(),
+                index: 1,
+                total: 1,
+                failure: OperationFailure::Ambiguous,
+            })
+        );
+        // The durable ledger says Unknown — the event never claimed success.
+        assert_eq!(
+            ledger.r2_inventory[object.key.as_str()].status,
+            OperationState::Unknown
+        );
+    }
+
+    #[test]
+    fn storage_local_validation_failure_emits_failed_without_pending() {
+        let fixture = Fixture::new();
+        let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+        let bundle = bundle_of(&[("index.html", b"index")]);
+        let object = fixture.source("a", b"bytes-a");
+        // Remove the physical source so validation fails before any Pending.
+        std::fs::remove_file(fixture.output.join(object.source_path.as_str())).unwrap();
+        let desired = desired(&bundle);
+        let mut ledger = ledger_for(&desired);
+        let mut providers = Providers::new(&log);
+
+        let plan = IntegrationPlan {
+            operations: vec![IntegrationOperation::PutStorage(object.clone())],
+            reconciliation_requirements: Vec::new(),
+        };
+        let (result, events) = execute_events(
+            &fixture,
+            &plan,
+            &desired,
+            &bundle,
+            &mut providers,
+            &mut ledger,
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            CoordinationError::Storage(StorageExecutionError::LocalValidation { .. })
+        ));
+        assert_eq!(
+            events.last(),
+            Some(&IntegrationEvent::StoragePutFailed {
+                key: object.key.clone(),
+                size_bytes: object.size_bytes,
+                generation: "g-000001".to_owned(),
+                index: 1,
+                total: 1,
+                failure: OperationFailure::LocalValidation,
+            })
+        );
+        assert!(ledger.r2_inventory.is_empty());
+    }
+
+    #[test]
+    fn repository_rejection_emits_batch_failed_without_finished() {
+        let fixture = Fixture::new();
+        let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+        let bundle = bundle_of(&[("index.html", b"index")]);
+        let desired = desired(&bundle);
+        let mut ledger = ledger_for(&desired);
+        let mut providers = Providers::new(&log);
+        // The base revision probe runs with an empty staging and does not
+        // consume scripted results; the scripted failure hits the real commit.
+        providers
+            .repository
+            .commit_scripts
+            .push_back(Err(ProviderError::PermissionDenied));
+
+        let plan = IntegrationPlan {
+            operations: vec![IntegrationOperation::WriteRepository(
+                DesiredRepositoryFile::new(
+                    RepositoryPath::new("index.html").unwrap(),
+                    sha256_bytes(b"index"),
+                    5,
+                    RepositoryFileSource::BundleMember,
+                )
+                .unwrap(),
+            )],
+            reconciliation_requirements: Vec::new(),
+        };
+        let (result, events) = execute_events(
+            &fixture,
+            &plan,
+            &desired,
+            &bundle,
+            &mut providers,
+            &mut ledger,
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            CoordinationError::Repository(RepositoryExecutionError::Rejected(_))
+        ));
+        assert_eq!(
+            events,
+            vec![
+                IntegrationEvent::RepositoryBatchStarted {
+                    generation: "g-000001".to_owned(),
+                    writes: 1,
+                    deletes: 0,
+                    paths: vec![RepositoryPath::new("index.html").unwrap()],
+                },
+                IntegrationEvent::RepositoryBatchFailed {
+                    generation: "g-000001".to_owned(),
+                    writes: 1,
+                    deletes: 0,
+                    failure: OperationFailure::Rejected,
+                },
+            ]
+        );
+        assert!(ledger.github_inventory.is_empty());
+    }
+
+    #[test]
+    fn repository_ambiguous_commit_marks_the_whole_batch_unknown() {
+        let fixture = Fixture::new();
+        let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+        let bundle = bundle_of(&[("index.html", b"index")]);
+        let desired = desired(&bundle);
+        let mut ledger = ledger_for(&desired);
+        let mut providers = Providers::new(&log);
+        providers
+            .repository
+            .commit_scripts
+            .push_back(Err(ProviderError::Network));
+
+        let delete_op = IntegrationOperation::WriteRepository(
+            DesiredRepositoryFile::new(
+                RepositoryPath::new("index.html").unwrap(),
+                sha256_bytes(b"index"),
+                5,
+                RepositoryFileSource::BundleMember,
+            )
+            .unwrap(),
+        );
+        let plan = IntegrationPlan {
+            operations: vec![delete_op],
+            reconciliation_requirements: Vec::new(),
+        };
+        let (result, events) = execute_events(
+            &fixture,
+            &plan,
+            &desired,
+            &bundle,
+            &mut providers,
+            &mut ledger,
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            CoordinationError::Repository(RepositoryExecutionError::Ambiguous(_))
+        ));
+        assert_eq!(
+            events.last(),
+            Some(&IntegrationEvent::RepositoryBatchFailed {
+                generation: "g-000001".to_owned(),
+                writes: 1,
+                deletes: 0,
+                failure: OperationFailure::Ambiguous,
+            })
+        );
+        assert_eq!(
+            ledger.github_inventory["index.html"].status,
+            OperationState::Unknown
+        );
+        assert_eq!(
+            ledger.github_inventory["index.html"].revision,
+            "base-revision"
+        );
+    }
+
+    #[test]
+    fn hosting_rejection_emits_failed_without_deployment_identity() {
+        let fixture = Fixture::new();
+        let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+        let bundle = bundle_of(&[("index.html", b"index")]);
+        let desired = desired(&bundle);
+        let mut ledger = ledger_for(&desired);
+        let mut providers = Providers::new(&log);
+        providers
+            .hosting
+            .results
+            .push_back(Err(ProviderError::PermissionDenied));
+
+        let plan = IntegrationPlan {
+            operations: vec![IntegrationOperation::PublishHosting {
+                bundle_fingerprint: desired.bundle_fingerprint.clone(),
+            }],
+            reconciliation_requirements: Vec::new(),
+        };
+        let (result, events) = execute_events(
+            &fixture,
+            &plan,
+            &desired,
+            &bundle,
+            &mut providers,
+            &mut ledger,
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            CoordinationError::Hosting(HostingExecutionError::Rejected(_))
+        ));
+        assert_eq!(
+            events,
+            vec![
+                IntegrationEvent::HostingPublishStarted {
+                    generation: "g-000001".to_owned(),
+                    bundle_fingerprint: desired.bundle_fingerprint.clone(),
+                },
+                IntegrationEvent::HostingPublishFailed {
+                    generation: "g-000001".to_owned(),
+                    failure: OperationFailure::Rejected,
+                },
+            ]
+        );
+        assert!(ledger.vercel.is_none());
+    }
+
+    #[test]
+    fn hosting_ambiguity_emits_failed_ambiguous_and_persists_unknown() {
+        let fixture = Fixture::new();
+        let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+        let bundle = bundle_of(&[("index.html", b"index")]);
+        let desired = desired(&bundle);
+        let mut ledger = ledger_for(&desired);
+        let mut providers = Providers::new(&log);
+        providers
+            .hosting
+            .results
+            .push_back(Err(ProviderError::Network));
+
+        let plan = IntegrationPlan {
+            operations: vec![IntegrationOperation::PublishHosting {
+                bundle_fingerprint: desired.bundle_fingerprint.clone(),
+            }],
+            reconciliation_requirements: Vec::new(),
+        };
+        let (result, events) = execute_events(
+            &fixture,
+            &plan,
+            &desired,
+            &bundle,
+            &mut providers,
+            &mut ledger,
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            CoordinationError::Hosting(HostingExecutionError::Ambiguous(_))
+        ));
+        assert_eq!(
+            events.last(),
+            Some(&IntegrationEvent::HostingPublishFailed {
+                generation: "g-000001".to_owned(),
+                failure: OperationFailure::Ambiguous,
+            })
+        );
+        assert_eq!(
+            ledger.vercel.as_ref().unwrap().status,
+            OperationState::Unknown
+        );
+    }
+
+    #[test]
+    fn equivalent_runs_emit_identical_event_sequences() {
+        let run = || {
+            let fixture = Fixture::new();
+            let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+            let bundle = bundle_of(&[("index.html", b"index")]);
+            let object = fixture.source("a", b"bytes-a");
+            let desired = desired(&bundle);
+            let mut ledger = ledger_for(&desired);
+            let mut providers = Providers::new(&log);
+            providers.hosting.results.push_back(Ok(ready_hosting()));
+            let (result, events) = execute_events(
+                &fixture,
+                &full_plan(&object, &desired.bundle_fingerprint),
+                &desired,
+                &bundle,
+                &mut providers,
+                &mut ledger,
+            );
+            result.unwrap();
+            events
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn event_payloads_carry_no_secrets_and_no_local_paths() {
+        let fixture = Fixture::new();
+        let log: SharedLog = Rc::new(RefCell::new(Vec::new()));
+        let bundle = bundle_of(&[("index.html", b"index")]);
+        let object = fixture.source("a", b"bytes-a");
+        let desired = desired(&bundle);
+        let mut ledger = ledger_for(&desired);
+        let mut providers = Providers::new(&log);
+        providers.hosting.results.push_back(Ok(ready_hosting()));
+        let (result, events) = execute_events(
+            &fixture,
+            &full_plan(&object, &desired.bundle_fingerprint),
+            &desired,
+            &bundle,
+            &mut providers,
+            &mut ledger,
+        );
+        result.unwrap();
+        let text = format!("{events:?}");
+        for needle in [
+            "token",
+            "secret",
+            "authorization",
+            "password",
+            "PHOTO_PUBLISHER_",
+        ] {
+            assert!(
+                !text.to_lowercase().contains(needle),
+                "event payload leaked {needle}"
+            );
+        }
+        // Local filesystem roots must never appear in payloads.
+        assert!(!text.contains(fixture.root.path().to_string_lossy().as_ref()));
     }
 }

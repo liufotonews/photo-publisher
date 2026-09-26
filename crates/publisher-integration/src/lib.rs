@@ -21,6 +21,7 @@ use tempfile::NamedTempFile;
 use url::{Host, Url};
 
 pub mod coordinator;
+pub mod events;
 pub mod executor;
 pub mod hosting;
 pub mod manifest;
@@ -30,6 +31,7 @@ pub mod repository;
 pub(crate) mod file_source;
 
 pub use coordinator::{CoordinationError, Coordinator, PublicationReport};
+pub use events::{EventObserver, IntegrationEvent, OperationFailure};
 pub use executor::{StorageExecutionError, StorageExecutionReport, StorageExecutor};
 pub use hosting::{HostingExecutionError, HostingExecutionReport, HostingExecutor};
 pub use manifest::{

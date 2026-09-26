@@ -38,9 +38,26 @@ use photo_publisher_provider_contracts::{
 };
 
 use crate::{
-    DesiredStorageObject, IntegrationLedger, IntegrationOperation, IntegrationPlan, OperationState,
-    R2InventoryEntry, ReconciliationRequirement,
+    DesiredStorageObject, EventObserver, IntegrationEvent, IntegrationLedger, IntegrationOperation,
+    IntegrationPlan, OperationFailure, OperationState, R2InventoryEntry, ReconciliationRequirement,
 };
+
+/// Maps an executor failure to the safe, structured event category.
+fn storage_failure(error: &StorageExecutionError) -> OperationFailure {
+    match error {
+        StorageExecutionError::Rejected { .. } => OperationFailure::Rejected,
+        StorageExecutionError::Ambiguous { .. } => OperationFailure::Ambiguous,
+        StorageExecutionError::LocalValidation { .. } | StorageExecutionError::InvalidRoot(_) => {
+            OperationFailure::LocalValidation
+        }
+        StorageExecutionError::InconsistentPlan(_)
+        | StorageExecutionError::InconsistentUpload { .. }
+        // Defensive mapping: the coordinator refuses reconciliation-required
+        // plans before any executor runs.
+        | StorageExecutionError::ReconciliationRequired(_) => OperationFailure::Inconsistent,
+        StorageExecutionError::Ledger(_) => OperationFailure::Ledger,
+    }
+}
 
 /// Why storage execution failed.
 ///
@@ -162,21 +179,47 @@ impl<'a> StorageExecutor<'a> {
         &mut self,
         plan: &IntegrationPlan,
     ) -> Result<StorageExecutionReport, StorageExecutionError> {
+        self.execute_with_observer(plan, &mut |_| {})
+    }
+
+    /// Like [`Self::execute`], but additionally reports every real storage
+    /// operation around its existing ledger/persist/provider transitions.
+    /// The observer only observes: it cannot alter decisions, ordering,
+    /// results, rollback, or persistence.
+    pub fn execute_with_observer(
+        &mut self,
+        plan: &IntegrationPlan,
+        observer: &mut EventObserver<'_>,
+    ) -> Result<StorageExecutionReport, StorageExecutionError> {
         if !plan.reconciliation_requirements.is_empty() {
             return Err(StorageExecutionError::ReconciliationRequired(
                 plan.reconciliation_requirements.clone(),
             ));
         }
 
+        let total = plan
+            .operations
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation,
+                    IntegrationOperation::PutStorage(_)
+                        | IntegrationOperation::DeleteStorage { .. }
+                )
+            })
+            .count();
+        let mut index = 0;
         let mut report = StorageExecutionReport::default();
         for operation in &plan.operations {
             match operation {
                 IntegrationOperation::PutStorage(desired) => {
-                    self.put(desired)?;
+                    index += 1;
+                    self.put_observed(desired, index, total, observer)?;
                     report.uploaded.push(desired.key.clone());
                 }
                 IntegrationOperation::DeleteStorage { key } => {
-                    self.delete(key)?;
+                    index += 1;
+                    self.delete_observed(key, index, total, observer)?;
                     report.deleted.push(key.clone());
                 }
                 // GitHub and Vercel operations are out of scope; later phases
@@ -187,6 +230,90 @@ impl<'a> StorageExecutor<'a> {
             }
         }
         Ok(report)
+    }
+
+    /// Observation wrapper around [`Self::put`]: emits `StoragePutFailed`
+    /// instead of `StoragePutFinished` whenever the attempt fails. An
+    /// ambiguous outcome is a failure, never a false completion.
+    fn put_observed(
+        &mut self,
+        desired: &DesiredStorageObject,
+        index: usize,
+        total: usize,
+        observer: &mut EventObserver<'_>,
+    ) -> Result<(), StorageExecutionError> {
+        let generation = self.ledger.local_generation.clone();
+        let key = desired.key.clone();
+        let size_bytes = desired.size_bytes;
+        observer(IntegrationEvent::StoragePutStarted {
+            key: key.clone(),
+            size_bytes,
+            generation: generation.clone(),
+            index,
+            total,
+        });
+        let result = self.put(desired);
+        observer(match &result {
+            Ok(()) => IntegrationEvent::StoragePutFinished {
+                key,
+                size_bytes,
+                generation,
+                index,
+                total,
+            },
+            Err(error) => IntegrationEvent::StoragePutFailed {
+                key,
+                size_bytes,
+                generation,
+                index,
+                total,
+                failure: storage_failure(error),
+            },
+        });
+        result
+    }
+
+    /// Observation wrapper around [`Self::delete`], same lifecycle rule.
+    fn delete_observed(
+        &mut self,
+        key: &ObjectKey,
+        index: usize,
+        total: usize,
+        observer: &mut EventObserver<'_>,
+    ) -> Result<(), StorageExecutionError> {
+        let generation = self.ledger.local_generation.clone();
+        let size_bytes = self
+            .ledger
+            .r2_inventory
+            .get(key.as_str())
+            .map(|entry| entry.size_bytes)
+            .unwrap_or(0);
+        observer(IntegrationEvent::StorageDeleteStarted {
+            key: key.clone(),
+            size_bytes,
+            generation: generation.clone(),
+            index,
+            total,
+        });
+        let result = self.delete(key);
+        observer(match &result {
+            Ok(()) => IntegrationEvent::StorageDeleteFinished {
+                key: key.clone(),
+                size_bytes,
+                generation,
+                index,
+                total,
+            },
+            Err(error) => IntegrationEvent::StorageDeleteFailed {
+                key: key.clone(),
+                size_bytes,
+                generation,
+                index,
+                total,
+                failure: storage_failure(error),
+            },
+        });
+        result
     }
 
     fn put(&mut self, desired: &DesiredStorageObject) -> Result<(), StorageExecutionError> {

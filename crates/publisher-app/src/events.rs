@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use photo_publisher_integration::IntegrationEvent;
+
 /// A named application workflow step, shared by every use case in this phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowStep {
@@ -31,6 +33,11 @@ pub enum ApplicationEvent {
     Finished,
     /// The use case failed; the returned error carries the data.
     Failed,
+    /// A granular, provider-neutral publication operation observed during
+    /// `PublishIntegrate`. This forwards the integration-layer event exactly
+    /// as produced: it never invents operations (a no-op publish emits none,
+    /// and dry-run never produces any).
+    Operation(IntegrationEvent),
 }
 
 impl fmt::Display for ApplicationEvent {
@@ -40,6 +47,7 @@ impl fmt::Display for ApplicationEvent {
             Self::LeftStep { step, ok } => format!("left-step:{step:?}:ok={ok}"),
             Self::Finished => "finished".to_owned(),
             Self::Failed => "failed".to_owned(),
+            Self::Operation(event) => format!("operation:{event:?}"),
         };
         formatter.write_str(&text)
     }

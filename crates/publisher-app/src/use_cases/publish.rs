@@ -128,34 +128,39 @@ fn run(
         prepare_v2_publication(&handle, configuration)
     })?;
 
-    let report = step(
-        events,
+    // The granular events are forwarded to the same single application sink
+    // while the coordinator runs. Emission stays observation-only.
+    events(ApplicationEvent::EnteredStep(
         WorkflowStep::PublishIntegrate,
-        || -> Result<photo_publisher_integration::PublicationReport, ApplicationError> {
-            let mut coordinator = Coordinator::new(
-                &mut *providers.storage,
-                &mut *providers.repository,
-                &mut *providers.hosting,
-                &mut publication.ledger,
-                publication.ledger_path.as_path(),
-                handle.output_dir.as_path(),
-            );
-            coordinator
-                .execute(
-                    &publication.plan,
-                    &publication.desired,
-                    &publication.bundle,
-                    &configuration.hosting,
-                )
-                .map_err(|error| {
-                    ApplicationError::with_source(
-                        ApplicationErrorKind::Publication,
-                        format!("{error}"),
-                        error,
-                    )
-                })
-        },
-    )?;
+    ));
+    let report = {
+        let mut coordinator = Coordinator::new(
+            &mut *providers.storage,
+            &mut *providers.repository,
+            &mut *providers.hosting,
+            &mut publication.ledger,
+            publication.ledger_path.as_path(),
+            handle.output_dir.as_path(),
+        );
+        let result = coordinator.execute_with_observer(
+            &publication.plan,
+            &publication.desired,
+            &publication.bundle,
+            &configuration.hosting,
+            &mut |event| events(ApplicationEvent::Operation(event)),
+        );
+        events(ApplicationEvent::LeftStep {
+            step: WorkflowStep::PublishIntegrate,
+            ok: result.is_ok(),
+        });
+        result.map_err(|error| {
+            ApplicationError::with_source(
+                ApplicationErrorKind::Publication,
+                format!("{error}"),
+                error,
+            )
+        })?
+    };
 
     if publication.plan.operations.is_empty() {
         let generation = publication.desired.local.generation.clone();
@@ -554,6 +559,213 @@ mod tests {
     }
 
     #[test]
+    fn publish_v2_forwards_granular_events_through_the_single_sink() {
+        use photo_publisher_integration::{IntegrationEvent, OperationFailure};
+        let _ = OperationFailure::Ambiguous; // ensure the type is observable
+        let fixture = fixture(2);
+        let configuration = configuration_from(&fixture.project_path);
+        let mut storage = FakeStorage::default();
+        let mut repository = FakeRepository::default();
+        let mut hosting = FakeHosting::default();
+        let credentials = fake_credentials();
+        let mut events: Vec<ApplicationEvent> = Vec::new();
+        publish_project(
+            &fixture.project_path,
+            Some(&configuration),
+            PublishOptions,
+            &mut PublicationProviders {
+                storage: &mut storage,
+                repository: &mut repository,
+                hosting: &mut hosting,
+                credentials: &credentials,
+            },
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        let operations: Vec<&IntegrationEvent> = events
+            .iter()
+            .filter_map(|event| match event {
+                ApplicationEvent::Operation(operation) => Some(operation),
+                _ => None,
+            })
+            .collect();
+        let kinds: Vec<&'static str> = operations
+            .iter()
+            .map(|operation| match operation {
+                IntegrationEvent::StoragePutStarted { .. } => "StoragePutStarted",
+                IntegrationEvent::StoragePutFinished { .. } => "StoragePutFinished",
+                IntegrationEvent::StorageDeleteStarted { .. } => "StorageDeleteStarted",
+                IntegrationEvent::StorageDeleteFinished { .. } => "StorageDeleteFinished",
+                IntegrationEvent::RepositoryBatchStarted { .. } => "RepositoryBatchStarted",
+                IntegrationEvent::RepositoryBatchFinished { .. } => "RepositoryBatchFinished",
+                IntegrationEvent::HostingPublishStarted { .. } => "HostingPublishStarted",
+                IntegrationEvent::HostingPublishFinished { .. } => "HostingPublishFinished",
+                IntegrationEvent::StoragePutFailed { .. } => "StoragePutFailed",
+                IntegrationEvent::StorageDeleteFailed { .. } => "StorageDeleteFailed",
+                IntegrationEvent::RepositoryBatchFailed { .. } => "RepositoryBatchFailed",
+                IntegrationEvent::HostingPublishFailed { .. } => "HostingPublishFailed",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "StoragePutStarted",
+                "StoragePutFinished",
+                "RepositoryBatchStarted",
+                "RepositoryBatchFinished",
+                "HostingPublishStarted",
+                "HostingPublishFinished",
+            ]
+        );
+
+        // Identity and progress fields must be domain data only.
+        let IntegrationEvent::StoragePutStarted {
+            key,
+            size_bytes,
+            generation,
+            index,
+            total,
+        } = operations[0]
+        else {
+            panic!("expected StoragePutStarted");
+        };
+        assert!(key.as_str().starts_with("originals/photos/download/"));
+        assert!(*size_bytes > 0);
+        assert_eq!(generation, "g-000001");
+        assert_eq!(*index, 1);
+        assert_eq!(*total, 1);
+        let IntegrationEvent::RepositoryBatchStarted {
+            writes,
+            deletes,
+            paths,
+            ..
+        } = operations[2]
+        else {
+            panic!("expected RepositoryBatchStarted");
+        };
+        assert_eq!(*writes, 3); // index.html + gallery.json + preview asset
+        assert_eq!(*deletes, 0);
+        assert!(paths
+            .iter()
+            .any(|path| path.as_str().starts_with("previews/photos/preview/")));
+        let IntegrationEvent::HostingPublishFinished {
+            deployment_id,
+            url,
+            generation,
+        } = operations[5]
+        else {
+            panic!("expected HostingPublishFinished");
+        };
+        assert_eq!(deployment_id, "dpl-fake");
+        assert_eq!(url, "example.test");
+        assert_eq!(generation, "g-000001");
+
+        // Workflow steps stay the enveloping lifecycle; operations sit inside
+        // PublishIntegrate.
+        let first_operation = events
+            .iter()
+            .position(|event| matches!(event, ApplicationEvent::Operation(_)))
+            .unwrap();
+        let entered_integrate = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ApplicationEvent::EnteredStep(WorkflowStep::PublishIntegrate)
+                )
+            })
+            .unwrap();
+        assert!(entered_integrate < first_operation);
+        assert_eq!(events.last(), Some(&ApplicationEvent::Finished));
+    }
+
+    #[test]
+    fn second_publish_emits_zero_operation_events() {
+        let fixture = fixture(2);
+        let configuration = configuration_from(&fixture.project_path);
+        let mut storage = FakeStorage::default();
+        let mut repository = FakeRepository::default();
+        let mut hosting = FakeHosting::default();
+        let credentials = fake_credentials();
+        publish_project(
+            &fixture.project_path,
+            Some(&configuration),
+            PublishOptions,
+            &mut PublicationProviders {
+                storage: &mut storage,
+                repository: &mut repository,
+                hosting: &mut hosting,
+                credentials: &credentials,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+
+        // Idempotent second run: plan is empty, so no operation events at all.
+        let mut events: Vec<ApplicationEvent> = Vec::new();
+        publish_project(
+            &fixture.project_path,
+            Some(&configuration),
+            PublishOptions,
+            &mut PublicationProviders {
+                storage: &mut storage,
+                repository: &mut repository,
+                hosting: &mut hosting,
+                credentials: &credentials,
+            },
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ApplicationEvent::Operation(_))),
+            "idempotent publish must not invent operation events"
+        );
+        assert_eq!(events.last(), Some(&ApplicationEvent::Finished));
+    }
+
+    #[test]
+    fn operation_payloads_carry_no_secrets_and_no_local_paths() {
+        let fixture = fixture(2);
+        let root_display = fixture.root.path().to_string_lossy().into_owned();
+        let configuration = configuration_from(&fixture.project_path);
+        let mut storage = FakeStorage::default();
+        let mut repository = FakeRepository::default();
+        let mut hosting = FakeHosting::default();
+        let credentials = fake_credentials();
+        let mut events: Vec<ApplicationEvent> = Vec::new();
+        publish_project(
+            &fixture.project_path,
+            Some(&configuration),
+            PublishOptions,
+            &mut PublicationProviders {
+                storage: &mut storage,
+                repository: &mut repository,
+                hosting: &mut hosting,
+                credentials: &credentials,
+            },
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+        let text = format!("{events:?}");
+        for needle in [
+            "token",
+            "secret",
+            "authorization",
+            "password",
+            "PHOTO_PUBLISHER_",
+        ] {
+            assert!(
+                !text.to_lowercase().contains(needle),
+                "event payload leaked {needle}"
+            );
+        }
+        assert!(!text.contains(root_display.as_str()));
+    }
+
+    #[test]
     fn publish_v2_runs_full_integration_through_fakes() {
         let fixture = fixture(2);
         let configuration = configuration_from(&fixture.project_path);
@@ -638,31 +850,59 @@ mod tests {
             events
         };
 
-        let expected: Vec<ApplicationEvent> = vec![
-            ApplicationEvent::EnteredStep(WorkflowStep::LoadProject),
-            ApplicationEvent::EnteredStep(WorkflowStep::LocalPublication),
-            ApplicationEvent::LeftStep {
-                step: WorkflowStep::LocalPublication,
-                ok: true,
-            },
-            ApplicationEvent::EnteredStep(WorkflowStep::BuildPlan),
-            ApplicationEvent::LeftStep {
-                step: WorkflowStep::BuildPlan,
-                ok: true,
-            },
-            ApplicationEvent::EnteredStep(WorkflowStep::PublishIntegrate),
-            ApplicationEvent::LeftStep {
-                step: WorkflowStep::PublishIntegrate,
-                ok: true,
-            },
-            ApplicationEvent::LeftStep {
-                step: WorkflowStep::LoadProject,
-                ok: true,
-            },
-            ApplicationEvent::Finished,
-        ];
-        assert_eq!(collect(), expected);
-        assert_eq!(collect(), collect());
+        let first = collect();
+        // Structural shape: workflow steps envelope the operation lifecycle,
+        // and every operation opens and closes exactly once.
+        let shape = first
+            .iter()
+            .map(|event| match event {
+                ApplicationEvent::EnteredStep(step) => format!("entered:{step:?}"),
+                ApplicationEvent::LeftStep { step, ok } => format!("left:{step:?}:{ok}"),
+                ApplicationEvent::Finished => "finished".to_owned(),
+                ApplicationEvent::Failed => "failed".to_owned(),
+                ApplicationEvent::Operation(operation) => {
+                    use photo_publisher_integration::IntegrationEvent as I;
+                    match operation {
+                        I::StoragePutStarted { .. } => "op:StoragePutStarted",
+                        I::StoragePutFinished { .. } => "op:StoragePutFinished",
+                        I::StorageDeleteStarted { .. } => "op:StorageDeleteStarted",
+                        I::StorageDeleteFinished { .. } => "op:StorageDeleteFinished",
+                        I::RepositoryBatchStarted { .. } => "op:RepositoryBatchStarted",
+                        I::RepositoryBatchFinished { .. } => "op:RepositoryBatchFinished",
+                        I::HostingPublishStarted { .. } => "op:HostingPublishStarted",
+                        I::HostingPublishFinished { .. } => "op:HostingPublishFinished",
+                        I::StoragePutFailed { .. } => "op:StoragePutFailed",
+                        I::StorageDeleteFailed { .. } => "op:StorageDeleteFailed",
+                        I::RepositoryBatchFailed { .. } => "op:RepositoryBatchFailed",
+                        I::HostingPublishFailed { .. } => "op:HostingPublishFailed",
+                    }
+                    .to_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            vec![
+                "entered:LoadProject",
+                "entered:LocalPublication",
+                "left:LocalPublication:true",
+                "entered:BuildPlan",
+                "left:BuildPlan:true",
+                "entered:PublishIntegrate",
+                "op:StoragePutStarted",
+                "op:StoragePutFinished",
+                "op:RepositoryBatchStarted",
+                "op:RepositoryBatchFinished",
+                "op:HostingPublishStarted",
+                "op:HostingPublishFinished",
+                "left:PublishIntegrate:true",
+                "left:LoadProject:true",
+                "finished",
+            ]
+        );
+        // Two identical fresh runs produce identical full event streams
+        // (including every operation payload).
+        assert_eq!(first, collect());
     }
 
     #[test]
