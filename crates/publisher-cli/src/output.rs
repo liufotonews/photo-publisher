@@ -4,7 +4,7 @@
 //! events remain provider-neutral domain data; this formatter is the CLI's
 //! human-facing view of those events.
 
-use photo_publisher_integration::IntegrationEvent;
+use photo_publisher_integration::{IntegrationEvent, OperationFailure};
 use publisher_app::{ApplicationEvent, WorkflowStep};
 
 pub fn format_event(event: &ApplicationEvent) -> String {
@@ -44,6 +44,22 @@ pub fn format_event(event: &ApplicationEvent) -> String {
     }
 }
 
+/// Stable human presentation of an operation failure.
+///
+/// The Rust variant names are never part of the CLI text: this explicit
+/// mapping is the only place where the machine classification meets the
+/// human message. An ambiguous outcome is always presented as "could not be
+/// confirmed", never as concluded.
+fn format_failure(failure: &OperationFailure) -> &'static str {
+    match failure {
+        OperationFailure::LocalValidation => "operação falhou na validação local",
+        OperationFailure::Rejected => "operação foi rejeitada",
+        OperationFailure::Ambiguous => "operação não pôde ser confirmada",
+        OperationFailure::Inconsistent => "operação encontrou estado inconsistente",
+        OperationFailure::Ledger => "operação foi impedida pelo estado consolidado",
+    }
+}
+
 fn format_operation(event: &IntegrationEvent) -> String {
     match event {
         IntegrationEvent::StoragePutStarted {
@@ -52,20 +68,26 @@ fn format_operation(event: &IntegrationEvent) -> String {
         IntegrationEvent::StoragePutFinished { key, .. } => {
             format!("[STORAGE] Concluído: {}", key.as_str())
         }
-        IntegrationEvent::StoragePutFailed { key, failure, .. } => format!(
-            "[ERROR] STORAGE: upload não confirmado: {} ({failure:?})",
-            key.as_str()
-        ),
+        IntegrationEvent::StoragePutFailed { key, failure, .. } => {
+            format!(
+                "[ERROR] STORAGE (upload): {}: {}",
+                format_failure(failure),
+                key.as_str()
+            )
+        }
         IntegrationEvent::StorageDeleteStarted {
             key, index, total, ..
         } => format!("[STORAGE] Removendo {index}/{total}: {}", key.as_str()),
         IntegrationEvent::StorageDeleteFinished { key, .. } => {
             format!("[STORAGE] Removido: {}", key.as_str())
         }
-        IntegrationEvent::StorageDeleteFailed { key, failure, .. } => format!(
-            "[ERROR] STORAGE: remoção não confirmada: {} ({failure:?})",
-            key.as_str()
-        ),
+        IntegrationEvent::StorageDeleteFailed { key, failure, .. } => {
+            format!(
+                "[ERROR] STORAGE (remoção): {}: {}",
+                format_failure(failure),
+                key.as_str()
+            )
+        }
         IntegrationEvent::RepositoryBatchStarted {
             writes, deletes, ..
         } => {
@@ -76,14 +98,14 @@ fn format_operation(event: &IntegrationEvent) -> String {
             None => "[REPOSITORY] Commit concluído".to_owned(),
         },
         IntegrationEvent::RepositoryBatchFailed { failure, .. } => {
-            format!("[ERROR] REPOSITORY: lote não concluído ({failure:?})")
+            format!("[ERROR] REPOSITORY (lote): {}", format_failure(failure))
         }
         IntegrationEvent::HostingPublishStarted { .. } => "[HOSTING] Publicando galeria".to_owned(),
         IntegrationEvent::HostingPublishFinished {
             deployment_id, url, ..
         } => format!("[HOSTING] Deployment concluído: {deployment_id} ({url})"),
         IntegrationEvent::HostingPublishFailed { failure, .. } => {
-            format!("[ERROR] HOSTING: deployment não concluído ({failure:?})")
+            format!("[ERROR] HOSTING (deployment): {}", format_failure(failure))
         }
     }
 }
@@ -130,9 +152,145 @@ mod tests {
             failure: photo_publisher_integration::OperationFailure::Ambiguous,
         });
         let text = format_event(&event);
-        assert!(text.contains("não confirmado"));
-        assert!(text.contains("Ambiguous"));
+        assert!(text.contains("não pôde ser confirmada"));
+        // The Rust variant name and any success wording are never presented.
+        assert!(!text.contains("Ambiguous"));
         assert!(!text.contains("Concluído"));
+        assert!(!text.contains("concluído"));
+    }
+
+    #[test]
+    fn every_operation_failure_has_a_stable_human_message() {
+        use photo_publisher_integration::OperationFailure as F;
+        let cases: &[(F, &str)] = &[
+            (F::LocalValidation, "operação falhou na validação local"),
+            (F::Rejected, "operação foi rejeitada"),
+            (F::Ambiguous, "operação não pôde ser confirmada"),
+            (F::Inconsistent, "operação encontrou estado inconsistente"),
+            (F::Ledger, "operação foi impedida pelo estado consolidado"),
+        ];
+        for (failure, expected) in cases {
+            assert_eq!(format_failure(failure), *expected);
+        }
+    }
+
+    #[test]
+    fn failure_lines_never_expose_rust_variant_names() {
+        use photo_publisher_integration::OperationFailure as F;
+        let key = photo_publisher_provider_contracts::ObjectKey::new("photos/a.jpg").unwrap();
+        // Every failure position in the formatter, every variant.
+        for failure in [
+            F::LocalValidation,
+            F::Rejected,
+            F::Ambiguous,
+            F::Inconsistent,
+            F::Ledger,
+        ] {
+            let events = [
+                IntegrationEvent::StoragePutFailed {
+                    key: key.clone(),
+                    size_bytes: 12,
+                    generation: "g-000001".to_owned(),
+                    index: 1,
+                    total: 1,
+                    failure,
+                },
+                IntegrationEvent::StorageDeleteFailed {
+                    key: key.clone(),
+                    size_bytes: 12,
+                    generation: "g-000001".to_owned(),
+                    index: 1,
+                    total: 1,
+                    failure,
+                },
+                IntegrationEvent::RepositoryBatchFailed {
+                    generation: "g-000001".to_owned(),
+                    writes: 2,
+                    deletes: 0,
+                    failure,
+                },
+                IntegrationEvent::HostingPublishFailed {
+                    generation: "g-000001".to_owned(),
+                    failure,
+                },
+            ];
+            for event in events {
+                let text = format_event(&ApplicationEvent::Operation(event));
+                for rust_name in [
+                    "LocalValidation",
+                    "Rejected",
+                    "Ambiguous",
+                    "Inconsistent",
+                    "Ledger",
+                ] {
+                    assert!(
+                        !text.contains(rust_name),
+                        "CLI output leaked the Rust variant name {rust_name}: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_is_never_presented_as_concluded_in_any_failure_line() {
+        use photo_publisher_integration::OperationFailure as F;
+        let key = photo_publisher_provider_contracts::ObjectKey::new("photos/a.jpg").unwrap();
+        let events = [
+            IntegrationEvent::StoragePutFailed {
+                key: key.clone(),
+                size_bytes: 12,
+                generation: "g-000001".to_owned(),
+                index: 1,
+                total: 1,
+                failure: F::Ambiguous,
+            },
+            IntegrationEvent::StorageDeleteFailed {
+                key,
+                size_bytes: 12,
+                generation: "g-000001".to_owned(),
+                index: 1,
+                total: 1,
+                failure: F::Ambiguous,
+            },
+            IntegrationEvent::RepositoryBatchFailed {
+                generation: "g-000001".to_owned(),
+                writes: 1,
+                deletes: 1,
+                failure: F::Ambiguous,
+            },
+            IntegrationEvent::HostingPublishFailed {
+                generation: "g-000001".to_owned(),
+                failure: F::Ambiguous,
+            },
+        ];
+        for event in events {
+            let text = format_event(&ApplicationEvent::Operation(event));
+            assert!(text.contains("não pôde ser confirmada"), "{text}");
+            assert!(!text.contains("Concluído"), "{text}");
+            assert!(!text.contains("concluído"), "{text}");
+        }
+    }
+
+    #[test]
+    fn failure_lines_carry_no_secrets_and_no_local_paths() {
+        use photo_publisher_integration::OperationFailure as F;
+        let key = photo_publisher_provider_contracts::ObjectKey::new("photos/a.jpg").unwrap();
+        let event = IntegrationEvent::StoragePutFailed {
+            key,
+            size_bytes: 12,
+            generation: "g-000001".to_owned(),
+            index: 1,
+            total: 1,
+            failure: F::Ambiguous,
+        };
+        let text = format_event(&ApplicationEvent::Operation(event));
+        for needle in ["token", "secret", "authorization", "password", "C:\\"] {
+            assert!(
+                !text.to_lowercase().contains(needle),
+                "failure line leaked {needle}: {text}"
+            );
+        }
     }
 
     #[test]
