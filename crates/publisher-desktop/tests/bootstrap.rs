@@ -158,6 +158,70 @@ fn changing_the_project_path_invalidates_the_previous_validation() {
 }
 
 #[test]
+fn stale_async_validation_results_are_rejected() {
+    // Structural proof of the async race fix: onValidate must capture the
+    // submitted path up front, re-read the field after the await, and ignore
+    // the outcome whenever the field no longer matches.
+    let script =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let handler = script
+        .split("async function onValidate()")
+        .nth(1)
+        .expect("onValidate must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+
+    // 1. The submitted path is captured before the invoke.
+    let capture = "const projectPath = el(\"project-path\").value.trim();";
+    let invoke = "await tauri.invoke(\"validate_project\"";
+    let staleness_check = "el(\"project-path\").value.trim() !== projectPath";
+    assert!(
+        handler.contains(capture),
+        "the submitted path must be captured"
+    );
+    assert!(
+        handler.contains(invoke),
+        "the validate invocation must exist"
+    );
+    assert!(
+        handler.contains(staleness_check),
+        "the current path must be re-read after the await"
+    );
+    // Ordering: capture → invoke → staleness check.
+    let order_ok = handler.find(capture).unwrap() < handler.find(invoke).unwrap()
+        && handler.find(invoke).unwrap() < handler.find(staleness_check).unwrap();
+    assert!(order_ok, "capture → invoke → check must be the order");
+
+    // 2. Stale branch must ignore the outcome entirely.
+    let accepted = "state.validated = Boolean(outcome.valid)";
+    assert!(handler.contains(accepted), "normal path must still accept");
+    let stale_branch_position = handler.find(staleness_check).unwrap();
+    let accept_position = handler.find(accepted).unwrap();
+    assert!(
+        stale_branch_position < accept_position,
+        "the staleness guard must precede accepting the outcome"
+    );
+    // The stale branch itself (the first guard after the await) must not
+    // write state.validated or re-enable Dry Run.
+    let first_guard = handler[stale_branch_position..]
+        .split("return;")
+        .next()
+        .unwrap();
+    assert!(
+        !first_guard.contains("state.validated"),
+        "a stale result must not write state.validated"
+    );
+    assert!(
+        !first_guard.contains("dry-run-button\").disabled = false"),
+        "a stale result must not re-enable Dry Run"
+    );
+
+    // 3. The existing invalidation-on-input behavior is intact.
+    assert!(script.contains("function onProjectPathChanged()"));
+}
+
+#[test]
 fn command_layer_contains_no_provider_or_network_wiring() {
     // Structural guarantee: the commands module is a pure adapter, so it must
     // not reference concrete providers, credentials directly, or remote verbs.

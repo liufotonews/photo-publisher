@@ -81,11 +81,22 @@ async function onValidate() {
   setBusy(true, "A validar…");
   try {
     const outcome = await tauri.invoke("validate_project", { projectPath });
+    // Guard against a stale async result: if the user edited the path while
+    // the backend validated, this answer describes a different project and
+    // must be ignored entirely (no re-validation, no Dry Run reactivation).
+    if (el("project-path").value.trim() !== projectPath) {
+      setBusy(false, "Pronto");
+      return;
+    }
     state.validated = Boolean(outcome.valid);
     showValidation(outcome);
     setBusy(false, "Projeto válido.");
     el("dry-run-button").disabled = !state.validated;
   } catch (error) {
+    if (el("project-path").value.trim() !== projectPath) {
+      setBusy(false, "Pronto");
+      return;
+    }
     state.validated = false;
     showValidationError(error);
     setBusy(false, "Erro na validação.");
