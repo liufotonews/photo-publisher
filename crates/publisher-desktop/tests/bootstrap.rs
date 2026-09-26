@@ -151,6 +151,9 @@ fn changing_the_project_path_invalidates_the_previous_validation() {
         "dry-run-button\").disabled = true",
         "hide(\"project-result\")",
         "hide(\"dry-run-result\")",
+        // The superseded operation must release the busy state exactly here,
+        // never through a stale result: this is what prevents UI deadlock.
+        "setBusy(false",
     ] {
         assert!(
             handler.contains(required),
@@ -160,6 +163,15 @@ fn changing_the_project_path_invalidates_the_previous_validation() {
     assert!(
         !handler.contains("invoke"),
         "invalidation must not call Rust: {handler}"
+    );
+
+    // Order: generation advance first, state clearing next, busy release last.
+    let begin = handler.find("beginOperation()").unwrap();
+    let cleared = handler.find("state.projectPath = \"\"").unwrap();
+    let release = handler.find("setBusy(false").unwrap();
+    assert!(
+        begin < cleared && cleared < release,
+        "operation invalidation must precede the busy release"
     );
 }
 

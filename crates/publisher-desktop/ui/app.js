@@ -392,9 +392,10 @@ function onProjectPathChanged() {
   hide("project-result");
   hide("dry-run-result");
   hide("publish-result");
-  if (!state.busy) {
-    el("global-status").textContent = "Pronto";
-  }
+  // The superseded operation is no longer current: the UI frees its busy
+  // state here — never from the stale result, which cannot cancel anything
+  // already started. setBusy only recalculates buttons from cleared state.
+  setBusy(false, "Pronto");
 }
 
 async function main() {
