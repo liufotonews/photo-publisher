@@ -9,6 +9,7 @@
 //!
 //! Contains no Tauri, no UI framework, no threads, and no async runtime.
 
+pub mod commands;
 pub mod composition;
 
 pub use composition::{build_providers, preflight_publication, DesktopProviders};

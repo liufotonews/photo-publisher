@@ -77,3 +77,30 @@ fn minimal_frontend_exists_without_framework() {
         );
     }
 }
+
+#[test]
+fn command_layer_contains_no_provider_or_network_wiring() {
+    // Structural guarantee: the commands module is a pure adapter, so it must
+    // not reference concrete providers, credentials, or remote verbs. The
+    // test reads the library source from disk to avoid self-reference.
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs")).unwrap();
+    for forbidden in [
+        "provider_github",
+        "provider_r2",
+        "provider_vercel",
+        "build_providers",
+        "preflight_publication",
+        "EnvironmentCredentialStore",
+        ".publish(",
+        ".put(",
+        ".delete(",
+        ".commit(",
+        "reqwest",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "command layer must not reference {forbidden}"
+        );
+    }
+}

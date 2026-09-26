@@ -4143,6 +4143,7 @@ dependencies = [
  "photo-publisher-provider-r2",
  "photo-publisher-provider-vercel",
  "publisher-app",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",
