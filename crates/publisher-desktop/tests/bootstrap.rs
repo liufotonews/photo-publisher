@@ -81,42 +81,70 @@ fn minimal_frontend_exists_without_framework() {
 #[test]
 fn command_layer_contains_no_provider_or_network_wiring() {
     // Structural guarantee: the commands module is a pure adapter, so it must
-    // not reference concrete providers, credentials, or remote verbs. The
-    // test reads the library source from disk to avoid self-reference.
+    // not reference concrete providers, credentials directly, or remote verbs.
+    // It DOES reuse the existing composition root functions — that is the
+    // intended delegation, not duplication. The test reads the library source
+    // from disk to avoid self-reference.
     let source =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands.rs")).unwrap();
     for forbidden in [
         "provider_github",
         "provider_r2",
         "provider_vercel",
-        "build_providers",
-        "preflight_publication",
         "EnvironmentCredentialStore",
         ".publish(",
         ".put(",
         ".delete(",
         ".commit(",
         "reqwest",
+        "ProviderError",
     ] {
         assert!(
             !source.contains(forbidden),
             "command layer must not reference {forbidden}"
         );
     }
+    // The composition root is reused, never replaced.
+    assert!(source.contains("crate::composition::preflight_publication"));
+    assert!(source.contains("crate::composition::build_providers"));
 }
 
 #[test]
-fn binary_registers_only_the_two_existing_commands_and_the_single_channel() {
-    // The Tauri binary is the only place that may touch `tauri`; the commands
-    // registered and the event channel feed must remain exactly the ones
-    // designed for this phase.
+fn binary_registers_exactly_the_four_commands_and_the_single_channel() {
+    // The Tauri binary is the only place that may touch `tauri`; the command
+    // set and the event channel feed must remain exactly what this phase
+    // specifies.
     let source =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
-    assert!(source.contains("generate_handler![get_app_info, validate_project]"));
+    assert!(source.contains(
+        "generate_handler![\n            get_app_info,\n            validate_project,\n            publish_project,\n            dry_run_project\n        ]"
+    ));
     assert!(source.contains("publisher_desktop::events::PUBLISHER_EVENT_CHANNEL"));
     assert!(source.contains("publisher_desktop::events::DesktopEvent::from"));
     // Emission failure is swallowed: the bridge can never fail the command.
     assert!(source.contains("let _ = app_handle.emit("));
+    // No other commands were registered.
+    let handler = source
+        .split("generate_handler![")
+        .nth(1)
+        .unwrap()
+        .split(']')
+        .next()
+        .unwrap();
+    let names: Vec<&str> = handler
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "get_app_info",
+            "validate_project",
+            "publish_project",
+            "dry_run_project"
+        ]
+    );
 }
 
 #[test]
@@ -125,6 +153,54 @@ fn event_channel_is_the_single_stable_contract_name() {
         publisher_desktop::events::PUBLISHER_EVENT_CHANNEL,
         "publisher://event"
     );
+}
+
+#[test]
+fn publish_v2_without_credentials_fails_before_any_remote_effect() {
+    // Integration-test process: mutating the process environment here cannot
+    // race the composition tests in the library binary.
+    for key in [
+        "PHOTO_PUBLISHER_GITHUB_TOKEN",
+        "PHOTO_PUBLISHER_R2_ACCESS_KEY_ID",
+        "PHOTO_PUBLISHER_R2_SECRET_ACCESS_KEY",
+        "PHOTO_PUBLISHER_VERCEL_TOKEN",
+    ] {
+        std::env::remove_var(key);
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("fotos")).unwrap();
+    let project_path = root.path().join("project.json");
+    std::fs::write(
+        &project_path,
+        r#"{
+            "schemaVersion": 2,
+            "project": {"id": "pub-sixf", "name": "Pub SixF"},
+            "gallery": {"template": "editorial-v1", "title": "Pub SixF", "bundlePath": "gallery-app"},
+            "source": {"type": "folder", "path": "fotos"},
+            "repository": {"provider": "github", "repository": "owner/repo"},
+            "hosting": {"provider": "vercel", "project": "pub-sixf"},
+            "storage": {
+                "preview": {"provider": "github", "publicBaseUrl": "https://cdn.example.com"},
+                "highResolution": {"provider": "r2", "accountId": "a", "bucket": "b", "publicBaseUrl": "https://d.example.com"}
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut events: Vec<publisher_app::ApplicationEvent> = Vec::new();
+    let error = publisher_desktop::commands::publish_project(
+        project_path.to_str().unwrap(),
+        &mut |event| events.push(event),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, "resource_missing");
+    assert!(error.message.contains("PHOTO_PUBLISHER_GITHUB_TOKEN"));
+    assert!(!error.message.contains("token value"));
+    // Nothing was published: no local output and no ledger were created.
+    assert!(!root.path().join("output").exists());
+    // Zero operation events: no executor ever ran.
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, publisher_app::ApplicationEvent::Operation(_))));
 }
 
 #[test]

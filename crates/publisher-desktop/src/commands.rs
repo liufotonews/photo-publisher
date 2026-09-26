@@ -96,6 +96,188 @@ pub fn validate_project(
     })
 }
 
+fn check_path(project_path: &str) -> Result<std::path::PathBuf, CommandError> {
+    let trimmed = project_path.trim();
+    if trimmed.is_empty() {
+        return Err(CommandError {
+            kind: publisher_app::ApplicationErrorKind::ProjectInvalid
+                .as_str()
+                .to_owned(),
+            message: "project path is required".to_owned(),
+        });
+    }
+    Ok(std::path::PathBuf::from(trimmed))
+}
+
+/// Publication outcome for the desktop shell: a stable, serializable view of
+/// the application outcome. Counts only — never internal types, never
+/// secrets, never provider details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublishOutcomeDto {
+    /// Stable outcome name: "published" | "no_change" | "blocked" |
+    /// "needs_recovery".
+    pub outcome: &'static str,
+    /// Generation of the committed local publication.
+    pub generation: String,
+    /// Storage summary, present only when remote storage work was confirmed.
+    pub storage: Option<OperationCountsDto>,
+    /// Repository summary, present only when a commit was confirmed.
+    pub repository: Option<RepositoryPublishDto>,
+    /// Hosting summary, present only when a deployment was confirmed.
+    pub hosting: Option<HostingPublishDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OperationCountsDto {
+    pub written: usize,
+    pub deleted: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryPublishDto {
+    pub written: usize,
+    pub deleted: usize,
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostingPublishDto {
+    pub deployment_id: String,
+    pub url: String,
+}
+
+/// Dry-run outcome for the desktop shell: counts of the reconciliation plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DryRunOutcomeDto {
+    pub generation: String,
+    pub storage_operations: usize,
+    pub repository_operations: usize,
+    pub hosting_operations: usize,
+    pub reconciliation_requirements: usize,
+}
+
+/// Publishes the project through the application layer.
+///
+/// The desktop layer only: (1) reads the validated document, (2) runs the
+/// existing publication preflight for v2 projects via the desktop composition
+/// root, (3) delegates the orchestration to `publisher_app::publish_project`
+/// with the composed providers. No business rule lives here.
+pub fn publish_project(
+    project_path: &str,
+    events: &mut EventSink<'_>,
+) -> Result<PublishOutcomeDto, CommandError> {
+    let path = check_path(project_path)?;
+    let document = publisher_app::load_project_document(&path)?;
+    let is_v2 = document["schemaVersion"].as_u64() == Some(2);
+
+    // Providers exist only for the duration of this invocation, and only for
+    // schema-v2 publications.
+    let composed = if is_v2 {
+        let configuration = crate::composition::preflight_publication(&document, &path)?;
+        let providers = crate::composition::build_providers(&configuration)?;
+        Some((configuration, providers))
+    } else {
+        None
+    };
+
+    let outcome = match composed {
+        Some((configuration, mut providers)) => {
+            let mut publication_providers = providers.as_publication_providers();
+            publisher_app::publish_project(
+                &path,
+                Some(&configuration),
+                publisher_app::PublishOptions,
+                &mut publication_providers,
+                events,
+            )?
+        }
+        None => {
+            // Schema v1 is local-only: the application layer never calls the
+            // providers at all, so the composition root provides an inert set.
+            let mut inert = crate::composition::NoopProviders::new();
+            publisher_app::publish_project(
+                &path,
+                None,
+                publisher_app::PublishOptions,
+                &mut inert.as_providers(),
+                events,
+            )?
+        }
+    };
+    Ok(publish_dto(&outcome))
+}
+
+fn publish_dto(outcome: &publisher_app::PublishOutcome) -> PublishOutcomeDto {
+    let publish_outcome_name;
+    let mut storage = None;
+    let mut repository = None;
+    let mut hosting = None;
+    match &outcome.publication {
+        publisher_app::PublicationOutcome::Published(report) => {
+            publish_outcome_name = "published";
+            storage = report.storage.as_ref().map(|report| OperationCountsDto {
+                written: report.uploaded.len(),
+                deleted: report.deleted.len(),
+            });
+            repository = report
+                .repository
+                .as_ref()
+                .map(|report| RepositoryPublishDto {
+                    written: report.written.len(),
+                    deleted: report.deleted.len(),
+                    revision: report.revision.clone(),
+                });
+            hosting = report.hosting.as_ref().map(|report| HostingPublishDto {
+                deployment_id: report
+                    .deployment
+                    .as_ref()
+                    .map(|deployment| deployment.id.clone())
+                    .unwrap_or_default(),
+                url: report
+                    .deployment
+                    .as_ref()
+                    .map(|deployment| deployment.url.clone())
+                    .unwrap_or_default(),
+            });
+        }
+        publisher_app::PublicationOutcome::NoChange { .. } => {
+            publish_outcome_name = "no_change";
+        }
+        publisher_app::PublicationOutcome::Blocked { .. } => {
+            publish_outcome_name = "blocked";
+        }
+        publisher_app::PublicationOutcome::NeedsRecovery { .. } => {
+            publish_outcome_name = "needs_recovery";
+        }
+    }
+    PublishOutcomeDto {
+        outcome: publish_outcome_name,
+        generation: outcome.generation.clone(),
+        storage,
+        repository,
+        hosting,
+    }
+}
+
+/// Plans the integrated publication without performing it.
+///
+/// Delegates to `publisher_app::dry_run_project`, which by construction
+/// cannot construct providers, write the ledger, or touch the network.
+pub fn dry_run_project(
+    project_path: &str,
+    events: &mut EventSink<'_>,
+) -> Result<DryRunOutcomeDto, CommandError> {
+    let path = check_path(project_path)?;
+    let outcome = publisher_app::dry_run_project(&path, events)?;
+    Ok(DryRunOutcomeDto {
+        generation: outcome.generation,
+        storage_operations: outcome.storage_operations,
+        repository_operations: outcome.repository_operations,
+        hosting_operations: outcome.hosting_operations,
+        reconciliation_requirements: outcome.reconciliation_requirements,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +388,72 @@ mod tests {
             captured.last(),
             Some(&publisher_app::ApplicationEvent::Finished)
         );
+    }
+
+    fn write_jpeg(path: &Path, value: u8) {
+        let image = image::RgbImage::from_pixel(1, 1, image::Rgb([value, 0, 0]));
+        image.save(path).unwrap();
+    }
+
+    fn write_v1_project_with_photo(root: &Path) -> std::path::PathBuf {
+        let project = write_project(root);
+        write_jpeg(&root.join("source").join("a.jpg"), 1);
+        project
+    }
+
+    #[test]
+    fn publish_v1_publishes_locally_without_providers_or_credentials() {
+        let root = tempdir().unwrap();
+        let project = write_v1_project_with_photo(root.path());
+        let outcome = publish_project(project.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert_eq!(outcome.outcome, "no_change");
+        assert_eq!(outcome.generation, "g-000001");
+        assert!(outcome.storage.is_none());
+        assert!(outcome.repository.is_none());
+        assert!(outcome.hosting.is_none());
+    }
+
+    #[test]
+    fn dry_run_v1_returns_a_stable_application_error() {
+        let root = tempdir().unwrap();
+        let project = write_v1_project_with_photo(root.path());
+        let error = dry_run_project(project.to_str().unwrap(), &mut |_| {}).unwrap_err();
+        // v1 projects have no integrated publication configuration.
+        assert_eq!(error.kind, "project_invalid");
+        assert!(!error.message.contains("PHOTO_PUBLISHER_"));
+        assert!(!error.message.contains("panicked"));
+    }
+
+    #[test]
+    fn dry_run_emits_zero_operation_events() {
+        let root = tempdir().unwrap();
+        let project = write_v1_project_with_photo(root.path());
+        let mut captured: Vec<publisher_app::ApplicationEvent> = Vec::new();
+        let _ = dry_run_project(project.to_str().unwrap(), &mut |event| captured.push(event));
+        assert!(
+            !captured
+                .iter()
+                .any(|event| matches!(event, publisher_app::ApplicationEvent::Operation(_))),
+            "dry-run must never emit operation events"
+        );
+    }
+
+    #[test]
+    fn publish_dto_serializes_deterministically() {
+        let dto = PublishOutcomeDto {
+            outcome: "no_change",
+            generation: "g-000001".to_owned(),
+            storage: None,
+            repository: None,
+            hosting: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&dto).unwrap(),
+            serde_json::to_string(&dto).unwrap()
+        );
+        let json = serde_json::to_string(&dto).unwrap();
+        for needle in ["PHOTO_PUBLISHER_", "token", "secret", "password", "C:\\"] {
+            assert!(!json.contains(needle), "DTO leaked {needle}: {json}");
+        }
     }
 }

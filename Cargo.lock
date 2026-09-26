@@ -4137,6 +4137,7 @@ dependencies = [
 name = "publisher-desktop"
 version = "0.1.0"
 dependencies = [
+ "image",
  "photo-publisher-integration",
  "photo-publisher-provider-contracts",
  "photo-publisher-provider-github",

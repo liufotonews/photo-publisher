@@ -260,6 +260,99 @@ impl HostingPublisher for VercelHostingAdapter {
     }
 }
 
+/// Inert provider set used only for schema-v1 (local-only) publications,
+/// where the application layer never invokes any provider. Every trait
+/// method answers `ProviderError::Unsupported`; these types exist purely to
+/// satisfy the `PublicationProviders` shape without touching any real
+/// provider, credential, or network.
+pub(crate) struct NoopProviders {
+    storage: NoopStorage,
+    repository: NoopRepository,
+    hosting: NoopHosting,
+    credentials: EnvironmentCredentialStore,
+}
+
+impl NoopProviders {
+    pub(crate) fn new() -> Self {
+        Self {
+            storage: NoopStorage,
+            repository: NoopRepository,
+            hosting: NoopHosting,
+            credentials: EnvironmentCredentialStore,
+        }
+    }
+
+    pub(crate) fn as_providers(&mut self) -> PublicationProviders<'_> {
+        PublicationProviders {
+            storage: &mut self.storage,
+            repository: &mut self.repository,
+            hosting: &mut self.hosting,
+            credentials: &self.credentials,
+        }
+    }
+}
+
+struct NoopStorage;
+struct NoopRepository;
+struct NoopHosting;
+
+use photo_publisher_provider_contracts::{
+    CommitInfo, FileMetadata, ObjectKey, RepositoryPath, RepositoryProvider, StorageObject,
+    StorageProvider,
+};
+
+impl StorageProvider for NoopStorage {
+    fn put(
+        &mut self,
+        _key: &ObjectKey,
+        _content: &mut dyn std::io::Read,
+        _content_type: Option<&str>,
+    ) -> ProviderResult<StorageObject> {
+        Err(ProviderError::Unsupported)
+    }
+    fn head(&self, _key: &ObjectKey) -> ProviderResult<Option<StorageObject>> {
+        Err(ProviderError::Unsupported)
+    }
+    fn delete(&mut self, _key: &ObjectKey) -> ProviderResult<()> {
+        Err(ProviderError::Unsupported)
+    }
+}
+
+impl RepositoryProvider for NoopRepository {
+    fn ensure_repository(&mut self) -> ProviderResult<()> {
+        Err(ProviderError::Unsupported)
+    }
+    fn exists(&self, _path: &RepositoryPath) -> ProviderResult<bool> {
+        Err(ProviderError::Unsupported)
+    }
+    fn read(&self, _path: &RepositoryPath) -> ProviderResult<Vec<u8>> {
+        Err(ProviderError::Unsupported)
+    }
+    fn write(
+        &mut self,
+        _path: &RepositoryPath,
+        _content: &mut dyn std::io::Read,
+    ) -> ProviderResult<FileMetadata> {
+        Err(ProviderError::Unsupported)
+    }
+    fn delete(&mut self, _path: &RepositoryPath) -> ProviderResult<()> {
+        Err(ProviderError::Unsupported)
+    }
+    fn commit(&mut self, _message: &str) -> ProviderResult<CommitInfo> {
+        Err(ProviderError::Unsupported)
+    }
+}
+
+impl HostingPublisher for NoopHosting {
+    fn publish(
+        &mut self,
+        _bundle: &ApplicationBundle,
+        _configuration: &HostingPublicationConfig,
+    ) -> ProviderResult<DeploymentInfo> {
+        Err(ProviderError::Unsupported)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
