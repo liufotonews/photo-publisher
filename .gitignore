@@ -1,2 +1,5 @@
 /target
 /target2
+
+# Tauri build artifacts (generated schemas)
+crates/publisher-desktop/gen/

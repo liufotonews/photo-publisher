@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Photo Publisher",
+  "version": "0.1.0",
+  "identifier": "com.photopublisher.desktop",
+  "build": {
+    "frontendDist": "./ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Photo Publisher",
+        "width": 960,
+        "height": 640
+      }
+    ]
+  },
+  "bundle": {
+    "active": false
+  }
+}
