@@ -277,15 +277,13 @@ async function onValidate() {
     const outcome = await tauri.invoke("validate_project", { projectPath });
     // Guard against a stale async result: if the user edited the path while
     // the backend validated, this answer describes a different project and
-    // must be ignored entirely (no re-validation, no Dry Run reactivation).
+    // must be ignored entirely — a stale answer never touches current state.
     if (currentPath() !== projectPath) {
-      setBusy(false, "Pronto");
       return;
     }
     // ABA: o caminho pode ter voltado ao mesmo valor; a geração da operação
     // é a identidade que impede reutilizar um resultado antigo.
     if (!isCurrentOperation(generation, projectPath)) {
-      setBusy(false, "Pronto");
       return;
     }
     state.validated = Boolean(outcome.valid);
@@ -295,11 +293,9 @@ async function onValidate() {
     el("publish-button").disabled = !canPublish();
   } catch (error) {
     if (currentPath() !== projectPath) {
-      setBusy(false, "Pronto");
       return;
     }
     if (!isCurrentOperation(generation, projectPath)) {
-      setBusy(false, "Pronto");
       return;
     }
     state.validated = false;
@@ -320,19 +316,16 @@ async function onDryRun() {
   try {
     const outcome = await tauri.invoke("dry_run_project", { projectPath });
     // Same staleness guard as validation: an answer about a superseded path
-    // is ignored entirely.
+    // is ignored entirely — a stale answer never touches current state.
     if (currentPath() !== projectPath) {
-      setBusy(false, "Pronto");
       return;
     }
     if (state.projectPath !== projectPath) {
-      setBusy(false, "Pronto");
       return;
     }
     // ABA: a geração é a identidade — um Dry Run antigo nunca reabilita
     // Publicar só porque o caminho voltou a coincidir.
     if (!isCurrentOperation(generation, projectPath)) {
-      setBusy(false, "Pronto");
       return;
     }
     state.dryRunReady = true;
@@ -341,11 +334,9 @@ async function onDryRun() {
     el("publish-button").disabled = !canPublish();
   } catch (error) {
     if (currentPath() !== projectPath) {
-      setBusy(false, "Pronto");
       return;
     }
     if (!isCurrentOperation(generation, projectPath)) {
-      setBusy(false, "Pronto");
       return;
     }
     showDryRunError(error);
@@ -362,15 +353,14 @@ async function onPublish() {
   try {
     const outcome = await tauri.invoke("publish_project", { projectPath });
     // A publish result is never cancelled; it is only refused as UI state
-    // when the user already moved on to a different path.
+    // when the user already moved on to a different path — a stale answer
+    // never touches current state.
     if (currentPath() !== projectPath) {
-      setBusy(false, "Pronto");
       return;
     }
     // ABA: the generation guards against an answer produced for a previous
     // session over the same path.
     if (!isCurrentOperation(generation, projectPath)) {
-      setBusy(false, "Pronto");
       return;
     }
     state.dryRunReady = false;
@@ -379,11 +369,9 @@ async function onPublish() {
     setBusy(false, canPublish() ? "Dry Run concluído." : "Publicação concluída.");
   } catch (error) {
     if (currentPath() !== projectPath) {
-      setBusy(false, "Pronto");
       return;
     }
     if (!isCurrentOperation(generation, projectPath)) {
-      setBusy(false, "Pronto");
       return;
     }
     showPublishError(error);

@@ -208,7 +208,8 @@ fn stale_async_validation_results_are_rejected() {
         "the staleness guard must precede accepting the outcome"
     );
     // The stale branch itself (the first guard after the await) must not
-    // write state.validated or re-enable Dry Run.
+    // write state, must not re-enable Dry Run, and must never touch the busy
+    // state of a newer operation.
     let first_guard = handler[stale_branch_position..]
         .split("return;")
         .next()
@@ -220,6 +221,10 @@ fn stale_async_validation_results_are_rejected() {
     assert!(
         !first_guard.contains("dry-run-button\").disabled = false"),
         "a stale result must not re-enable Dry Run"
+    );
+    assert!(
+        !first_guard.contains("setBusy(false"),
+        "a stale result must not touch the current busy state"
     );
 
     // 3. The existing invalidation-on-input behavior is intact.
@@ -600,11 +605,26 @@ fn publish_rejects_stale_results_and_busy_runs() {
     assert!(handler.contains("if (!canPublish()) return;"));
     assert!(handler.contains("const projectPath = state.projectPath;"));
     assert!(handler.contains("tauri.invoke(\"publish_project\""));
-    let staleness = "if (currentPath() !== projectPath) {\n      setBusy(false, \"Pronto\");\n      return;\n    }";
+    let staleness = "if (currentPath() !== projectPath) {\n      return;\n    }";
     assert!(
         handler.contains(staleness),
         "stale publish results must be ignored"
     );
+    // Inside the stale guard body: exactly a return; — no setBusy at all.
+    let check = "if (currentPath() !== projectPath)";
+    let guard_inner = handler[handler.find(check).unwrap()..]
+        .split('{')
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(
+        !guard_inner.contains("setBusy"),
+        "stale publish results never touch the busy state"
+    );
+    assert!(guard_inner.contains("return;"));
     // A stale result must not re-enable Publish.
     assert!(
         !handler.contains("el(\"publish-button\").disabled = false"),
@@ -641,6 +661,10 @@ fn dry_run_rejects_stale_results_too() {
     assert!(
         stale.contains("return;"),
         "stale dry-run result must return without marking dryRunReady"
+    );
+    assert!(
+        !stale.contains("setBusy(false"),
+        "stale dry-run result must never touch the busy state"
     );
 }
 
@@ -723,8 +747,8 @@ fn aba_protection_uses_operation_generation_in_all_async_workflows() {
             "{handler_name}: stale must not re-enable anything"
         );
         assert!(
-            guard.contains("setBusy(false"),
-            "{handler_name}: stale resolves busy without side effects"
+            !guard.contains("setBusy"),
+            "{handler_name}: stale never touches the busy state"
         );
     }
 }
