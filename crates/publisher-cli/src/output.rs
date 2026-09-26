@@ -48,7 +48,7 @@ fn format_operation(event: &IntegrationEvent) -> String {
     match event {
         IntegrationEvent::StoragePutStarted {
             key, index, total, ..
-        } => format!("[STORAGE] Upload {index}/{total}: {key_str}"),
+        } => format!("[STORAGE] Upload {index}/{total}: {}", key.as_str()),
         IntegrationEvent::StoragePutFinished { key, .. } => {
             format!("[STORAGE] Concluído: {}", key.as_str())
         }
