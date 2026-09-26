@@ -28,6 +28,7 @@
         <div class="actions">
           <button id="validate-button" type="button">Validar projeto</button>
           <button id="dry-run-button" type="button" disabled>Executar Dry Run</button>
+          <button id="publish-button" type="button" disabled>Publicar</button>
         </div>
       </section>
 
@@ -51,6 +52,11 @@
           <div><dt>Hosting</dt><dd id="dry-run-hosting"></dd></div>
           <div><dt>Reconciliação</dt><dd id="dry-run-reconciliation"></dd></div>
         </dl>
+      </section>
+
+      <section id="publish-result" class="card result" hidden aria-live="polite">
+        <h2 id="publish-result-title">Publicação</h2>
+        <p id="publish-status" class="status"></p>
       </section>
 
       <section id="activity" class="card" aria-labelledby="activity-title">

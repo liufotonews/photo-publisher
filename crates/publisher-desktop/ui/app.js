@@ -14,15 +14,31 @@ const tauriEvents = window.__TAURI__ ? window.__TAURI__.event : null;
 const state = {
   projectPath: "",
   validated: false,
+  dryRunReady: false,
   busy: false,
 };
 
 const el = (id) => document.getElementById(id);
 
+function currentPath() {
+  return el("project-path").value.trim();
+}
+
+function canPublish() {
+  return (
+    !state.busy &&
+    state.validated &&
+    state.dryRunReady &&
+    state.projectPath !== "" &&
+    currentPath() === state.projectPath
+  );
+}
+
 function setBusy(busy, label) {
   state.busy = busy;
   el("validate-button").disabled = busy;
   el("dry-run-button").disabled = busy || !state.validated;
+  el("publish-button").disabled = !canPublish();
   el("global-status").textContent = label;
 }
 
@@ -42,9 +58,8 @@ function showValidation(outcome) {
 function showValidationError(error) {
   el("project-result").hidden = false;
   el("project-result-title").textContent = "Validação falhou";
-  el("project-status").textContent = error && error.message
-    ? error.message
-    : "Erro desconhecido.";
+  el("project-status").textContent =
+    error && error.message ? error.message : "Erro desconhecido.";
   // Limpa o resumo anterior: o erro fica visualmente separado.
   el("project-name").textContent = "";
   el("project-id").textContent = "";
@@ -65,13 +80,47 @@ function showDryRun(outcome) {
 function showDryRunError(error) {
   el("dry-run-result").hidden = false;
   el("dry-run-result-title").textContent = "Dry Run";
-  el("dry-run-status").textContent = "Não foi possível executar o Dry Run: " +
+  el("dry-run-status").textContent =
+    "Não foi possível executar o Dry Run: " +
     (error && error.message ? error.message : "Erro desconhecido.");
   el("dry-run-generation").textContent = "";
   el("dry-run-repository").textContent = "";
   el("dry-run-storage").textContent = "";
   el("dry-run-hosting").textContent = "";
   el("dry-run-reconciliation").textContent = "";
+}
+
+const PUBLISH_OUTCOME_MESSAGES = {
+  published: {
+    title: "Publicado",
+    text: "A publicação foi concluída.",
+  },
+  no_change: {
+    title: "Sem alterações",
+    text: "O projeto já está sincronizado.",
+  },
+  blocked: {
+    title: "Publicação bloqueada",
+    text: "A publicação não foi executada porque existem pendências que precisam ser resolvidas.",
+  },
+  needs_recovery: {
+    title: "Recuperação necessária",
+    text: "A publicação anterior requer recuperação antes de uma nova publicação.",
+  },
+};
+
+function showPublish(outcome) {
+  el("publish-result").hidden = false;
+  const message = PUBLISH_OUTCOME_MESSAGES[outcome.outcome];
+  el("publish-result-title").textContent = message ? message.title : "Publicação";
+  el("publish-status").textContent = message ? message.text : "";
+}
+
+function showPublishError(error) {
+  el("publish-result").hidden = false;
+  el("publish-result-title").textContent = "Publicação falhou";
+  el("publish-status").textContent =
+    error && error.message ? error.message : "Erro desconhecido.";
 }
 
 // ---------------------------------------------------------------------------
@@ -193,11 +242,14 @@ async function installPublisherEventListener() {
 
 async function onValidate() {
   if (state.busy) return;
-  const projectPath = el("project-path").value.trim();
+  const projectPath = currentPath();
   hide("project-result");
   hide("dry-run-result");
+  hide("publish-result");
   state.validated = false;
+  state.dryRunReady = false;
   el("dry-run-button").disabled = true;
+  el("publish-button").disabled = true;
   state.projectPath = projectPath;
   setBusy(true, "A validar…");
   try {
@@ -205,7 +257,7 @@ async function onValidate() {
     // Guard against a stale async result: if the user edited the path while
     // the backend validated, this answer describes a different project and
     // must be ignored entirely (no re-validation, no Dry Run reactivation).
-    if (el("project-path").value.trim() !== projectPath) {
+    if (currentPath() !== projectPath) {
       setBusy(false, "Pronto");
       return;
     }
@@ -213,8 +265,9 @@ async function onValidate() {
     showValidation(outcome);
     setBusy(false, "Projeto válido.");
     el("dry-run-button").disabled = !state.validated;
+    el("publish-button").disabled = !canPublish();
   } catch (error) {
-    if (el("project-path").value.trim() !== projectPath) {
+    if (currentPath() !== projectPath) {
       setBusy(false, "Pronto");
       return;
     }
@@ -224,37 +277,88 @@ async function onValidate() {
   }
 }
 
+async function onDryRun() {
+  if (state.busy || !state.validated) return;
+  const projectPath = state.projectPath;
+  if (!projectPath || currentPath() !== projectPath) return;
+  hide("dry-run-result");
+  hide("publish-result");
+  state.dryRunReady = false;
+  setBusy(true, "A executar Dry Run…");
+  try {
+    const outcome = await tauri.invoke("dry_run_project", { projectPath });
+    // Same staleness guard as validation: an answer about a superseded path
+    // is ignored entirely.
+    if (currentPath() !== projectPath) {
+      setBusy(false, "Pronto");
+      return;
+    }
+    if (state.projectPath !== projectPath) {
+      setBusy(false, "Pronto");
+      return;
+    }
+    state.dryRunReady = true;
+    showDryRun(outcome);
+    setBusy(false, "Dry Run concluído.");
+    el("publish-button").disabled = !canPublish();
+  } catch (error) {
+    if (currentPath() !== projectPath) {
+      setBusy(false, "Pronto");
+      return;
+    }
+    showDryRunError(error);
+    setBusy(false, "Falha no Dry Run.");
+  }
+}
+
+async function onPublish() {
+  if (!canPublish()) return;
+  const projectPath = state.projectPath;
+  hide("publish-result");
+  setBusy(true, "A publicar…");
+  try {
+    const outcome = await tauri.invoke("publish_project", { projectPath });
+    // A publish result is never cancelled; it is only refused as UI state
+    // when the user already moved on to a different path.
+    if (currentPath() !== projectPath) {
+      setBusy(false, "Pronto");
+      return;
+    }
+    state.dryRunReady = false;
+    el("publish-button").disabled = true;
+    showPublish(outcome);
+    setBusy(false, canPublish() ? "Dry Run concluído." : "Publicação concluída.");
+  } catch (error) {
+    if (currentPath() !== projectPath) {
+      setBusy(false, "Pronto");
+      return;
+    }
+    showPublishError(error);
+    setBusy(false, "Falha na publicação.");
+  }
+}
+
 // Uma alteração ao caminho invalida qualquer validação anterior: a UI deixa
 // de ser "validada", o Dry Run fica desabilitado e os resultados anteriores
 // são removidos. Nada é executado e nada de Rust é chamado.
 function onProjectPathChanged() {
   state.validated = false;
+  state.dryRunReady = false;
   state.projectPath = "";
   el("dry-run-button").disabled = true;
+  el("publish-button").disabled = true;
   hide("project-result");
   hide("dry-run-result");
+  hide("publish-result");
   if (!state.busy) {
     el("global-status").textContent = "Pronto";
-  }
-}
-
-async function onDryRun() {
-  if (state.busy || !state.validated) return;
-  hide("dry-run-result");
-  setBusy(true, "A executar Dry Run…");
-  try {
-    const outcome = await tauri.invoke("dry_run_project", { projectPath: state.projectPath });
-    showDryRun(outcome);
-    setBusy(false, "Dry Run concluído.");
-  } catch (error) {
-    showDryRunError(error);
-    setBusy(false, "Falha no Dry Run.");
   }
 }
 
 async function main() {
   el("validate-button").addEventListener("click", onValidate);
   el("dry-run-button").addEventListener("click", onDryRun);
+  el("publish-button").addEventListener("click", onPublish);
   el("project-path").addEventListener("input", onProjectPathChanged);
   // The event listener is installed once, at startup.
   installPublisherEventListener();

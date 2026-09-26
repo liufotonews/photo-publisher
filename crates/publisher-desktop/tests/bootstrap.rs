@@ -96,11 +96,17 @@ fn ui_assets_are_plain_html_js_css_with_no_framework_or_credentials() {
     let config_text =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json")).unwrap();
     assert!(config_text.contains("\"withGlobalTauri\": true"));
-    // Frontend calls only these commands — publish stays out of this phase.
+    // Frontend calls only these commands; publication is confined to its own
+    // handler (see publish_is_called_only_through_the_publish_handler...).
     assert!(script.contains("validate_project"));
     assert!(script.contains("dry_run_project"));
     assert!(script.contains("get_app_info"));
-    assert!(!script.contains("publish_project"));
+    assert!(script.contains("async function onPublish()"));
+    let outside_publish = script.split("async function onPublish()").next().unwrap();
+    assert!(
+        !outside_publish.contains("tauri.invoke(\"publish_project\""),
+        "publication must stay inside onPublish"
+    );
     // No credentials, no tokens, no persistent storage, no filesystem access.
     let script_lower = script.to_lowercase();
     for forbidden in [
@@ -173,9 +179,9 @@ fn stale_async_validation_results_are_rejected() {
         .unwrap();
 
     // 1. The submitted path is captured before the invoke.
-    let capture = "const projectPath = el(\"project-path\").value.trim();";
+    let capture = "const projectPath = currentPath();";
     let invoke = "await tauri.invoke(\"validate_project\"";
-    let staleness_check = "el(\"project-path\").value.trim() !== projectPath";
+    let staleness_check = "currentPath() !== projectPath";
     assert!(
         handler.contains(capture),
         "the submitted path must be captured"
@@ -302,11 +308,35 @@ fn publisher_event_mapping_covers_every_workflow_and_operation_event() {
 }
 
 #[test]
-fn the_ui_still_does_not_call_publish_and_uses_no_library() {
-    let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js"))
-        .unwrap()
-        .to_lowercase();
-    assert!(!script.contains("publish_project"));
+fn publish_is_called_only_through_the_publish_handler_and_frameworks_stay_out() {
+    let script =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    // Publication is reachable, but only from onPublish.
+    assert!(script.contains("async function onPublish()"));
+    let handler = script
+        .split("async function onPublish()")
+        .nth(1)
+        .expect("onPublish must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(handler.contains("tauri.invoke(\"publish_project\""));
+    // validate/dry-run handlers never publish.
+    for other in ["async function onValidate()", "async function onDryRun()"] {
+        let body = script
+            .split(other)
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(
+            !body.contains("publish_project"),
+            "handler {other} must not publish"
+        );
+    }
+    // No frontend framework.
+    let lowered = script.to_lowercase();
     for forbidden in [
         "react.js",
         "react-dom",
@@ -314,9 +344,11 @@ fn the_ui_still_does_not_call_publish_and_uses_no_library() {
         "vite.config",
         ".tsx",
         ".jsx",
+        "import(",
+        "require(",
     ] {
         assert!(
-            !script.contains(forbidden),
+            !lowered.contains(forbidden),
             "frontend must avoid {forbidden}"
         );
     }
@@ -523,4 +555,113 @@ fn event_adapter_has_no_business_or_runtime_surface() {
             "event adapter must not reference {forbidden}"
         );
     }
+}
+
+#[test]
+fn publish_gate_requires_validation_and_dry_run() {
+    let script =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    // A publish guard must exist and require validated + dryRunReady + the
+    // current field still matching the captured path, plus not busy.
+    assert!(
+        script.contains("function canPublish()"),
+        "canPublish must exist"
+    );
+    let publish_guard = script
+        .split("function canPublish()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "!state.busy",
+        "state.validated",
+        "state.dryRunReady",
+        "currentPath() === state.projectPath",
+    ] {
+        assert!(
+            publish_guard.contains(required),
+            "canPublish must require {required}"
+        );
+    }
+    // Validation alone no longer unlocks publish: dry-run must run again.
+    assert!(script.contains("state.dryRunReady = true"), "dry-run gate");
+    let validate_handler = script
+        .split("async function onValidate()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(validate_handler.contains("state.dryRunReady = false"));
+    assert!(validate_handler.contains("el(\"publish-button\").disabled = true"));
+}
+
+#[test]
+fn publish_rejects_stale_results_and_busy_runs() {
+    let script =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let handler = script
+        .split("async function onPublish()")
+        .nth(1)
+        .expect("onPublish must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // Busy guard plus captured-path comparison.
+    assert!(handler.contains("if (!canPublish()) return;"));
+    assert!(handler.contains("const projectPath = state.projectPath;"));
+    assert!(handler.contains("tauri.invoke(\"publish_project\""));
+    let staleness = "if (currentPath() !== projectPath) {\n      setBusy(false, \"Pronto\");\n      return;\n    }";
+    assert!(
+        handler.contains(staleness),
+        "stale publish results must be ignored"
+    );
+    // A stale result must not re-enable Publish.
+    assert!(
+        !handler.contains("el(\"publish-button\").disabled = false"),
+        "stale publish results must not re-enable publish"
+    );
+    // After publishing, the gate resets: a new Dry Run is required again.
+    assert!(handler.contains("state.dryRunReady = false"));
+}
+
+#[test]
+fn dry_run_rejects_stale_results_too() {
+    let script =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let handler = script
+        .split("async function onDryRun()")
+        .nth(1)
+        .expect("onDryRun must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(handler.contains("const projectPath = state.projectPath;"));
+    assert!(handler.contains("tauri.invoke(\"dry_run_project\""));
+    assert!(
+        handler.contains("currentPath() !== projectPath"),
+        "stale check"
+    );
+    assert!(handler.contains("state.dryRunReady = true"));
+    let stale = handler
+        .split("if (currentPath() !== projectPath)")
+        .nth(1)
+        .unwrap()
+        .split("state.dryRunReady = true")
+        .next()
+        .unwrap();
+    assert!(
+        stale.contains("return;"),
+        "stale dry-run result must return without marking dryRunReady"
+    );
+}
+
+#[test]
+fn exactly_one_event_listener_is_installed() {
+    let script =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/app.js")).unwrap();
+    let count = script.matches(".listen(\"publisher://event\"").count();
+    assert_eq!(count, 1, "exactly one listener registration expected");
 }
