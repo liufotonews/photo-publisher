@@ -113,17 +113,11 @@ fn command_layer_contains_no_provider_or_network_wiring() {
 fn binary_registers_exactly_the_four_commands_and_the_single_channel() {
     // The Tauri binary is the only place that may touch `tauri`; the command
     // set and the event channel feed must remain exactly what this phase
-    // specifies.
-    let source =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
-    assert!(source.contains(
-        "generate_handler![\n            get_app_info,\n            validate_project,\n            publish_project,\n            dry_run_project\n        ]"
-    ));
-    assert!(source.contains("publisher_desktop::events::PUBLISHER_EVENT_CHANNEL"));
-    assert!(source.contains("publisher_desktop::events::DesktopEvent::from"));
-    // Emission failure is swallowed: the bridge can never fail the command.
-    assert!(source.contains("let _ = app_handle.emit("));
-    // No other commands were registered.
+    // specifies. Line endings are normalized (CI checkouts on Windows use
+    // CRLF) before any string comparison.
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
     let handler = source
         .split("generate_handler![")
         .nth(1)
@@ -145,6 +139,10 @@ fn binary_registers_exactly_the_four_commands_and_the_single_channel() {
             "dry_run_project"
         ]
     );
+    assert!(source.contains("publisher_desktop::events::PUBLISHER_EVENT_CHANNEL"));
+    assert!(source.contains("publisher_desktop::events::DesktopEvent::from"));
+    // Emission failure is swallowed: the bridge can never fail the command.
+    assert!(source.contains("let _ = app_handle.emit("));
 }
 
 #[test]
