@@ -18,6 +18,26 @@ const state = {
   busy: false,
 };
 
+// Generation counter against ABA races: a stale path may reappear (A→B→A),
+// so path-equality alone cannot decide if an async result is still current.
+// Any accepted answer must carry the generation captured before the await
+// and the same captured path.
+let operationGeneration = 0;
+
+/// Starts a new UI operation and returns its generation; changing the project
+/// path also advances the generation so prior in-flight operations become
+/// stale even if the user types the same path again.
+function beginOperation() {
+  operationGeneration += 1;
+  return operationGeneration;
+}
+
+/// An operation is current only if the generation and the path both still
+/// match what the operation captured.
+function isCurrentOperation(generation, path) {
+  return operationGeneration === generation && path === currentPath();
+}
+
 const el = (id) => document.getElementById(id);
 
 function currentPath() {
@@ -243,6 +263,7 @@ async function installPublisherEventListener() {
 async function onValidate() {
   if (state.busy) return;
   const projectPath = currentPath();
+  const generation = beginOperation();
   hide("project-result");
   hide("dry-run-result");
   hide("publish-result");
@@ -261,6 +282,12 @@ async function onValidate() {
       setBusy(false, "Pronto");
       return;
     }
+    // ABA: o caminho pode ter voltado ao mesmo valor; a geração da operação
+    // é a identidade que impede reutilizar um resultado antigo.
+    if (!isCurrentOperation(generation, projectPath)) {
+      setBusy(false, "Pronto");
+      return;
+    }
     state.validated = Boolean(outcome.valid);
     showValidation(outcome);
     setBusy(false, "Projeto válido.");
@@ -268,6 +295,10 @@ async function onValidate() {
     el("publish-button").disabled = !canPublish();
   } catch (error) {
     if (currentPath() !== projectPath) {
+      setBusy(false, "Pronto");
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
       setBusy(false, "Pronto");
       return;
     }
@@ -281,6 +312,7 @@ async function onDryRun() {
   if (state.busy || !state.validated) return;
   const projectPath = state.projectPath;
   if (!projectPath || currentPath() !== projectPath) return;
+  const generation = beginOperation();
   hide("dry-run-result");
   hide("publish-result");
   state.dryRunReady = false;
@@ -297,12 +329,22 @@ async function onDryRun() {
       setBusy(false, "Pronto");
       return;
     }
+    // ABA: a geração é a identidade — um Dry Run antigo nunca reabilita
+    // Publicar só porque o caminho voltou a coincidir.
+    if (!isCurrentOperation(generation, projectPath)) {
+      setBusy(false, "Pronto");
+      return;
+    }
     state.dryRunReady = true;
     showDryRun(outcome);
     setBusy(false, "Dry Run concluído.");
     el("publish-button").disabled = !canPublish();
   } catch (error) {
     if (currentPath() !== projectPath) {
+      setBusy(false, "Pronto");
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
       setBusy(false, "Pronto");
       return;
     }
@@ -314,6 +356,7 @@ async function onDryRun() {
 async function onPublish() {
   if (!canPublish()) return;
   const projectPath = state.projectPath;
+  const generation = beginOperation();
   hide("publish-result");
   setBusy(true, "A publicar…");
   try {
@@ -321,6 +364,12 @@ async function onPublish() {
     // A publish result is never cancelled; it is only refused as UI state
     // when the user already moved on to a different path.
     if (currentPath() !== projectPath) {
+      setBusy(false, "Pronto");
+      return;
+    }
+    // ABA: the generation guards against an answer produced for a previous
+    // session over the same path.
+    if (!isCurrentOperation(generation, projectPath)) {
       setBusy(false, "Pronto");
       return;
     }
@@ -333,6 +382,10 @@ async function onPublish() {
       setBusy(false, "Pronto");
       return;
     }
+    if (!isCurrentOperation(generation, projectPath)) {
+      setBusy(false, "Pronto");
+      return;
+    }
     showPublishError(error);
     setBusy(false, "Falha na publicação.");
   }
@@ -342,6 +395,7 @@ async function onPublish() {
 // de ser "validada", o Dry Run fica desabilitado e os resultados anteriores
 // são removidos. Nada é executado e nada de Rust é chamado.
 function onProjectPathChanged() {
+  beginOperation(); // invalidates any in-flight operation's generation too
   state.validated = false;
   state.dryRunReady = false;
   state.projectPath = "";

@@ -650,3 +650,81 @@ fn exactly_one_event_listener_is_installed() {
     let count = script.matches(".listen(\"publisher://event\"").count();
     assert_eq!(count, 1, "exactly one listener registration expected");
 }
+
+#[test]
+fn aba_protection_uses_operation_generation_in_all_async_workflows() {
+    let script = read_source("/ui/app.js");
+    // The helpers define the generation-based guard against A→B→A races.
+    assert!(script.contains("let operationGeneration = 0;"));
+    assert!(script.contains("function beginOperation()"));
+    assert!(script.contains("function isCurrentOperation("));
+
+    for handler_name in [
+        "async function onValidate()",
+        "async function onDryRun()",
+        "async function onPublish()",
+    ] {
+        let handler = script
+            .split(handler_name)
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        // Each async handler captures the generation with its path.
+        assert!(
+            handler.contains("beginOperation()"),
+            "{handler_name} must capture the operation generation"
+        );
+        // And rejects stale results through the combined test.
+        let await_pos = handler.find("await tauri.invoke").unwrap();
+        let guard_pos = handler.find("isCurrentOperation(").unwrap();
+        assert!(
+            await_pos < guard_pos,
+            "{handler_name}: the generation check must follow the await"
+        );
+    }
+
+    // A path change starts a new generation (so A→B→A can never validate the
+    // superseded operation again).
+    let path_handler = script
+        .split("function onProjectPathChanged()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(
+        path_handler.contains("beginOperation()"),
+        "path changes must advance the operation generation"
+    );
+    // The stale guard never re-enables Dry Run or Publish.
+    for handler_name in [
+        "async function onValidate()",
+        "async function onDryRun()",
+        "async function onPublish()",
+    ] {
+        let handler = script
+            .split(handler_name)
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let guard = handler
+            .split("isCurrentOperation(")
+            .nth(1)
+            .unwrap()
+            .split("return;")
+            .next()
+            .unwrap();
+        assert!(
+            !guard.contains(".disabled = false"),
+            "{handler_name}: stale must not re-enable anything"
+        );
+        assert!(
+            guard.contains("setBusy(false"),
+            "{handler_name}: stale resolves busy without side effects"
+        );
+    }
+}
