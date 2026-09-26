@@ -28,3 +28,26 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Phase 6-E.3 validation: one deterministic Windows run covering format,
+  # tests, clippy, CLI behavior (help/verbose/silent/json/dry-run/
+  # idempotency), and the frozen-file check against tag v0.1.0. No real
+  # credentials are needed; the fixture uses the local-only project contract.
+  verify-phase6e:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The full history is required so tag v0.1.0 is available for the
+          # frozen-file comparison.
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Verify Phase 6-E
+        shell: pwsh
+        run: scripts/verify-phase6e.ps1
