@@ -9,6 +9,7 @@
 //! stays free of the Tauri runtime (so tests link nothing webview-related),
 //! and the desktop binary registers thin wrappers for each of them.
 
+use publisher_app::events::EventSink;
 use serde::Serialize;
 
 /// Non-sensitive application identity, derived from the crate itself.
@@ -65,8 +66,13 @@ pub struct ProjectSummary {
 ///
 /// This command performs no preflight of providers and reads no credentials:
 /// validation is intentionally independent of any publication setup, so it
-/// works on a machine without GitHub/R2/Vercel configuration.
-pub fn validate_project(project_path: &str) -> Result<ValidateProjectOutcome, CommandError> {
+/// works on a machine without GitHub/R2/Vercel configuration. The caller
+/// provides the event sink (the desktop binary forwards it to the Tauri
+/// event channel); nothing is emitted unless the caller does so.
+pub fn validate_project(
+    project_path: &str,
+    events: &mut EventSink<'_>,
+) -> Result<ValidateProjectOutcome, CommandError> {
     let trimmed = project_path.trim();
     if trimmed.is_empty() {
         return Err(CommandError {
@@ -76,7 +82,7 @@ pub fn validate_project(project_path: &str) -> Result<ValidateProjectOutcome, Co
             message: "project path is required".to_owned(),
         });
     }
-    let handle = publisher_app::validate_project(std::path::Path::new(trimmed), &mut |_event| {})?;
+    let handle = publisher_app::validate_project(std::path::Path::new(trimmed), events)?;
     Ok(ValidateProjectOutcome {
         valid: true,
         project: ProjectSummary {
@@ -140,7 +146,7 @@ mod tests {
     fn validate_project_accepts_a_valid_fixture() {
         let root = tempdir().unwrap();
         let project = write_project(root.path());
-        let outcome = validate_project(project.to_str().unwrap()).unwrap();
+        let outcome = validate_project(project.to_str().unwrap(), &mut |_| {}).unwrap();
         assert!(outcome.valid);
         assert_eq!(outcome.project.id, "app-test");
         assert_eq!(outcome.project.name, "App Test");
@@ -152,7 +158,7 @@ mod tests {
         let root = tempdir().unwrap();
         let path = root.path().join("project.json");
         std::fs::write(&path, b"{not json").unwrap();
-        let error = validate_project(path.to_str().unwrap()).unwrap_err();
+        let error = validate_project(path.to_str().unwrap(), &mut |_| {}).unwrap_err();
         assert_eq!(error.kind, "project_invalid");
         assert!(!error.message.contains("panicked"));
         let json = serde_json::to_value(&error).unwrap();
@@ -161,23 +167,44 @@ mod tests {
 
     #[test]
     fn validate_project_rejects_empty_paths_deterministically() {
-        let error = validate_project("   ").unwrap_err();
+        let error = validate_project("   ", &mut |_| {}).unwrap_err();
         assert_eq!(error.kind, "project_invalid");
         assert_eq!(error.message, "project path is required");
     }
 
     #[test]
     fn validate_project_never_needs_credentials() {
-        for key in [
-            "PHOTO_PUBLISHER_GITHUB_TOKEN",
-            "PHOTO_PUBLISHER_R2_ACCESS_KEY_ID",
-            "PHOTO_PUBLISHER_R2_SECRET_ACCESS_KEY",
-            "PHOTO_PUBLISHER_VERCEL_TOKEN",
-        ] {
-            std::env::remove_var(key);
-        }
+        // Validation never consults the environment: the command runs
+        // identically regardless of any PHOTO_PUBLISHER_* configuration.
+        // (No mutation here — environment changes race with the composition
+        // tests in the same process; see tests/bootstrap.rs for the structural
+        // guarantee that no credential lookup happens at all.)
         let root = tempdir().unwrap();
         let project = write_project(root.path());
-        validate_project(project.to_str().unwrap()).unwrap();
+        validate_project(project.to_str().unwrap(), &mut |_| {}).unwrap();
+    }
+
+    #[test]
+    fn validate_project_emits_events_without_changing_the_outcome() {
+        let root = tempdir().unwrap();
+        let project = write_project(root.path());
+        let mut captured: Vec<publisher_app::ApplicationEvent> = Vec::new();
+        let outcome =
+            validate_project(project.to_str().unwrap(), &mut |event| captured.push(event)).unwrap();
+        // Same result regardless of whether events are observed.
+        assert!(outcome.valid);
+        assert_eq!(outcome.project.id, "app-test");
+        assert_eq!(outcome.project.kind, "v1");
+        // The use case emitted its workflow lifecycle; the adapter observed it.
+        assert_eq!(
+            captured.first(),
+            Some(&publisher_app::ApplicationEvent::EnteredStep(
+                publisher_app::WorkflowStep::ValidateProject
+            ))
+        );
+        assert_eq!(
+            captured.last(),
+            Some(&publisher_app::ApplicationEvent::Finished)
+        );
     }
 }

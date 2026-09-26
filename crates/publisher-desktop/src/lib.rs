@@ -11,5 +11,6 @@
 
 pub mod commands;
 pub mod composition;
+pub mod events;
 
 pub use composition::{build_providers, preflight_publication, DesktopProviders};

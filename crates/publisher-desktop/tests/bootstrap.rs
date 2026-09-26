@@ -104,3 +104,52 @@ fn command_layer_contains_no_provider_or_network_wiring() {
         );
     }
 }
+
+#[test]
+fn binary_registers_only_the_two_existing_commands_and_the_single_channel() {
+    // The Tauri binary is the only place that may touch `tauri`; the commands
+    // registered and the event channel feed must remain exactly the ones
+    // designed for this phase.
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+    assert!(source.contains("generate_handler![get_app_info, validate_project]"));
+    assert!(source.contains("publisher_desktop::events::PUBLISHER_EVENT_CHANNEL"));
+    assert!(source.contains("publisher_desktop::events::DesktopEvent::from"));
+    // Emission failure is swallowed: the bridge can never fail the command.
+    assert!(source.contains("let _ = app_handle.emit("));
+}
+
+#[test]
+fn event_channel_is_the_single_stable_contract_name() {
+    assert_eq!(
+        publisher_desktop::events::PUBLISHER_EVENT_CHANNEL,
+        "publisher://event"
+    );
+}
+
+#[test]
+fn event_adapter_has_no_business_or_runtime_surface() {
+    // Structural guarantee: the adapter module translates and nothing else —
+    // no provider, credential, process, or time sources; no Tauri runtime (the
+    // emission lives in the binary). Reads the source from disk to avoid
+    // self-reference.
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/events.rs")).unwrap();
+    for forbidden in [
+        "std::time",
+        "SystemTime",
+        "std::process",
+        "provider_github",
+        "provider_r2",
+        "provider_vercel",
+        "EnvironmentCredentialStore",
+        "app_handle",
+        "emit(",
+        "tauri::",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "event adapter must not reference {forbidden}"
+        );
+    }
+}
