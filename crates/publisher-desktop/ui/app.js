@@ -259,7 +259,11 @@ async function onPreflight() {
   if (!projectPath || currentPath() !== projectPath) return;
   const generation = beginOperation();
   state.preflightReady = false;
+  // Um novo Preflight é uma nova verificação de pré-condições: o Dry Run
+  // anterior deixa de representar o estado atual e tem de ser repetido.
+  state.dryRunReady = false;
   hide("preflight-result");
+  hide("dry-run-result");
   setBusy(true, "A executar Preflight…");
   try {
     const outcome = await tauri.invoke("preflight_project", { projectPath });

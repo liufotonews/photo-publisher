@@ -1932,3 +1932,67 @@ fn preflight_is_invalidated_by_path_change_and_mode_switch() {
         .unwrap();
     assert!(mode.contains("el(\"preflight-result\")"));
 }
+
+#[test]
+fn preflight_rerun_invalidates_the_previous_dry_run() {
+    // Audit fix (Phase 7-F microfix): starting a new Preflight is a new
+    // precondition check, so the previous Dry Run result no longer
+    // represents the current state. Both invalidations must happen before
+    // the backend call — never after, never conditionally on success.
+    let script = read_source("/ui/app.js");
+    let handler = script
+        .split("async function onPreflight()")
+        .nth(1)
+        .expect("onPreflight must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "state.preflightReady = false",
+        "state.dryRunReady = false",
+        "hide(\"preflight-result\")",
+        "hide(\"dry-run-result\")",
+    ] {
+        assert!(
+            handler.contains(required),
+            "onPreflight must contain {required}"
+        );
+    }
+    let await_pos = handler
+        .find("await tauri.invoke(\"preflight_project\"")
+        .unwrap();
+    for invalidation in [
+        "state.preflightReady = false",
+        "state.dryRunReady = false",
+        "hide(\"preflight-result\")",
+        "hide(\"dry-run-result\")",
+    ] {
+        let pos = handler.find(invalidation).unwrap();
+        assert!(
+            pos < await_pos,
+            "{invalidation} must happen before the preflight await"
+        );
+    }
+    // Discipline order: generation first, invalidations next, busy last.
+    let generation_pos = handler.find("beginOperation()").unwrap();
+    let busy_pos = handler.find("setBusy(true").unwrap();
+    let invalidate_pos = handler.find("state.dryRunReady = false").unwrap();
+    assert!(generation_pos < invalidate_pos && invalidate_pos < busy_pos);
+    // A successful Preflight re-enables the Dry Run but never the Publish:
+    // the publish gate continues to require a fresh dryRunReady.
+    let success_branch = handler
+        .split("state.preflightReady = Boolean(outcome.ready)")
+        .nth(1)
+        .unwrap();
+    let success_stop = success_branch.find("} catch (error) {").unwrap();
+    let success = &success_branch[..success_stop];
+    assert!(!success.contains("state.dryRunReady = true"));
+    let can_publish = script
+        .split("function canPublish()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(can_publish.contains("state.dryRunReady"));
+}
