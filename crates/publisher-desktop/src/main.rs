@@ -15,7 +15,7 @@
 
 use publisher_desktop::commands::{
     AppInfo, CommandError, CreateProjectSetupOutcomeDto, DryRunOutcomeDto, PublishOutcomeDto,
-    RecoverOutcomeDto, ValidateProjectOutcome,
+    RecoverOutcomeDto, ValidateConfigurationOutcomeDto, ValidateProjectOutcome,
 };
 use tauri::Emitter;
 
@@ -105,6 +105,16 @@ fn create_project_setup(
     publisher_desktop::commands::create_project_setup(&project_path, setup)
 }
 
+/// Diagnoses the declared configuration of a `project.json` — a synchronous
+/// read-and-diagnose operation fully delegated to the publisher-app
+/// configuration validation (no providers, no credentials, no network).
+#[tauri::command]
+fn validate_project_configuration(
+    project_path: String,
+) -> Result<ValidateConfigurationOutcomeDto, CommandError> {
+    publisher_desktop::commands::validate_project_configuration(&project_path)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(DesktopState)
@@ -114,7 +124,8 @@ fn main() {
             publish_project,
             dry_run_project,
             recover_project,
-            create_project_setup
+            create_project_setup,
+            validate_project_configuration
         ])
         .run(tauri::generate_context!("tauri.conf.json"))
         .expect("error while running the Photo Publisher desktop application");

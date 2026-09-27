@@ -398,7 +398,7 @@ fn command_layer_contains_no_provider_or_network_wiring() {
 }
 
 #[test]
-fn binary_registers_exactly_the_six_commands_and_the_single_channel() {
+fn binary_registers_exactly_the_seven_commands_and_the_single_channel() {
     // The Tauri binary is the only place that may touch `tauri`; the command
     // set and the event channel feed must remain exactly what this phase
     // specifies. Line endings are normalized (CI checkouts on Windows use
@@ -424,7 +424,8 @@ fn binary_registers_exactly_the_six_commands_and_the_single_channel() {
             "publish_project",
             "dry_run_project",
             "recover_project",
-            "create_project_setup"
+            "create_project_setup",
+            "validate_project_configuration"
         ]
     );
     assert!(source.contains("publisher_desktop::events::PUBLISHER_EVENT_CHANNEL"));
@@ -777,7 +778,8 @@ fn recover_project_is_registered_and_remains_a_pure_adapter() {
             "publish_project",
             "dry_run_project",
             "recover_project",
-            "create_project_setup"
+            "create_project_setup",
+            "validate_project_configuration"
         ]
     );
     // The desktop command layer delegates to the application use case.
@@ -818,7 +820,7 @@ fn create_project_setup_is_registered_and_a_pure_adapter() {
         .filter(|n| !n.is_empty())
         .collect();
     assert!(names.contains(&"create_project_setup"));
-    assert_eq!(names.len(), 6);
+    assert_eq!(names.len(), 7);
     let commands = read_source("/src/commands.rs");
     assert!(commands.contains("publisher_app::create_project_setup"));
     assert!(commands.contains("pub struct CreateProjectSetupOutcomeDto"));
@@ -834,6 +836,49 @@ fn create_project_setup_is_registered_and_a_pure_adapter() {
         assert!(
             !body.contains(forbidden),
             "create_project_setup must not contain {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn validate_project_configuration_is_registered_and_a_pure_adapter() {
+    // Phase 7-D: the command is a thin adapter over the publisher-app
+    // configuration validation — never a publish/dry-run/recover/create path,
+    // never a provider or credential surface.
+    let main = read_source("/src/main.rs");
+    let handler = main
+        .split("generate_handler![")
+        .nth(1)
+        .unwrap()
+        .split(']')
+        .next()
+        .unwrap();
+    assert!(handler.contains("validate_project_configuration"));
+    let commands = read_source("/src/commands.rs");
+    assert!(commands.contains("publisher_app::validate_project_configuration"));
+    assert!(commands.contains("pub struct ValidateConfigurationOutcomeDto"));
+    let body = commands
+        .split("pub fn validate_project_configuration")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "publish_project(",
+        "dry_run_project(",
+        "recover_project(",
+        "create_project_setup(",
+        "CredentialStore",
+        "std::env",
+        ".publish(",
+        ".put(",
+        ".commit(",
+        ".delete(",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "validate_project_configuration must not contain {forbidden}"
         );
     }
 }
@@ -1186,5 +1231,145 @@ fn wizard_stays_framework_free_like_the_rest_of_the_ui() {
     assert!(
         !html.contains("cdn") && !html.contains("https://"),
         "no external frontend asset may be loaded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7-D — Configuration validation UI
+// ---------------------------------------------------------------------------
+
+#[test]
+fn configuration_check_button_and_result_area_exist() {
+    let html = read_source("/ui/index.html");
+    for id in [
+        "id=\"config-validate-button\"",
+        "id=\"configuration-result\"",
+        "id=\"configuration-result-title\"",
+        "id=\"config-status\"",
+        "id=\"config-issues\"",
+    ] {
+        assert!(html.contains(id), "index.html must contain {id}");
+    }
+    let script = read_source("/ui/app.js");
+    assert!(
+        script.contains(
+            "el(\"config-validate-button\").addEventListener(\"click\", onValidateConfiguration)"
+        ),
+        "the button must be wired to the configuration check handler"
+    );
+}
+
+#[test]
+fn configuration_check_invokes_only_validate_project_configuration() {
+    let script = read_source("/ui/app.js");
+    let handler = script
+        .split("async function onValidateConfiguration()")
+        .nth(1)
+        .expect("onValidateConfiguration must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // Exactly one backend call: the new command, by name.
+    assert!(handler.contains("tauri.invoke(\"validate_project_configuration\""));
+    for forbidden in [
+        "invoke(\"validate_project\"",
+        "publish_project",
+        "dry_run_project",
+        "recover_project",
+        "create_project_setup",
+    ] {
+        assert!(
+            !handler.contains(forbidden),
+            "configuration check must never invoke {forbidden}"
+        );
+    }
+    // It never mutates the publication workflow state — it is a diagnosis,
+    // not a step of the publish gate.
+    for forbidden in [
+        "state.validated",
+        "state.dryRunReady",
+        "state.needsRecovery",
+        "state.projectPath",
+    ] {
+        assert!(
+            !handler.contains(forbidden),
+            "configuration check must not mutate {forbidden}"
+        );
+    }
+    // Same generation/stale discipline as every other async handler.
+    assert!(handler.contains("beginOperation()"));
+    let await_pos = handler.find("await tauri.invoke").unwrap();
+    let guard_pos = handler.find("isCurrentOperation(").unwrap();
+    assert!(
+        await_pos < guard_pos,
+        "the generation check must follow the await"
+    );
+    // Stale branches are pure returns: no busy-state mutation.
+    let staleness = "if (currentPath() !== projectPath) {\n      return;\n    }";
+    assert!(
+        handler.contains(staleness),
+        "stale configuration results must be ignored"
+    );
+    let stale_block = handler[handler.find("isCurrentOperation(").unwrap()..]
+        .split("return;")
+        .next()
+        .unwrap();
+    assert!(
+        !stale_block.contains("setBusy"),
+        "stale configuration results never touch the busy state"
+    );
+}
+
+#[test]
+fn configuration_check_renders_issues_safely() {
+    let script = read_source("/ui/app.js");
+    let show = script
+        .split("function showConfiguration(")
+        .nth(1)
+        .expect("showConfiguration must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // Both outcomes are presented distinctly (valid / requires fixes).
+    assert!(show.contains("coerente para publicação"));
+    assert!(show.contains("requer correções"));
+    // Issues are rendered from the backend payload as plain text — never as
+    // HTML (the payload contains user-editable configuration strings).
+    assert!(show.contains("outcome.issues"));
+    assert!(show.contains("issue.field"));
+    assert!(show.contains("issue.message"));
+    assert!(show.contains("textContent"));
+    assert!(show.contains("document.createElement(\"li\")"));
+    assert!(show.contains("appendChild"));
+    assert!(
+        !show.contains("innerHTML"),
+        "issue rendering must never use innerHTML"
+    );
+}
+
+#[test]
+fn configuration_check_result_is_forgotten_on_path_change_or_mode_switch() {
+    let script = read_source("/ui/app.js");
+    let path_handler = script
+        .split("function onProjectPathChanged()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(
+        path_handler.contains("hide(\"configuration-result\")"),
+        "a path change must discard the configuration diagnosis"
+    );
+    let mode = script
+        .split("function setCreateMode(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(
+        mode.contains("el(\"configuration-result\")"),
+        "the wizard mode must hide the configuration diagnosis"
     );
 }

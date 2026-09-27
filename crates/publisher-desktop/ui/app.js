@@ -68,6 +68,7 @@ function canRecover() {
 
 function refreshButtons() {
   el("validate-button").disabled = state.busy;
+  el("config-validate-button").disabled = state.busy;
   el("dry-run-button").disabled = state.busy || !state.validated;
   el("publish-button").disabled = !canPublish();
   el("recover-button").disabled = !canRecover();
@@ -146,6 +147,78 @@ function showValidationError(error) {
   el("project-name").textContent = "";
   el("project-id").textContent = "";
   el("project-kind").textContent = "";
+}
+
+// ---------------------------------------------------------------------------
+// Configuration validation (Phase 7-D)
+//
+// Diagnóstico puro da configuração declarada: apresenta os issues que o
+// backend reporta e NADA mais. Não altera a máquina de estados da
+// publicação (validated/dryRunReady/needsRecovery/projectPath ficam
+// intactos) e nunca chama publish/dry-run/recover/create.
+// ---------------------------------------------------------------------------
+
+function showConfiguration(outcome) {
+  el("configuration-result").hidden = false;
+  el("configuration-result-title").textContent = "Configuração";
+  const list = el("config-issues");
+  // Limpa via textContent: nenhum HTML é gerado a partir de dados externos.
+  list.textContent = "";
+  if (outcome.valid) {
+    el("config-status").textContent = "✓ Configuração coerente para publicação.";
+    return;
+  }
+  el("config-status").textContent = "⚠ A configuração requer correções.";
+  for (const issue of outcome.issues) {
+    const item = document.createElement("li");
+    item.textContent = `${issue.field}: ${issue.message}`;
+    list.appendChild(item);
+  }
+}
+
+function showConfigurationError(error) {
+  el("configuration-result").hidden = false;
+  el("configuration-result-title").textContent = "Configuração";
+  el("config-status").textContent =
+    error && error.message ? error.message : "Erro desconhecido.";
+  el("config-issues").textContent = "";
+}
+
+async function onValidateConfiguration() {
+  if (state.busy) return;
+  const projectPath = currentPath();
+  const generation = beginOperation();
+  hide("configuration-result");
+  setBusy(true, "A validar configuração…");
+  try {
+    const outcome = await tauri.invoke("validate_project_configuration", {
+      projectPath,
+    });
+    // Mesma disciplina de stale/ABA dos outros handlers: uma resposta
+    // antiga não toca o estado atual.
+    if (currentPath() !== projectPath) {
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
+      return;
+    }
+    showConfiguration(outcome);
+    setBusy(
+      false,
+      outcome.valid
+        ? "Configuração válida."
+        : "Configuração requer correções."
+    );
+  } catch (error) {
+    if (currentPath() !== projectPath) {
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
+      return;
+    }
+    showConfigurationError(error);
+    setBusy(false, "Erro na validação da configuração.");
+  }
 }
 
 function showDryRun(outcome) {
@@ -523,6 +596,7 @@ function onProjectPathChanged() {
   el("dry-run-button").disabled = true;
   el("publish-button").disabled = true;
   hide("project-result");
+  hide("configuration-result");
   hide("dry-run-result");
   hide("publish-result");
   // The superseded operation is no longer current: the UI frees its busy
@@ -665,6 +739,7 @@ function setCreateMode(active) {
   document.querySelector("nav.pipeline").hidden = active;
   document.querySelector('[aria-labelledby="project-section-title"]').hidden = active;
   el("project-result").hidden = active;
+  el("configuration-result").hidden = active;
   el("dry-run-result").hidden = active;
   el("publish-result").hidden = active;
   el("recover-section").hidden = active;
@@ -677,6 +752,7 @@ function setCreateMode(active) {
 
 async function main() {
   el("validate-button").addEventListener("click", onValidate);
+  el("config-validate-button").addEventListener("click", onValidateConfiguration);
   el("dry-run-button").addEventListener("click", onDryRun);
   el("publish-button").addEventListener("click", onPublish);
   el("recover-button").addEventListener("click", onRecover);

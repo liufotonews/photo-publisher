@@ -357,6 +357,54 @@ pub fn create_project_setup(
     })
 }
 
+/// One diagnosed configuration issue, ready for presentation. The code is
+/// the stable machine identifier; the message is presentation text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigurationIssueDto {
+    pub code: String,
+    pub field: String,
+    pub message: String,
+}
+
+/// Outcome of the configuration validation (Phase 7-D): a deterministic,
+/// secret-free diagnosis of the declared configuration. Reports only —
+/// never publishes, never recovers, never creates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ValidateConfigurationOutcomeDto {
+    pub valid: bool,
+    pub schema_version: u8,
+    pub project_id: String,
+    pub project_name: String,
+    pub issues: Vec<ConfigurationIssueDto>,
+}
+
+/// Diagnoses the declared configuration of a `project.json`.
+///
+/// Pure adapter: all level-2 rules live in `publisher-app`. This command
+/// holds no provider, credential, or network reach — it cannot read a
+/// secret or call a remote API by construction.
+pub fn validate_project_configuration(
+    project_path: &str,
+) -> Result<ValidateConfigurationOutcomeDto, CommandError> {
+    let path = check_path(project_path)?;
+    let outcome = publisher_app::validate_project_configuration(&path)?;
+    Ok(ValidateConfigurationOutcomeDto {
+        valid: outcome.valid,
+        schema_version: outcome.schema_version,
+        project_id: outcome.project_id,
+        project_name: outcome.project_name,
+        issues: outcome
+            .issues
+            .iter()
+            .map(|issue| ConfigurationIssueDto {
+                code: issue.code.as_str().to_owned(),
+                field: issue.field.clone(),
+                message: issue.message.clone(),
+            })
+            .collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,5 +708,113 @@ mod tests {
         assert!(!error
             .message
             .contains(target.display().to_string().as_str()));
+    }
+
+    /// A schema-valid, fully coherent v2 document for the 7-D command tests.
+    fn write_coherent_v2_project(root: &Path) -> std::path::PathBuf {
+        // Configuration validation reads only the document — no source
+        // directory, credentials, or network are needed.
+        let path = root.join("project.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "project": {"id": "joao-maria-2026", "name": "João & Maria"},
+                "gallery": {"template": "editorial-v1", "title": "João & Maria", "bundlePath": "gallery-app"},
+                "source": {"type": "folder", "path": "fotos"},
+                "repository": {"provider": "github", "repository": "fotografo/joao-maria-2026", "branch": "main"},
+                "hosting": {"provider": "vercel", "project": "joao-maria-2026", "teamId": "team_example"},
+                "storage": {
+                    "preview": {"provider": "github", "prefix": "previews", "publicBaseUrl": "https://cdn.example.com/previews"},
+                    "highResolution": {"provider": "r2", "accountId": "account-example", "bucket": "fotografia", "prefix": "originals", "publicBaseUrl": "https://downloads.example.com/originals"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn validate_project_configuration_reports_a_coherent_v2_project() {
+        let root = tempdir().unwrap();
+        let path = write_coherent_v2_project(root.path());
+        let outcome = validate_project_configuration(path.to_str().unwrap()).unwrap();
+        assert!(outcome.valid);
+        assert!(outcome.issues.is_empty());
+        assert_eq!(outcome.schema_version, 2);
+        assert_eq!(outcome.project_id, "joao-maria-2026");
+        assert_eq!(outcome.project_name, "João & Maria");
+    }
+
+    #[test]
+    fn validate_project_configuration_keeps_v1_local_projects_valid() {
+        // The existing v1 fixture style declares inert provider names; v1 is
+        // local-only, so no matrix rule may fire on it here either.
+        let root = tempdir().unwrap();
+        let path = write_project(root.path());
+        let outcome = validate_project_configuration(path.to_str().unwrap()).unwrap();
+        assert!(outcome.valid, "issues: {:?}", outcome.issues);
+        assert_eq!(outcome.schema_version, 1);
+    }
+
+    #[test]
+    fn validate_project_configuration_diagnoses_an_unknown_provider() {
+        let root = tempdir().unwrap();
+        let path = write_coherent_v2_project(root.path());
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        document["repository"]["provider"] = serde_json::Value::String("gitlab".to_owned());
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let outcome = validate_project_configuration(path.to_str().unwrap()).unwrap();
+        assert!(!outcome.valid);
+        assert_eq!(outcome.issues.len(), 1);
+        assert_eq!(outcome.issues[0].code, "unsupported_configuration");
+        assert_eq!(outcome.issues[0].field, "repository.provider");
+    }
+
+    #[test]
+    fn validate_project_configuration_is_deterministic_and_secret_free() {
+        let root = tempdir().unwrap();
+        let path = write_coherent_v2_project(root.path());
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        document["storage"]["highResolution"]["bucket"] = serde_json::Value::String(String::new());
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let first = validate_project_configuration(path.to_str().unwrap()).unwrap();
+        let second = validate_project_configuration(path.to_str().unwrap()).unwrap();
+        assert_eq!(first, second);
+        assert!(!first.valid);
+        assert_eq!(
+            first.issues[0].code,
+            "invalid_high_resolution_storage_configuration"
+        );
+        let json = serde_json::to_string(&first).unwrap().to_lowercase();
+        for needle in ["photo_publisher_", "token", "secret", "password"] {
+            assert!(!json.contains(needle), "DTO leaked {needle}");
+        }
+    }
+
+    #[test]
+    fn validate_project_configuration_keeps_level_1_classifications() {
+        // Empty path.
+        let error = validate_project_configuration("   ").unwrap_err();
+        assert_eq!(error.kind, "project_invalid");
+        // Missing file.
+        let root = tempdir().unwrap();
+        let missing = root.path().join("project.json");
+        let error = validate_project_configuration(missing.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.kind, "resource_missing");
+        // Schema-invalid document (source.type outside the enum): level 1
+        // stays an error, never a level-2 issue list.
+        let invalid = root.path().join("invalid.json");
+        let mut document: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(write_coherent_v2_project(root.path())).unwrap(),
+        )
+        .unwrap();
+        document["source"]["type"] = serde_json::Value::String("s3".to_owned());
+        std::fs::write(&invalid, serde_json::to_vec(&document).unwrap()).unwrap();
+        let error = validate_project_configuration(invalid.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.kind, "project_invalid");
     }
 }

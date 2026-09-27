@@ -261,6 +261,24 @@ button.primary:not(:disabled) {
   color: var(--success);
 }
 
+/* Diagnóstico de configuração (Phase 7-D). */
+.issue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.issue-list li {
+  font-size: 13px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--attention);
+  border-radius: 4px;
+  background: #fafbfc;
+}
+
 /* Wizard para criar projeto (Phase 7-C). */
 .tabs {
   display: flex;

@@ -58,12 +58,16 @@
         </label>
         <div class="actions">
           <button id="validate-button" type="button" class="primary">Validar projeto</button>
+          <button id="config-validate-button" type="button" class="secondary">
+            Validar configuração
+          </button>
           <button id="dry-run-button" type="button" disabled>Executar Dry Run</button>
           <button id="publish-button" type="button" disabled>Publicar</button>
         </div>
         <p class="hint">
           O Publicar só fica disponível depois de validar o projeto e executar
-          um Dry Run com sucesso.
+          um Dry Run com sucesso. Validar configuração é um diagnóstico da
+          configuração declarada — não altera o fluxo de publicação.
         </p>
       </section>
 
@@ -75,6 +79,12 @@
           <div><dt>ID</dt><dd id="project-id"></dd></div>
           <div><dt>Tipo</dt><dd id="project-kind"></dd></div>
         </dl>
+      </section>
+
+      <section id="configuration-result" class="card result" hidden aria-live="polite">
+        <h2 id="configuration-result-title">Configuração</h2>
+        <p id="config-status" class="status"></p>
+        <ul id="config-issues" class="issue-list"></ul>
       </section>
 
       <section id="dry-run-result" class="card result" hidden aria-live="polite">

@@ -6,6 +6,7 @@
 //! provider. Publication planning, execution, recovery, and integrity rules
 //! stay in `publisher-core`, `publisher-pipeline`, and `publisher-integration`.
 
+pub mod config_validation;
 pub mod errors;
 pub mod events;
 pub mod outcome;
@@ -15,6 +16,10 @@ pub mod setup;
 pub mod setup_service;
 pub mod use_cases;
 
+pub use config_validation::{
+    validate_project_configuration, validate_setup, ConfigurationIssue, ConfigurationIssueCode,
+    ConfigurationValidationOutcome,
+};
 pub use errors::{ApplicationError, ApplicationErrorKind};
 pub use events::{ApplicationEvent, WorkflowStep};
 pub use outcome::PublicationOutcome;
