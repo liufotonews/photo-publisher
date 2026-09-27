@@ -14,8 +14,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use publisher_desktop::commands::{
-    AppInfo, CommandError, CreateProjectSetupOutcomeDto, DryRunOutcomeDto, PublishOutcomeDto,
-    RecoverOutcomeDto, ValidateConfigurationOutcomeDto, ValidateProjectOutcome,
+    AppInfo, CommandError, CreateProjectSetupOutcomeDto, CredentialStatusDto, DryRunOutcomeDto,
+    PublishOutcomeDto, RecoverOutcomeDto, ValidateConfigurationOutcomeDto, ValidateProjectOutcome,
 };
 use tauri::Emitter;
 
@@ -115,6 +115,27 @@ fn validate_project_configuration(
     publisher_desktop::commands::validate_project_configuration(&project_path)
 }
 
+/// Lists the configured bit of every supported credential (Phase 7-E).
+/// Synchronous and local: the allowlist and the backend call are the whole
+/// operation; values never leave the credential store.
+#[tauri::command]
+fn get_credential_status() -> Result<Vec<CredentialStatusDto>, CommandError> {
+    publisher_desktop::commands::get_credential_status()
+}
+
+/// Stores one credential (Phase 7-E). The value crosses the bridge for this
+/// call only and is never surfaced in results, errors, events, or logs.
+#[tauri::command]
+fn set_credential(name: String, value: String) -> Result<(), CommandError> {
+    publisher_desktop::commands::set_credential(&name, value)
+}
+
+/// Removes one credential (Phase 7-E).
+#[tauri::command]
+fn delete_credential(name: String) -> Result<(), CommandError> {
+    publisher_desktop::commands::delete_credential(&name)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(DesktopState)
@@ -125,7 +146,10 @@ fn main() {
             dry_run_project,
             recover_project,
             create_project_setup,
-            validate_project_configuration
+            validate_project_configuration,
+            get_credential_status,
+            set_credential,
+            delete_credential
         ])
         .run(tauri::generate_context!("tauri.conf.json"))
         .expect("error while running the Photo Publisher desktop application");

@@ -405,6 +405,49 @@ pub fn validate_project_configuration(
     })
 }
 
+/// Public state of one credential: a stable name, a safe label, and the
+/// configured bit. The value never appears in this surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CredentialStatusDto {
+    pub name: String,
+    pub label: String,
+    pub configured: bool,
+}
+
+/// Lists the configured bit of every supported credential (Phase 7-E).
+/// Reads one bit per credential from the composition-root backend and
+/// nothing else — the values are never returned.
+pub fn get_credential_status() -> Result<Vec<CredentialStatusDto>, CommandError> {
+    let store = crate::composition::credential_store();
+    let statuses = publisher_app::credential_status(&store)?;
+    Ok(statuses
+        .iter()
+        .map(|status| CredentialStatusDto {
+            name: status.name.to_owned(),
+            label: status.label.to_owned(),
+            configured: status.configured,
+        })
+        .collect())
+}
+
+/// Stores one credential (Phase 7-E). The value is passed to the backend
+/// for the duration of the operation only: it is never copied into a DTO,
+/// an error, an event, a log, or any state of this layer. The name is
+/// validated against the application allowlist by `publisher-app` itself.
+pub fn set_credential(name: &str, value: String) -> Result<(), CommandError> {
+    let mut store = crate::composition::credential_store();
+    publisher_app::set_credential(&mut store, name, value.as_bytes())?;
+    Ok(())
+}
+
+/// Removes one credential (Phase 7-E). Only the allowlisted name crosses
+/// the boundary; there is nothing secret left to report afterwards.
+pub fn delete_credential(name: &str) -> Result<(), CommandError> {
+    let mut store = crate::composition::credential_store();
+    publisher_app::delete_credential(&mut store, name)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +859,89 @@ mod tests {
         std::fs::write(&invalid, serde_json::to_vec(&document).unwrap()).unwrap();
         let error = validate_project_configuration(invalid.to_str().unwrap()).unwrap_err();
         assert_eq!(error.kind, "project_invalid");
+    }
+
+    // --- Credential UX (Phase 7-E) -----------------------------------------
+    //
+    // These tests mutate the process environment through the composition
+    // backend; they serialize on the crate-wide ENV_LOCK and always restore
+    // the absent state afterwards (publication tests in this same binary
+    // depend on missing credentials).
+
+    fn clear_all_credentials() {
+        for name in publisher_app::SUPPORTED_CREDENTIALS {
+            let mut store = crate::composition::credential_store();
+            publisher_app::delete_credential(&mut store, name).unwrap();
+        }
+    }
+
+    #[test]
+    fn credential_status_reports_only_the_allowlisted_names_and_bits() {
+        let _guard = crate::composition::ENV_LOCK.lock().unwrap();
+        clear_all_credentials();
+        let statuses = get_credential_status().unwrap();
+        assert_eq!(statuses.len(), 4);
+        assert!(statuses.iter().all(|entry| !entry.configured));
+        assert!(statuses.iter().all(|entry| !entry.label.is_empty()));
+        assert_eq!(
+            statuses
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            publisher_app::SUPPORTED_CREDENTIALS
+        );
+        clear_all_credentials();
+    }
+
+    #[test]
+    fn set_status_and_delete_roundtrip_never_exposes_the_secret() {
+        let _guard = crate::composition::ENV_LOCK.lock().unwrap();
+        clear_all_credentials();
+        let sentinel = "TEST_SECRET_SHOULD_NEVER_ESCAPE";
+        set_credential("vercel.token", sentinel.to_owned()).unwrap();
+        let statuses = get_credential_status().unwrap();
+        assert!(
+            statuses
+                .iter()
+                .find(|s| s.name == "vercel.token")
+                .unwrap()
+                .configured
+        );
+        let json = serde_json::to_string(&statuses).unwrap();
+        assert!(!json.contains(sentinel), "status DTO leaked the secret");
+        assert!(json.contains("vercel.token"), "names are public, safe data");
+
+        let error = set_credential("foo.secret", sentinel.to_owned()).unwrap_err();
+        assert_eq!(error.kind, "validation");
+        assert!(!error.message.contains(sentinel));
+
+        delete_credential("vercel.token").unwrap();
+        let statuses = get_credential_status().unwrap();
+        assert!(
+            !statuses
+                .iter()
+                .find(|s| s.name == "vercel.token")
+                .unwrap()
+                .configured
+        );
+        clear_all_credentials();
+    }
+
+    #[test]
+    fn credential_commands_reject_unknown_names_and_blank_secrets() {
+        let _guard = crate::composition::ENV_LOCK.lock().unwrap();
+        clear_all_credentials();
+        let error = set_credential("other.token", "x".to_owned()).unwrap_err();
+        assert_eq!(error.kind, "validation");
+        let error = delete_credential("other.token").unwrap_err();
+        assert_eq!(error.kind, "validation");
+        let error = set_credential("github.token", "   ".to_owned()).unwrap_err();
+        assert_eq!(error.kind, "validation");
+        // Nothing was stored as a side effect of the rejected operations.
+        assert!(get_credential_status()
+            .unwrap()
+            .iter()
+            .all(|entry| !entry.configured));
+        clear_all_credentials();
     }
 }

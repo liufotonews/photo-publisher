@@ -32,13 +32,17 @@ use publisher_app::{ApplicationError, ApplicationErrorKind, PublicationProviders
 
 /// Reads provider credentials from process environment variables.
 ///
-/// Read-only: `set`/`delete` are unsupported so this store can never mutate
-/// secrets. Nothing is persisted, logged, or embedded in outputs.
+/// The store is environment-backed and session-scoped: `set`/`delete`
+/// (Phase 7-E) update the current process environment so the credential UX
+/// can manage the same backend that publication already reads. Nothing is
+/// persisted to disk, written to `project.json`, logged, or embedded in
+/// results or errors. Names outside the known set are unsupported.
 ///
 /// NOTE — duplication with the CLI composition root: this type mirrors
-/// `publisher-cli`'s `EnvCredentialStore` exactly. Extracting it into a
-/// shared crate is a future refactor (see the phase report); keeping the
-/// duplication here is intentional and small.
+/// `publisher-cli`'s `EnvCredentialStore` exactly, except that the CLI store
+/// rejects `set`/`delete` (the CLI has no credential UX). Extracting the
+/// shared read side is a future refactor; keeping the duplication here is
+/// intentional and small.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EnvironmentCredentialStore;
 
@@ -67,14 +71,38 @@ impl CredentialStore for EnvironmentCredentialStore {
         }
     }
 
-    fn set(&mut self, _name: &str, _secret: &[u8]) -> ProviderResult<()> {
-        Err(ProviderError::Unsupported)
+    fn set(&mut self, name: &str, secret: &[u8]) -> ProviderResult<()> {
+        let Some(key) = Self::env_key(name) else {
+            return Err(ProviderError::Unsupported);
+        };
+        // Environment variables are strings: a non-UTF-8 secret cannot be
+        // represented by this backend and is rejected without leaking it.
+        let value = std::str::from_utf8(secret).map_err(|_| ProviderError::Other)?;
+        std::env::set_var(key, value);
+        Ok(())
     }
 
-    fn delete(&mut self, _name: &str) -> ProviderResult<()> {
-        Err(ProviderError::Unsupported)
+    fn delete(&mut self, name: &str) -> ProviderResult<()> {
+        let Some(key) = Self::env_key(name) else {
+            return Err(ProviderError::Unsupported);
+        };
+        std::env::remove_var(key);
+        Ok(())
     }
 }
+
+/// The credential backend of the desktop shell: the existing
+/// environment-backed store, returned ready for the application layer.
+/// Command code never names the concrete store itself.
+pub fn credential_store() -> EnvironmentCredentialStore {
+    EnvironmentCredentialStore
+}
+
+/// Serializes tests that mutate process environment variables (shared by
+/// every test module in this crate; environment changes race within a
+/// single test process).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Enforces the provider matrix supported by this phase, using only the raw
 /// validated project document. Unknown providers are rejected before any
@@ -359,8 +387,9 @@ mod tests {
     use publisher_app::ApplicationErrorKind;
     use tempfile::tempdir;
 
-    /// Serializes tests that mutate process environment variables.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serializes tests that mutate process environment variables (shared
+    /// across this crate's test modules via the crate-level `ENV_LOCK`).
+    use super::ENV_LOCK;
 
     const VALID_PROJECT: &str = r#"{
         "schemaVersion": 2,

@@ -20,6 +20,7 @@
       <nav class="tabs" aria-label="Modo">
         <button type="button" id="tab-publish" class="tab active">Publicar</button>
         <button type="button" id="tab-create" class="tab">Novo projeto</button>
+        <button type="button" id="tab-credentials" class="tab">Credenciais</button>
       </nav>
 
       <!-- Sequência visual do fluxo: publicação -->
@@ -121,6 +122,66 @@
       <section id="activity" class="card" aria-labelledby="activity-title">
         <h2 id="activity-title">Atividade</h2>
         <ul id="activity-list" class="activity-list" aria-live="polite"></ul>
+      </section>
+
+      <!-- Credenciais (Phase 7-E): gerir o estado (configurada ou não) sem
+           nunca apresentar os valores. Os nomes viajam em data attributes;
+           os valores nunca tocam o DOM além do próprio campo. -->
+      <section id="credentials-section" class="card" hidden aria-labelledby="credentials-title">
+        <h2 id="credentials-title">Credenciais</h2>
+        <p class="hint">
+          As credenciais ficam no ambiente local da aplicação e nunca são
+          apresentadas. Configurar credenciais não publica nada.
+        </p>
+        <p id="credential-note" class="hint" aria-live="polite"></p>
+
+        <div class="credential-row">
+          <div class="credential-info">
+            <span class="credential-label">GitHub — Token</span>
+            <span class="credential-state">○ Não configurada</span>
+          </div>
+          <input class="credential-value" data-credential-name="github.token" type="password" autocomplete="off" spellcheck="false" />
+          <div class="actions">
+            <button type="button" class="secondary" data-credential-action="save">Guardar</button>
+            <button type="button" class="secondary" data-credential-action="remove">Remover</button>
+          </div>
+        </div>
+
+        <div class="credential-row">
+          <div class="credential-info">
+            <span class="credential-label">Cloudflare R2 — Access Key</span>
+            <span class="credential-state">○ Não configurada</span>
+          </div>
+          <input class="credential-value" data-credential-name="r2.access_key_id" type="password" autocomplete="off" spellcheck="false" />
+          <div class="actions">
+            <button type="button" class="secondary" data-credential-action="save">Guardar</button>
+            <button type="button" class="secondary" data-credential-action="remove">Remover</button>
+          </div>
+        </div>
+
+        <div class="credential-row">
+          <div class="credential-info">
+            <span class="credential-label">Cloudflare R2 — Secret Key</span>
+            <span class="credential-state">○ Não configurada</span>
+          </div>
+          <input class="credential-value" data-credential-name="r2.secret_access_key" type="password" autocomplete="off" spellcheck="false" />
+          <div class="actions">
+            <button type="button" class="secondary" data-credential-action="save">Guardar</button>
+            <button type="button" class="secondary" data-credential-action="remove">Remover</button>
+          </div>
+        </div>
+
+        <div class="credential-row">
+          <div class="credential-info">
+            <span class="credential-label">Vercel — Token</span>
+            <span class="credential-state">○ Não configurada</span>
+          </div>
+          <input class="credential-value" data-credential-name="vercel.token" type="password" autocomplete="off" spellcheck="false" />
+          <div class="actions">
+            <button type="button" class="secondary" data-credential-action="save">Guardar</button>
+            <button type="button" class="secondary" data-credential-action="remove">Remover</button>
+          </div>
+        </div>
       </section>
 
       <!-- Wizard para criar um novo project.json (sem publicar nada). -->

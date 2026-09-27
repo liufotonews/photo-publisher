@@ -279,6 +279,51 @@ button.primary:not(:disabled) {
   background: #fafbfc;
 }
 
+/* Credenciais (Phase 7-E): estado visível, valores nunca exibidos. */
+.credential-row {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 10px;
+  background: #fafbfc;
+  display: grid;
+  gap: 8px;
+}
+
+.credential-info {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.credential-label {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.credential-state {
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.credential-row input {
+  padding: 10px 12px;
+  font-size: 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.credential-row input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.credential-row .actions {
+  margin-top: 0;
+}
+
 /* Wizard para criar projeto (Phase 7-C). */
 .tabs {
   display: flex;

@@ -606,6 +606,138 @@ function onProjectPathChanged() {
 }
 
 // ---------------------------------------------------------------------------
+// Credential UX (Phase 7-E)
+//
+// As credenciais são geridas apenas pelos três commands dedicados. O valor
+// é lido do campo no momento do clique, enviado uma única vez ao backend e
+// limpo de imediato — nunca fica em estado, nunca é escrito no DOM, nunca é
+// copiado para a área de transferência, nunca é persistido na página. O
+// estado do fluxo de publicação (validated/dryRunReady/busy/generation)
+// não é tocado por este bloco.
+// ---------------------------------------------------------------------------
+
+const credentialsState = {
+  busy: false,
+  generation: 0,
+};
+
+function credentialRows() {
+  return Array.from(
+    document.querySelectorAll("#credentials-section .credential-value")
+  );
+}
+
+function showCredentialNote(message) {
+  el("credential-note").textContent = message;
+}
+
+function markCredentialRow(row, configured) {
+  row.querySelector(".credential-state").textContent = configured
+    ? "● Configurada"
+    : "○ Não configurada";
+}
+
+function renderCredentialStatus(statuses) {
+  const byName = new Map(statuses.map((entry) => [entry.name, entry]));
+  for (const input of credentialRows()) {
+    const entry = byName.get(input.dataset.credentialName);
+    markCredentialRow(input.closest(".credential-row"), Boolean(entry && entry.configured));
+  }
+}
+
+async function refreshCredentialStatus() {
+  if (!tauri) return;
+  const generation = (credentialsState.generation += 1);
+  try {
+    const statuses = await tauri.invoke("get_credential_status");
+    if (generation !== credentialsState.generation) {
+      return;
+    }
+    renderCredentialStatus(statuses);
+  } catch (error) {
+    if (generation !== credentialsState.generation) {
+      return;
+    }
+    showCredentialNote(error && error.message ? error.message : "Erro desconhecido.");
+  }
+}
+
+async function onCredentialAction(button) {
+  if (credentialsState.busy || !tauri) return;
+  const row = button.closest(".credential-row");
+  const input = row.querySelector(".credential-value");
+  const name = input.dataset.credentialName;
+  const action = button.dataset.credentialAction;
+  const generation = (credentialsState.generation += 1);
+
+  if (action === "remove") {
+    if (!window.confirm("Remover esta credencial?")) {
+      return;
+    }
+    credentialsState.busy = true;
+    try {
+      await tauri.invoke("delete_credential", { name });
+      if (generation !== credentialsState.generation) {
+        return;
+      }
+      markCredentialRow(row, false);
+      showCredentialNote("Credencial removida.");
+    } catch (error) {
+      if (generation !== credentialsState.generation) {
+        return;
+      }
+      showCredentialNote(error && error.message ? error.message : "Erro desconhecido.");
+    } finally {
+      credentialsState.busy = false;
+    }
+    return;
+  }
+
+  const value = input.value;
+  // O valor sai do campo imediatamente: nunca permanece no DOM após o clique.
+  input.value = "";
+  if (value.trim() === "") {
+    showCredentialNote("Indique o valor a guardar.");
+    return;
+  }
+  credentialsState.busy = true;
+  try {
+    await tauri.invoke("set_credential", { name, value });
+    if (generation !== credentialsState.generation) {
+      return;
+    }
+    markCredentialRow(row, true);
+    showCredentialNote("Credencial guardada.");
+  } catch (error) {
+    if (generation !== credentialsState.generation) {
+      return;
+    }
+    showCredentialNote(error && error.message ? error.message : "Erro desconhecido.");
+  } finally {
+    credentialsState.busy = false;
+  }
+}
+
+function setCredentialsMode(active) {
+  el("tab-credentials").classList.toggle("active", active);
+  if (active) {
+    // Reutiliza o modo do wizard para esconder todo o fluxo de publicação…
+    setCreateMode(true);
+    // …mas a secção visível aqui é a de credenciais, não o wizard.
+    el("create-flow").hidden = true;
+    el("tab-create").classList.remove("active");
+    el("credentials-section").hidden = false;
+    // Respostas de operações anteriores ficam obsoletas ao trocar de modo.
+    credentialsState.generation += 1;
+    refreshCredentialStatus();
+  } else {
+    credentialsState.generation += 1;
+    el("credentials-section").hidden = true;
+    setCreateMode(false);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Project setup wizard (Phase 7-C)
 //
 // The wizard only collects data and produces one `project.json` via the
@@ -734,6 +866,9 @@ async function onCreateProject() {
 function setCreateMode(active) {
   el("tab-publish").classList.toggle("active", !active);
   el("tab-create").classList.toggle("active", active);
+  // A secção de credenciais nunca se mistura com os outros dois modos.
+  el("tab-credentials").classList.remove("active");
+  el("credentials-section").hidden = true;
   // Hide every publication-flow piece: pipeline nav, project card, all result
   // cards and the activity log must not leak into the setup screen.
   document.querySelector("nav.pipeline").hidden = active;
@@ -757,8 +892,12 @@ async function main() {
   el("publish-button").addEventListener("click", onPublish);
   el("recover-button").addEventListener("click", onRecover);
   el("project-path").addEventListener("input", onProjectPathChanged);
-  el("tab-publish").addEventListener("click", () => setCreateMode(false));
+  el("tab-publish").addEventListener("click", () => setCredentialsMode(false));
   el("tab-create").addEventListener("click", () => setCreateMode(true));
+  el("tab-credentials").addEventListener("click", () => setCredentialsMode(true));
+  for (const button of document.querySelectorAll("#credentials-section [data-credential-action]")) {
+    button.addEventListener("click", () => onCredentialAction(button));
+  }
   el("create-cancel").addEventListener("click", () => setCreateMode(false));
   el("create-submit").addEventListener("click", onCreateProject);
   // The event listener is installed once, at startup.

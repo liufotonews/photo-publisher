@@ -7,6 +7,7 @@
 //! stay in `publisher-core`, `publisher-pipeline`, and `publisher-integration`.
 
 pub mod config_validation;
+pub mod credentials;
 pub mod errors;
 pub mod events;
 pub mod outcome;
@@ -19,6 +20,9 @@ pub mod use_cases;
 pub use config_validation::{
     validate_project_configuration, validate_setup, ConfigurationIssue, ConfigurationIssueCode,
     ConfigurationValidationOutcome,
+};
+pub use credentials::{
+    credential_status, delete_credential, set_credential, CredentialStatus, SUPPORTED_CREDENTIALS,
 };
 pub use errors::{ApplicationError, ApplicationErrorKind};
 pub use events::{ApplicationEvent, WorkflowStep};

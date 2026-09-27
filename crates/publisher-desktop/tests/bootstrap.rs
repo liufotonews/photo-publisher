@@ -398,7 +398,7 @@ fn command_layer_contains_no_provider_or_network_wiring() {
 }
 
 #[test]
-fn binary_registers_exactly_the_seven_commands_and_the_single_channel() {
+fn binary_registers_exactly_the_ten_commands_and_the_single_channel() {
     // The Tauri binary is the only place that may touch `tauri`; the command
     // set and the event channel feed must remain exactly what this phase
     // specifies. Line endings are normalized (CI checkouts on Windows use
@@ -425,7 +425,10 @@ fn binary_registers_exactly_the_seven_commands_and_the_single_channel() {
             "dry_run_project",
             "recover_project",
             "create_project_setup",
-            "validate_project_configuration"
+            "validate_project_configuration",
+            "get_credential_status",
+            "set_credential",
+            "delete_credential"
         ]
     );
     assert!(source.contains("publisher_desktop::events::PUBLISHER_EVENT_CHANNEL"));
@@ -779,7 +782,10 @@ fn recover_project_is_registered_and_remains_a_pure_adapter() {
             "dry_run_project",
             "recover_project",
             "create_project_setup",
-            "validate_project_configuration"
+            "validate_project_configuration",
+            "get_credential_status",
+            "set_credential",
+            "delete_credential"
         ]
     );
     // The desktop command layer delegates to the application use case.
@@ -820,7 +826,7 @@ fn create_project_setup_is_registered_and_a_pure_adapter() {
         .filter(|n| !n.is_empty())
         .collect();
     assert!(names.contains(&"create_project_setup"));
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), 10);
     let commands = read_source("/src/commands.rs");
     assert!(commands.contains("publisher_app::create_project_setup"));
     assert!(commands.contains("pub struct CreateProjectSetupOutcomeDto"));
@@ -880,6 +886,92 @@ fn validate_project_configuration_is_registered_and_a_pure_adapter() {
             !body.contains(forbidden),
             "validate_project_configuration must not contain {forbidden}"
         );
+    }
+}
+
+#[test]
+fn credential_commands_are_registered_and_pure_adapters() {
+    // Phase 7-E: the three credential commands are registered and delegate
+    // to the publisher-app service over the composition-root backend. The
+    // command layer itself never names the concrete store, never publishes,
+    // never provisions, and never echoes a secret.
+    let main = read_source("/src/main.rs");
+    let handler = main
+        .split("generate_handler![")
+        .nth(1)
+        .unwrap()
+        .split(']')
+        .next()
+        .unwrap();
+    for command in [
+        "get_credential_status",
+        "set_credential",
+        "delete_credential",
+    ] {
+        assert!(
+            handler.contains(command),
+            "generate_handler must register {command}"
+        );
+    }
+    let commands = read_source("/src/commands.rs");
+    assert!(commands.contains("publisher_app::credential_status"));
+    assert!(commands.contains("publisher_app::set_credential"));
+    assert!(commands.contains("publisher_app::delete_credential"));
+    assert!(commands.contains("pub struct CredentialStatusDto"));
+    // The credential-status surface carries exactly: name, label, bit.
+    let dto = commands
+        .split("pub struct CredentialStatusDto")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for field in [
+        "pub name: String",
+        "pub label: String",
+        "pub configured: bool",
+    ] {
+        assert!(dto.contains(field), "CredentialStatusDto needs {field}");
+    }
+    for leakage in ["secret", "value", "bytes", "Vec<u8>"] {
+        assert!(
+            !dto.contains(leakage),
+            "CredentialStatusDto must never carry the credential {leakage}"
+        );
+    }
+    // No credential command may reach publication, provisioning, providers,
+    // or the environment by itself (the store lives in the composition root).
+    for function in [
+        "pub fn get_credential_status",
+        "pub fn set_credential",
+        "pub fn delete_credential",
+    ] {
+        let body = commands
+            .split(function)
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "publish_project(",
+            "dry_run_project(",
+            "recover_project(",
+            "create_project_setup(",
+            "validate_project_configuration(",
+            "EnvironmentCredentialStore",
+            "std::env",
+            ".publish(",
+            ".put(",
+            ".commit(",
+            ".delete(",
+            "reqwest",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{function} must not contain {forbidden}"
+            );
+        }
     }
 }
 
@@ -1372,4 +1464,195 @@ fn configuration_check_result_is_forgotten_on_path_change_or_mode_switch() {
         mode.contains("el(\"configuration-result\")"),
         "the wizard mode must hide the configuration diagnosis"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7-E — Credential UX
+// ---------------------------------------------------------------------------
+
+#[test]
+fn credentials_section_exists_with_secret_safe_inputs() {
+    let html = read_source("/ui/index.html");
+    assert!(html.contains("id=\"tab-credentials\""), "Credenciais tab");
+    assert!(
+        html.contains("id=\"credentials-section\""),
+        "credentials section exists"
+    );
+    assert!(html.contains("id=\"credential-note\""));
+    // Exactly the four supported credential names, carried in markup (never
+    // assembled by the frontend logic).
+    for name in [
+        "data-credential-name=\"github.token\"",
+        "data-credential-name=\"r2.access_key_id\"",
+        "data-credential-name=\"r2.secret_access_key\"",
+        "data-credential-name=\"vercel.token\"",
+    ] {
+        assert_eq!(
+            html.matches(name).count(),
+            1,
+            "exactly one field must carry {name}"
+        );
+    }
+    // Every credential input is a masked field; no reveal control exists.
+    let section = html.split("id=\"credentials-section\"").nth(1).unwrap();
+    let section = section.split("</section>").next().unwrap();
+    assert_eq!(section.matches("type=\"password\"").count(), 4);
+    assert_eq!(
+        section.matches("data-credential-action=\"save\"").count(),
+        4
+    );
+    assert_eq!(
+        section.matches("data-credential-action=\"remove\"").count(),
+        4
+    );
+    let lowered = section.to_lowercase();
+    for forbidden in [
+        "localstorage",
+        "sessionstorage",
+        "clipboard",
+        "type=\"text\" name=",
+        "show-token",
+        "reveal",
+    ] {
+        assert!(
+            !lowered.contains(forbidden),
+            "credentials section must not contain {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn credential_actions_use_only_credential_commands_and_clear_inputs() {
+    let script = read_source("/ui/app.js");
+    let handler = script
+        .split("async function onCredentialAction(")
+        .nth(1)
+        .expect("onCredentialAction must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // Exactly the two mutating commands, never anything else.
+    assert!(handler.contains("invoke(\"set_credential\""));
+    assert!(handler.contains("invoke(\"delete_credential\""));
+    for forbidden in [
+        "publish_project",
+        "dry_run_project",
+        "recover_project",
+        "create_project_setup",
+        "invoke(\"validate_project",
+    ] {
+        assert!(
+            !handler.contains(forbidden),
+            "credential actions must never invoke {forbidden}"
+        );
+    }
+    // The typed value is cleared from the field immediately at click time —
+    // before any await resolves — and never written anywhere else.
+    assert!(handler.contains("input.value = \"\";"));
+    assert!(
+        !handler.contains("textContent = value"),
+        "the value must never be rendered"
+    );
+    assert!(
+        !handler.contains("innerHTML"),
+        "credential UI must never build HTML from values"
+    );
+    let refresh = script
+        .split("async function refreshCredentialStatus(")
+        .nth(1)
+        .expect("refreshCredentialStatus must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(refresh.contains("invoke(\"get_credential_status\""));
+    // Removal requires an explicit confirmation.
+    assert!(handler.contains("window.confirm("));
+    // Status changes are presentation text only (fixed strings written via
+    // textContent in markCredentialRow; render delegates to it).
+    let render = script
+        .split("function renderCredentialStatus(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(render.contains("markCredentialRow("));
+    assert!(!render.contains("innerHTML"));
+    let mark = script
+        .split("function markCredentialRow(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(mark.contains("textContent"));
+    assert!(!mark.contains("innerHTML"));
+    // The rendered marks are fixed strings, never the stored value.
+    assert!(mark.contains("Configurada"));
+    assert!(mark.contains("configurada"));
+}
+
+#[test]
+fn credential_state_is_independent_of_the_publication_flow() {
+    let script = read_source("/ui/app.js");
+    // Independent state container with the same stale-answer discipline.
+    assert!(script.contains("const credentialsState = {"));
+    for chunk_name in [
+        "async function onCredentialAction(",
+        "async function refreshCredentialStatus(",
+        "function setCredentialsMode(",
+    ] {
+        let body = script
+            .split(chunk_name)
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "state.validated",
+            "state.dryRunReady",
+            "state.needsRecovery",
+            "state.projectPath",
+            "operationGeneration",
+            "setBusy(",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{chunk_name} must not touch {forbidden}"
+            );
+        }
+    }
+    // Both async handlers apply a generation guard after each await.
+    for chunk_name in [
+        "async function onCredentialAction(",
+        "async function refreshCredentialStatus(",
+    ] {
+        let body = script
+            .split(chunk_name)
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let await_pos = body.find("await tauri.invoke").unwrap();
+        let guard_pos = body
+            .find("generation !== credentialsState.generation")
+            .unwrap();
+        assert!(
+            await_pos < guard_pos,
+            "{chunk_name}: the generation guard must follow the await"
+        );
+    }
+    // Entering the tab refreshes the status; entering/leaving never leaks
+    // into the publish tab.
+    assert!(script.contains("setCredentialsMode(true)"));
+    let mode = script
+        .split("function setCredentialsMode(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(mode.contains("refreshCredentialStatus()"));
 }
