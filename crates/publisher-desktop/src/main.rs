@@ -14,7 +14,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use publisher_desktop::commands::{
-    AppInfo, CommandError, DryRunOutcomeDto, PublishOutcomeDto, ValidateProjectOutcome,
+    AppInfo, CommandError, DryRunOutcomeDto, PublishOutcomeDto, RecoverOutcomeDto,
+    ValidateProjectOutcome,
 };
 use tauri::Emitter;
 
@@ -86,6 +87,14 @@ fn dry_run_project(
     publisher_desktop::commands::dry_run_project(&project_path, &mut forward_events(&app_handle))
 }
 
+#[tauri::command]
+fn recover_project(
+    app_handle: tauri::AppHandle,
+    project_path: String,
+) -> Result<RecoverOutcomeDto, CommandError> {
+    publisher_desktop::commands::recover_project(&project_path, &mut forward_events(&app_handle))
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(DesktopState)
@@ -93,7 +102,8 @@ fn main() {
             get_app_info,
             validate_project,
             publish_project,
-            dry_run_project
+            dry_run_project,
+            recover_project
         ])
         .run(tauri::generate_context!("tauri.conf.json"))
         .expect("error while running the Photo Publisher desktop application");

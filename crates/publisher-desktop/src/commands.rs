@@ -156,6 +156,17 @@ pub struct DryRunOutcomeDto {
     pub reconciliation_requirements: usize,
 }
 
+/// Recovery outcome for the desktop shell. Only public facts — no internals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoverOutcomeDto {
+    /// The recovery flow was attempted (the use case ran).
+    pub attempted: bool,
+    /// True when the local publication is committed again after recovery.
+    pub recovered: bool,
+    /// Generation currently committed, when a recovered journal exists.
+    pub generation: Option<String>,
+}
+
 /// Publishes the project through the application layer.
 ///
 /// The desktop layer only: (1) reads the validated document, (2) runs the
@@ -275,6 +286,28 @@ pub fn dry_run_project(
         repository_operations: outcome.repository_operations,
         hosting_operations: outcome.hosting_operations,
         reconciliation_requirements: outcome.reconciliation_requirements,
+    })
+}
+
+/// Runs the application-layer publication recovery for the project.
+///
+/// Pure adapter: all journal/ledger semantics stay in `publisher-app`;
+/// this command only validates the input path and converts the outcome.
+pub fn recover_project(
+    project_path: &str,
+    events: &mut EventSink<'_>,
+) -> Result<RecoverOutcomeDto, CommandError> {
+    let path = check_path(project_path)?;
+    let outcome = publisher_app::recover_publication(&path, events)?;
+    let recovered = outcome
+        .state
+        .as_ref()
+        .map(|state| !state.recovery_needed)
+        .unwrap_or(false);
+    Ok(RecoverOutcomeDto {
+        attempted: outcome.attempted,
+        recovered,
+        generation: outcome.state.as_ref().map(|state| state.generation.clone()),
     })
 }
 
@@ -453,6 +486,55 @@ mod tests {
         );
         let json = serde_json::to_string(&dto).unwrap();
         for needle in ["PHOTO_PUBLISHER_", "token", "secret", "password", "C:\\"] {
+            assert!(!json.contains(needle), "DTO leaked {needle}: {json}");
+        }
+    }
+
+    #[test]
+    fn recover_project_delegates_without_touching_state() {
+        // Without a prior publication, recovery completes with "recovered"
+        // equal to false — and the command still uses the existing sink.
+        let root = tempdir().unwrap();
+        let project = write_project(root.path());
+        let mut captured: Vec<publisher_app::ApplicationEvent> = Vec::new();
+        let outcome =
+            recover_project(project.to_str().unwrap(), &mut |event| captured.push(event)).unwrap();
+        assert!(outcome.attempted);
+        assert!(!outcome.recovered);
+        assert_eq!(outcome.generation, None);
+        assert_eq!(
+            captured.first(),
+            Some(&publisher_app::ApplicationEvent::EnteredStep(
+                publisher_app::WorkflowStep::RecoverPublication
+            ))
+        );
+    }
+
+    #[test]
+    fn recover_rejects_empty_paths_deterministically() {
+        let error = recover_project("   ", &mut |_| {}).unwrap_err();
+        assert_eq!(error.kind, "project_invalid");
+        assert_eq!(error.message, "project path is required");
+    }
+
+    #[test]
+    fn recover_outcome_dto_is_deterministic_and_never_carries_secrets() {
+        let outcome = RecoverOutcomeDto {
+            attempted: true,
+            recovered: true,
+            generation: Some("g-000002".to_owned()),
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert_eq!(
+            json,
+            serde_json::to_string(&RecoverOutcomeDto {
+                attempted: true,
+                recovered: true,
+                generation: Some("g-000002".to_owned()),
+            })
+            .unwrap()
+        );
+        for needle in ["PHOTO_PUBLISHER_", "token", "secret", "password"] {
             assert!(!json.contains(needle), "DTO leaked {needle}: {json}");
         }
     }

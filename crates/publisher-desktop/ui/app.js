@@ -16,6 +16,7 @@ const state = {
   validated: false,
   dryRunReady: false,
   busy: false,
+  needsRecovery: false,
 };
 
 // Generation counter against ABA races: a stale path may reappear (A→B→A),
@@ -54,12 +55,28 @@ function canPublish() {
   );
 }
 
+// Recovery is reachable only after a publish result says "needs_recovery"
+// for the path currently displayed and nothing else is running.
+function canRecover() {
+  return (
+    !state.busy &&
+    state.needsRecovery &&
+    state.projectPath !== "" &&
+    currentPath() === state.projectPath
+  );
+}
+
+function refreshButtons() {
+  el("validate-button").disabled = state.busy;
+  el("dry-run-button").disabled = state.busy || !state.validated;
+  el("publish-button").disabled = !canPublish();
+  el("recover-button").disabled = !canRecover();
+}
+
 function setBusy(busy, label) {
   state.busy = busy;
-  el("validate-button").disabled = busy;
-  el("dry-run-button").disabled = busy || !state.validated;
-  el("publish-button").disabled = !canPublish();
   el("global-status").textContent = label;
+  refreshButtons();
 }
 
 function hide(id) {
@@ -132,14 +149,37 @@ const PUBLISH_OUTCOME_MESSAGES = {
 function showPublish(outcome) {
   el("publish-result").hidden = false;
   const message = PUBLISH_OUTCOME_MESSAGES[outcome.outcome];
+  // "needs_recovery" is the only publish outcome that unlocks the explicit
+  // Recovery action; "blocked" and the others do not.
+  state.needsRecovery = outcome.outcome === "needs_recovery";
+  el("recover-section").hidden = !state.needsRecovery;
   el("publish-result-title").textContent = message ? message.title : "Publicação";
   el("publish-status").textContent = message ? message.text : "";
+  refreshButtons();
 }
 
 function showPublishError(error) {
   el("publish-result").hidden = false;
   el("publish-result-title").textContent = "Publicação falhou";
   el("publish-status").textContent =
+    error && error.message ? error.message : "Erro desconhecido.";
+}
+
+function showRecover(outcome) {
+  el("recover-result").hidden = false;
+  if (outcome.recovered) {
+    el("recover-result-title").textContent = "Recuperação concluída";
+    el("recover-status").textContent = "A publicação anterior foi restaurada.";
+  } else {
+    el("recover-result-title").textContent = "Nada a recuperar";
+    el("recover-status").textContent = "Não havia publicação pendente.";
+  }
+}
+
+function showRecoverError(error) {
+  el("recover-result").hidden = false;
+  el("recover-result-title").textContent = "Recuperação falhou";
+  el("recover-status").textContent =
     error && error.message ? error.message : "Erro desconhecido.";
 }
 
@@ -272,6 +312,9 @@ async function onValidate() {
   el("dry-run-button").disabled = true;
   el("publish-button").disabled = true;
   state.projectPath = projectPath;
+  state.needsRecovery = false;
+  hide("recover-result");
+  hide("recover-section");
   setBusy(true, "A validar…");
   try {
     const outcome = await tauri.invoke("validate_project", { projectPath });
@@ -309,6 +352,9 @@ async function onDryRun() {
   const projectPath = state.projectPath;
   if (!projectPath || currentPath() !== projectPath) return;
   const generation = beginOperation();
+  state.needsRecovery = false;
+  hide("recover-result");
+  hide("recover-section");
   hide("dry-run-result");
   hide("publish-result");
   state.dryRunReady = false;
@@ -364,9 +410,8 @@ async function onPublish() {
       return;
     }
     state.dryRunReady = false;
-    el("publish-button").disabled = true;
     showPublish(outcome);
-    setBusy(false, canPublish() ? "Dry Run concluído." : "Publicação concluída.");
+    setBusy(false, "Publicação atualizada.");
   } catch (error) {
     if (currentPath() !== projectPath) {
       return;
@@ -379,12 +424,47 @@ async function onPublish() {
   }
 }
 
+async function onRecover() {
+  if (!canRecover()) return;
+  const projectPath = state.projectPath;
+  const generation = beginOperation();
+  state.needsRecovery = false;
+  state.dryRunReady = false;
+  hide("recover-result");
+  hide("publish-result");
+  hide("dry-run-result");
+  setBusy(true, "A recuperar…");
+  try {
+    const outcome = await tauri.invoke("recover_project", { projectPath });
+    if (currentPath() !== projectPath) {
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
+      return;
+    }
+    showRecover(outcome);
+    setBusy(false, "Recuperação verificada. Valide e execute Dry Run novamente.");
+  } catch (error) {
+    if (currentPath() !== projectPath) {
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
+      return;
+    }
+    showRecoverError(error);
+    setBusy(false, "Falha na recuperação.");
+  }
+}
+
 // Uma alteração ao caminho invalida qualquer validação anterior: a UI deixa
 // de ser "validada", o Dry Run fica desabilitado e os resultados anteriores
 // são removidos. Nada é executado e nada de Rust é chamado.
 function onProjectPathChanged() {
   beginOperation(); // invalidates any in-flight operation's generation too
   state.validated = false;
+  state.needsRecovery = false;
+  hide("recover-result");
+  hide("recover-section");
   state.dryRunReady = false;
   state.projectPath = "";
   el("dry-run-button").disabled = true;
@@ -402,6 +482,7 @@ async function main() {
   el("validate-button").addEventListener("click", onValidate);
   el("dry-run-button").addEventListener("click", onDryRun);
   el("publish-button").addEventListener("click", onPublish);
+  el("recover-button").addEventListener("click", onRecover);
   el("project-path").addEventListener("input", onProjectPathChanged);
   // The event listener is installed once, at startup.
   installPublisherEventListener();

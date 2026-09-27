@@ -422,7 +422,8 @@ fn binary_registers_exactly_the_four_commands_and_the_single_channel() {
             "get_app_info",
             "validate_project",
             "publish_project",
-            "dry_run_project"
+            "dry_run_project",
+            "recover_project"
         ]
     );
     assert!(source.contains("publisher_desktop::events::PUBLISHER_EVENT_CHANNEL"));
@@ -685,6 +686,122 @@ fn exactly_one_event_listener_is_installed() {
     let script = read_source("/ui/app.js");
     let count = script.matches(".listen(\"publisher://event\"").count();
     assert_eq!(count, 1, "exactly one listener registration expected");
+}
+
+#[test]
+fn recover_project_is_registered_and_remains_a_pure_adapter() {
+    // The command set now includes recover_project alongside the four
+    // existing commands, with the same single event channel.
+    let main = read_source("/src/main.rs");
+    let handler = main
+        .split("generate_handler![")
+        .nth(1)
+        .unwrap()
+        .split(']')
+        .next()
+        .unwrap();
+    let names: Vec<&str> = handler
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "get_app_info",
+            "validate_project",
+            "publish_project",
+            "dry_run_project",
+            "recover_project"
+        ]
+    );
+    // The desktop command layer delegates to the application use case.
+    let commands = read_source("/src/commands.rs");
+    assert!(commands.contains("publisher_app::recover_publication"));
+    assert!(commands.contains("pub struct RecoverOutcomeDto"));
+    // It writes nothing itself: recovery never calls a publish/delete verb.
+    let body = commands
+        .split("pub fn recover_project")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for forbidden in [".publish(", ".put(", ".commit(", ".delete("] {
+        assert!(
+            !body.contains(forbidden),
+            "recover_project must not contain {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn needs_recovery_unlocks_recovery_but_blocked_never_does() {
+    let script = read_source("/ui/app.js");
+    let html = read_source("/ui/index.html");
+    assert!(
+        html.contains("recover-button"),
+        "UI exposes the recover action"
+    );
+    assert!(
+        html.contains("recover-section"),
+        "UI exposes the recovery result area"
+    );
+    // canRecover is gated on the explicit publish outcome.
+    assert!(script.contains("canRecover()"));
+    let guard = script
+        .split("function canRecover()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "!state.busy",
+        "state.needsRecovery",
+        "currentPath() === state.projectPath",
+    ] {
+        assert!(
+            guard.contains(required),
+            "canRecover must require {required}"
+        );
+    }
+    // showPublish maps ONLY the "needs_recovery" outcome to the recovery state;
+    // "blocked" (and all others) cannot activate it by accident.
+    let publish_handler = script
+        .split("function showPublish(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(publish_handler.contains("outcome.outcome === \"needs_recovery\""));
+    // After recovery the publish gate stays closed (a new Dry Run must run).
+    let recover_handler = script
+        .split("async function onRecover()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(recover_handler.contains("state.dryRunReady = false"));
+    // The recovery success path never re-enables Publish.
+    assert!(
+        !recover_handler.contains("el(\"publish-button\").disabled = false"),
+        "recovery must not re-enable Publish"
+    );
+    // Stale recovery branches are pure returns (no setBusy) — like every other
+    // stale handler in this generation-based UI.
+    let stale_pos = recover_handler.find("!isCurrentOperation(").unwrap();
+    let stale_block = recover_handler[stale_pos..]
+        .split("return;")
+        .next()
+        .unwrap();
+    assert!(
+        !stale_block.contains("setBusy"),
+        "stale recovery must never touch the busy state"
+    );
+    assert!(recover_handler.contains("tauri.invoke(\"recover_project\""));
 }
 
 #[test]
