@@ -11,6 +11,7 @@ pub mod events;
 pub mod outcome;
 pub mod project;
 pub mod providers;
+pub mod setup;
 pub mod use_cases;
 
 pub use errors::{ApplicationError, ApplicationErrorKind};

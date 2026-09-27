@@ -4129,6 +4129,7 @@ dependencies = [
  "photo-publisher-integration",
  "photo-publisher-pipeline",
  "photo-publisher-provider-contracts",
+ "serde",
  "serde_json",
  "tempfile",
 ]
