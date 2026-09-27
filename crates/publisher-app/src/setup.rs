@@ -161,10 +161,14 @@ impl ProjectSetup {
             }
         }
         std::fs::write(path, document).map_err(|error| {
-            resource_missing(format!(
-                "could not write project.json at {}: {error}",
-                path.display()
-            ))
+            // Filesystem/I/O failure: classified as the existing application
+            // `Internal` category; the public message is generic and never
+            // carries the user-provided path; the cause is preserved.
+            ApplicationError::with_source(
+                ApplicationErrorKind::Internal,
+                "failed to write project configuration",
+                error,
+            )
         })
     }
 }
@@ -343,5 +347,31 @@ mod tests {
         assert_eq!(model.project.id, "joao-maria-2026");
         let again = valid_v2();
         assert_eq!(model, again);
+    }
+
+    #[test]
+    fn write_never_classifies_generic_io_errors_as_resource_missing() {
+        // Deterministic failure: the target project path IS an existing
+        // directory, so any write into it must fail (PermissionDenied on
+        // Windows, EISDIR on Linux).
+        let root = tempdir().unwrap();
+        let target = root.path().join("project.json");
+        std::fs::create_dir(&target).unwrap();
+        let error = valid_v2().write(&target).unwrap_err();
+
+        // 1. Not a ResourceMissing: the destination exists.
+        assert_ne!(error.kind, ApplicationErrorKind::ResourceMissing);
+        assert_eq!(error.kind, ApplicationErrorKind::Internal);
+
+        // 2. The public message never contains the user-provided path.
+        let message = error.to_string();
+        let path_text = target.display().to_string();
+        assert!(
+            !message.contains(path_text.as_str()),
+            "error message must not expose the user path: {message}"
+        );
+
+        // 3. The underlying I/O cause is preserved for diagnostics.
+        assert!(error.source_error().is_some());
     }
 }
