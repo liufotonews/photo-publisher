@@ -398,7 +398,7 @@ fn command_layer_contains_no_provider_or_network_wiring() {
 }
 
 #[test]
-fn binary_registers_exactly_the_four_commands_and_the_single_channel() {
+fn binary_registers_exactly_the_six_commands_and_the_single_channel() {
     // The Tauri binary is the only place that may touch `tauri`; the command
     // set and the event channel feed must remain exactly what this phase
     // specifies. Line endings are normalized (CI checkouts on Windows use
@@ -423,7 +423,8 @@ fn binary_registers_exactly_the_four_commands_and_the_single_channel() {
             "validate_project",
             "publish_project",
             "dry_run_project",
-            "recover_project"
+            "recover_project",
+            "create_project_setup"
         ]
     );
     assert!(source.contains("publisher_desktop::events::PUBLISHER_EVENT_CHANNEL"));
@@ -775,7 +776,8 @@ fn recover_project_is_registered_and_remains_a_pure_adapter() {
             "validate_project",
             "publish_project",
             "dry_run_project",
-            "recover_project"
+            "recover_project",
+            "create_project_setup"
         ]
     );
     // The desktop command layer delegates to the application use case.
@@ -794,6 +796,44 @@ fn recover_project_is_registered_and_remains_a_pure_adapter() {
         assert!(
             !body.contains(forbidden),
             "recover_project must not contain {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn create_project_setup_is_registered_and_a_pure_adapter() {
+    // The command registration includes every existing command plus the new
+    // one; the adapter delegates to publisher-app, never writes directly.
+    let main = read_source("/src/main.rs");
+    let handler = main
+        .split("generate_handler![")
+        .nth(1)
+        .unwrap()
+        .split(']')
+        .next()
+        .unwrap();
+    let names: Vec<&str> = handler
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+    assert!(names.contains(&"create_project_setup"));
+    assert_eq!(names.len(), 6);
+    let commands = read_source("/src/commands.rs");
+    assert!(commands.contains("publisher_app::create_project_setup"));
+    assert!(commands.contains("pub struct CreateProjectSetupOutcomeDto"));
+    // It has no provisioning reach: no provider verbs anywhere in setup.
+    let body = commands
+        .split("pub fn create_project_setup")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for forbidden in [".publish(", ".put(", ".commit(", ".delete(", ".get("] {
+        assert!(
+            !body.contains(forbidden),
+            "create_project_setup must not contain {forbidden}"
         );
     }
 }
@@ -943,4 +983,208 @@ fn aba_protection_uses_operation_generation_in_all_async_workflows() {
             "{handler_name}: stale never touches the busy state"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7-C — Desktop Project Setup Wizard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wizard_entry_point_and_fields_exist_in_the_ui() {
+    let html = read_source("/ui/index.html");
+    // The "Novo projeto" entry point and the wizard container.
+    assert!(
+        html.contains("id=\"tab-create\""),
+        "Novo projeto tab exists"
+    );
+    assert!(html.contains("id=\"tab-publish\""), "Publicar tab exists");
+    assert!(html.contains("id=\"create-flow\""), "wizard section exists");
+    // Required fields per group (Projeto / Galeria / destino).
+    for id in [
+        "wizard-project-id",
+        "wizard-project-name",
+        "wizard-project-client",
+        "wizard-project-date",
+        "wizard-gallery-template",
+        "wizard-gallery-title",
+        "wizard-gallery-description",
+        "wizard-gallery-bundle",
+        "wizard-source-path",
+        "wizard-repository-provider",
+        "wizard-repository-name",
+        "wizard-repository-branch",
+        "wizard-hosting-provider",
+        "wizard-hosting-project",
+        "wizard-hosting-team",
+        "wizard-preview-provider",
+        "wizard-preview-prefix",
+        "wizard-preview-public-url",
+        "wizard-hires-provider",
+        "wizard-hires-bucket",
+        "wizard-hires-prefix",
+        "wizard-hires-account",
+        "wizard-hires-public-url",
+        "wizard-domain-url",
+        "wizard-project-path",
+        "create-submit",
+        "create-cancel",
+        "create-result",
+        "create-status",
+        "create-result-title",
+    ] {
+        assert!(html.contains(id), "wizard field {id} must exist");
+    }
+    // Source stays folder-only in this phase.
+    assert!(
+        !html.contains("wizard-source-type"),
+        "no extra source types in 7-C"
+    );
+    // The wizard never collects credentials.
+    let wizard_section = html.split("id=\"create-flow\"").nth(1).unwrap();
+    for forbidden in [
+        "password",
+        "token",
+        "secret",
+        "api-key",
+        "apikey",
+        "credential",
+    ] {
+        assert!(
+            !wizard_section.to_lowercase().contains(forbidden),
+            "wizard must never collect {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn wizard_invokes_only_create_project_setup() {
+    let script = read_source("/ui/app.js");
+    let handler = script
+        .split("async function onCreateProject()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // Exactly one invoke, targeting the new command by name.
+    assert!(handler.contains("tauri.invoke(\"create_project_setup\""));
+    for forbidden in [
+        "publish_project",
+        "dry_run_project",
+        "recover_project",
+        "validate_project",
+    ] {
+        assert!(
+            !handler.contains(forbidden),
+            "wizard must never invoke {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn wizard_presents_success_with_identity_and_path() {
+    let script = read_source("/ui/app.js");
+    let show = script
+        .split("function showCreated(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "outcome.project_name",
+        "outcome.project_id",
+        "outcome.project_path",
+        "create-result",
+    ] {
+        assert!(
+            show.contains(required),
+            "success rendering must include {required}"
+        );
+    }
+    // Errors surface a friendly message through the same result area.
+    let show_error = script
+        .split("function showCreateError(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(show_error.contains("create-status"));
+    let handler = script
+        .split("async function onCreateProject()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(handler.contains("showCreateError("));
+}
+
+#[test]
+fn wizard_state_never_touches_the_publication_workflow() {
+    let script = read_source("/ui/app.js");
+    // The wizard keeps an independent state container...
+    assert!(script.contains("const wizardState = {"));
+    // ...and its handlers never mutate the publication state machine.
+    for chunk_name in [
+        "async function onCreateProject()",
+        "function showCreated(",
+        "function showCreateError(",
+        "function setCreateMode(",
+    ] {
+        let body = script
+            .split(chunk_name)
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "state.validated",
+            "state.dryRunReady",
+            "state.needsRecovery",
+            "state.projectPath",
+            "operationGeneration",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{chunk_name} must not touch {forbidden}"
+            );
+        }
+    }
+    // The wizard uses its own generation guard (same stale discipline).
+    let handler = script
+        .split("async function onCreateProject()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(handler.contains("wizardState.generation"));
+    assert!(handler.contains("generation !== wizardState.generation"));
+}
+
+#[test]
+fn wizard_stays_framework_free_like_the_rest_of_the_ui() {
+    let html = read_source("/ui/index.html");
+    let script = read_source("/ui/app.js");
+    for forbidden in [
+        "react",
+        "React",
+        "npm",
+        "node_modules",
+        "@tauri-apps/api",
+        "import ",
+        "require(",
+    ] {
+        assert!(
+            !script.contains(forbidden),
+            "frontend must not reference {forbidden}"
+        );
+    }
+    assert!(
+        !html.contains("cdn") && !html.contains("https://"),
+        "no external frontend asset may be loaded"
+    );
 }

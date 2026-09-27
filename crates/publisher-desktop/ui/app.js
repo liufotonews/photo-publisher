@@ -531,12 +531,160 @@ function onProjectPathChanged() {
   setBusy(false, "Pronto");
 }
 
+// ---------------------------------------------------------------------------
+// Project setup wizard (Phase 7-C)
+//
+// The wizard only collects data and produces one `project.json` via the
+// desktop command; publishing, dry-run and recovery are untouched. The
+// wizard keeps its own independent state and never mutates the publication
+// workflow state.
+// ---------------------------------------------------------------------------
+
+const wizardState = {
+  busy: false,
+  generation: 0,
+};
+
+function wizardValue(id) {
+  return el(id).value.trim();
+}
+
+function wizardOptional(id) {
+  const v = wizardValue(id);
+  return v === "" ? null : v;
+}
+
+function showCreated(outcome) {
+  el("create-result").hidden = false;
+  el("create-result-title").textContent = "Projeto criado";
+  el("create-status").textContent =
+    `${outcome.project_name} (${outcome.project_id}) — gravado em ${outcome.project_path}`;
+}
+
+function showCreateError(message) {
+  el("create-result").hidden = false;
+  el("create-result-title").textContent = "Criação falhou";
+  el("create-status").textContent = message;
+}
+
+async function onCreateProject() {
+  if (wizardState.busy) return;
+  // Presentation-only checks: schema remains the authority.
+  const requiredFields = [
+    "wizard-project-id",
+    "wizard-project-name",
+    "wizard-gallery-template",
+    "wizard-gallery-title",
+    "wizard-project-path",
+    "wizard-repository-provider",
+    "wizard-repository-name",
+    "wizard-hosting-provider",
+    "wizard-preview-provider",
+    "wizard-hires-provider",
+  ];
+  for (const id of requiredFields) {
+    if (wizardValue(id) === "") {
+      showCreateError("Preencha todos os campos obrigatórios.");
+      return;
+    }
+  }
+
+  const generation = (wizardState.generation += 1);
+  el("create-submit").disabled = true;
+  el("create-cancel").disabled = true;
+  wizardState.busy = true;
+  hide("create-result");
+  try {
+    const setup = {
+      schemaVersion: 2,
+      project: {
+        id: wizardValue("wizard-project-id"),
+        name: wizardValue("wizard-project-name"),
+        ...(wizardOptional("wizard-project-client") && { client: wizardOptional("wizard-project-client") }),
+        ...(wizardOptional("wizard-project-date") && { date: wizardOptional("wizard-project-date") }),
+      },
+      gallery: {
+        template: wizardValue("wizard-gallery-template"),
+        title: wizardValue("wizard-gallery-title"),
+        ...(wizardOptional("wizard-gallery-description") && { description: wizardOptional("wizard-gallery-description") }),
+        ...(wizardOptional("wizard-gallery-bundle") && { bundlePath: wizardOptional("wizard-gallery-bundle") }),
+      },
+      source: { type: "folder", path: wizardOptional("wizard-source-path") },
+      repository: {
+        provider: wizardValue("wizard-repository-provider"),
+        repository: wizardValue("wizard-repository-name"),
+        ...(wizardOptional("wizard-repository-branch") && { branch: wizardOptional("wizard-repository-branch") }),
+      },
+      hosting: {
+        provider: wizardValue("wizard-hosting-provider"),
+        ...(wizardOptional("wizard-hosting-project") && { project: wizardOptional("wizard-hosting-project") }),
+        ...(wizardOptional("wizard-hosting-team") && { teamId: wizardOptional("wizard-hosting-team") }),
+      },
+      storage: {
+        preview: {
+          provider: wizardValue("wizard-preview-provider"),
+          ...(wizardOptional("wizard-preview-prefix") && { prefix: wizardOptional("wizard-preview-prefix") }),
+          ...(wizardOptional("wizard-preview-public-url") && { publicBaseUrl: wizardOptional("wizard-preview-public-url") }),
+        },
+        highResolution: {
+          provider: wizardValue("wizard-hires-provider"),
+          ...(wizardOptional("wizard-hires-bucket") && { bucket: wizardOptional("wizard-hires-bucket") }),
+          ...(wizardOptional("wizard-hires-prefix") && { prefix: wizardOptional("wizard-hires-prefix") }),
+          ...(wizardOptional("wizard-hires-account") && { accountId: wizardOptional("wizard-hires-account") }),
+          ...(wizardOptional("wizard-hires-public-url") && { publicBaseUrl: wizardOptional("wizard-hires-public-url") }),
+        },
+      },
+      ...(wizardOptional("wizard-domain-url") && { domain: { url: wizardOptional("wizard-domain-url") } }),
+    };
+
+    const outcome = await tauri.invoke("create_project_setup", {
+      projectPath: wizardValue("wizard-project-path"),
+      setup,
+    });
+    if (generation !== wizardState.generation) {
+      return;
+    }
+    showCreated(outcome);
+  } catch (error) {
+    if (generation !== wizardState.generation) {
+      return;
+    }
+    showCreateError(error && error.message ? error.message : "Erro desconhecido.");
+  } finally {
+    wizardState.busy = false;
+    el("create-submit").disabled = false;
+    el("create-cancel").disabled = false;
+  }
+}
+
+function setCreateMode(active) {
+  el("tab-publish").classList.toggle("active", !active);
+  el("tab-create").classList.toggle("active", active);
+  // Hide every publication-flow piece: pipeline nav, project card, all result
+  // cards and the activity log must not leak into the setup screen.
+  document.querySelector("nav.pipeline").hidden = active;
+  document.querySelector('[aria-labelledby="project-section-title"]').hidden = active;
+  el("project-result").hidden = active;
+  el("dry-run-result").hidden = active;
+  el("publish-result").hidden = active;
+  el("recover-section").hidden = active;
+  el("activity").hidden = active;
+  el("create-flow").hidden = !active;
+  if (active) {
+    hide("create-result");
+  }
+}
+
 async function main() {
   el("validate-button").addEventListener("click", onValidate);
   el("dry-run-button").addEventListener("click", onDryRun);
   el("publish-button").addEventListener("click", onPublish);
   el("recover-button").addEventListener("click", onRecover);
   el("project-path").addEventListener("input", onProjectPathChanged);
+  el("tab-publish").addEventListener("click", () => setCreateMode(false));
+  el("tab-create").addEventListener("click", () => setCreateMode(true));
+  el("create-cancel").addEventListener("click", () => setCreateMode(false));
+  el("create-submit").addEventListener("click", onCreateProject);
   // The event listener is installed once, at startup.
   installPublisherEventListener();
   if (tauri) {

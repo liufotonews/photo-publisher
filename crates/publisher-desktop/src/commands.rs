@@ -311,6 +311,52 @@ pub fn recover_project(
     })
 }
 
+/// Outcome of the project setup creation, published back to the desktop UI.
+///
+/// Public facts only: identity and the written path (the caller provided it).
+/// Never providers.credentials/network or internal payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CreateProjectSetupOutcomeDto {
+    pub project_id: String,
+    pub project_name: String,
+    pub project_path: String,
+}
+
+/// Creates a `project.json` from the wizard's payload.
+///
+/// The only work here is: deserialize the wizard payload into the Phase 7-A
+/// contract (`ProjectSetup`), then hand it to the application-level service
+/// (`create_project_setup`), which performs the schema-mandated write.
+/// This function has no provider, no credential, and no network reach —
+/// those live outside setup by design (see Phase 7-0).
+pub fn create_project_setup(
+    project_path: &str,
+    setup: serde_json::Value,
+) -> Result<CreateProjectSetupOutcomeDto, CommandError> {
+    let path = check_path(project_path)?;
+    if !setup.is_object() {
+        return Err(CommandError {
+            kind: publisher_app::ApplicationErrorKind::ProjectInvalid
+                .as_str()
+                .to_owned(),
+            message: "the wizard payload must be a JSON object".to_owned(),
+        });
+    }
+    let model: publisher_app::ProjectSetup =
+        serde_json::from_value(setup).map_err(|error| CommandError {
+            kind: publisher_app::ApplicationErrorKind::ProjectInvalid
+                .as_str()
+                .to_owned(),
+            message: format!("the wizard payload does not match the project contract: {error}"),
+        })?;
+    let outcome = publisher_app::create_project_setup(&path, model)?;
+    Ok(CreateProjectSetupOutcomeDto {
+        project_id: outcome.project_id,
+        project_name: outcome.project_name,
+        project_path: outcome.project_path.display().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +583,82 @@ mod tests {
         for needle in ["PHOTO_PUBLISHER_", "token", "secret", "password"] {
             assert!(!json.contains(needle), "DTO leaked {needle}: {json}");
         }
+    }
+
+    #[test]
+    fn create_project_setup_writes_exactly_one_document_via_the_contract() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("project.json");
+        let payload = serde_json::json!({
+            "schemaVersion": 2,
+            "project": {"id": "joao-maria-2026", "name": "João & Maria"},
+            "gallery": {"template": "editorial-v1", "title": "João & Maria", "bundlePath": "gallery-app"},
+            "source": {"type": "folder", "path": "fotos"},
+            "repository": {"provider": "github", "repository": "fotografo/joao-maria-2026", "branch": "main"},
+            "hosting": {"provider": "vercel", "project": "joao-maria-2026"},
+            "storage": {
+                "preview": {"provider": "github", "publicBaseUrl": "https://cdn.example.com/previews"},
+                "highResolution": {"provider": "r2", "accountId": "acct", "bucket": "fotografia", "publicBaseUrl": "https://downloads.example.com/originals"}
+            }
+        });
+        let outcome = create_project_setup(target.to_str().unwrap(), payload).unwrap();
+        assert_eq!(outcome.project_id, "joao-maria-2026");
+        assert_eq!(outcome.project_name, "João & Maria");
+        assert_eq!(outcome.project_path, target.display().to_string());
+        assert!(target.is_file());
+        // The resulting document must pass the same schema as the contract.
+        let reloaded = publisher_app::ProjectSetup::load(&target).unwrap();
+        assert_eq!(reloaded.project.id, "joao-maria-2026");
+    }
+
+    #[test]
+    fn create_project_setup_rejects_a_contract_invalid_setup() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("project.json");
+        let invalid = serde_json::json!({
+            "schemaVersion": 2,
+            "project": {"id": "has spaces", "name": "T"}
+        });
+        let error = create_project_setup(target.to_str().unwrap(), invalid).unwrap_err();
+        assert_eq!(error.kind, "project_invalid");
+        assert!(!target.exists(), "no document may be left behind");
+    }
+
+    #[test]
+    fn create_project_setup_rejects_non_object_payloads() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("project.json");
+        let error =
+            create_project_setup(target.to_str().unwrap(), serde_json::json!("not an object"))
+                .unwrap_err();
+        assert_eq!(error.kind, "project_invalid");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn create_project_setup_never_reclassifies_io_failures() {
+        // The destination is an existing directory: the write must fail and
+        // be classified as Internal (not ResourceMissing), and the public
+        // message must not contain the full user path. Same rule as Phase 7-A.
+        let root = tempdir().unwrap();
+        let target = root.path().join("project.json");
+        std::fs::create_dir(&target).unwrap();
+        let payload = serde_json::json!({
+            "schemaVersion": 2,
+            "project": {"id": "joao-maria-2026", "name": "N"},
+            "gallery": {"template": "editorial-v1", "title": "N", "bundlePath": "gallery-app"},
+            "source": {"type": "folder", "path": "fotos"},
+            "repository": {"provider": "github", "repository": "o/r"},
+            "hosting": {"provider": "vercel", "project": "p"},
+            "storage": {
+                "preview": {"provider": "github", "publicBaseUrl": "https://cdn.example.com/p"},
+                "highResolution": {"provider": "r2", "accountId": "a", "bucket": "b", "publicBaseUrl": "https://d.example.com/o"}
+            }
+        });
+        let error = create_project_setup(target.to_str().unwrap(), payload).unwrap_err();
+        assert_eq!(error.kind, "internal");
+        assert!(!error
+            .message
+            .contains(target.display().to_string().as_str()));
     }
 }

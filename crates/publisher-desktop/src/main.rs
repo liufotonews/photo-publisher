@@ -14,8 +14,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use publisher_desktop::commands::{
-    AppInfo, CommandError, DryRunOutcomeDto, PublishOutcomeDto, RecoverOutcomeDto,
-    ValidateProjectOutcome,
+    AppInfo, CommandError, CreateProjectSetupOutcomeDto, DryRunOutcomeDto, PublishOutcomeDto,
+    RecoverOutcomeDto, ValidateProjectOutcome,
 };
 use tauri::Emitter;
 
@@ -95,6 +95,16 @@ fn recover_project(
     publisher_desktop::commands::recover_project(&project_path, &mut forward_events(&app_handle))
 }
 
+/// Creates a `project.json` from the wizard's payload — a synchronous, short
+/// operation fully delegated to the publisher-app setup service.
+#[tauri::command]
+fn create_project_setup(
+    project_path: String,
+    setup: serde_json::Value,
+) -> Result<CreateProjectSetupOutcomeDto, CommandError> {
+    publisher_desktop::commands::create_project_setup(&project_path, setup)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(DesktopState)
@@ -103,7 +113,8 @@ fn main() {
             validate_project,
             publish_project,
             dry_run_project,
-            recover_project
+            recover_project,
+            create_project_setup
         ])
         .run(tauri::generate_context!("tauri.conf.json"))
         .expect("error while running the Photo Publisher desktop application");

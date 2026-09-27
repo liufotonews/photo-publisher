@@ -16,6 +16,12 @@
         <span id="global-status" class="status-chip" role="status">Pronto</span>
       </header>
 
+      <!-- Alternância entre a publicação e a criação de um novo projeto. -->
+      <nav class="tabs" aria-label="Modo">
+        <button type="button" id="tab-publish" class="tab active">Publicar</button>
+        <button type="button" id="tab-create" class="tab">Novo projeto</button>
+      </nav>
+
       <!-- Sequência visual do fluxo: publicação -->
       <nav class="pipeline" aria-label="Sequência">
         <ol class="pipeline-steps">
@@ -105,6 +111,171 @@
       <section id="activity" class="card" aria-labelledby="activity-title">
         <h2 id="activity-title">Atividade</h2>
         <ul id="activity-list" class="activity-list" aria-live="polite"></ul>
+      </section>
+
+      <!-- Wizard para criar um novo project.json (sem publicar nada). -->
+      <section id="create-flow" class="card" hidden aria-labelledby="create-title">
+        <h2 id="create-title">Novo projeto</h2>
+        <p class="hint">
+          Preencha a configuração do projeto. Isto apenas cria o
+          <strong>project.json</strong> — nada é publicado e nenhuma
+          infraestrutura externa é criada.
+        </p>
+
+        <details class="wizard-group" open>
+          <summary>Projeto</summary>
+          <div class="wizard-grid">
+            <label class="field">
+              <span>ID do projeto *</span>
+              <input id="wizard-project-id" type="text" required spellcheck="false" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Nome do projeto *</span>
+              <input id="wizard-project-name" type="text" required autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Cliente</span>
+              <input id="wizard-project-client" type="text" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Data</span>
+              <input id="wizard-project-date" type="date" autocomplete="off" />
+            </label>
+          </div>
+        </details>
+
+        <details class="wizard-group" open>
+          <summary>Galeria</summary>
+          <div class="wizard-grid">
+            <label class="field">
+              <span>Template *</span>
+              <input id="wizard-gallery-template" type="text" required autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Título *</span>
+              <input id="wizard-gallery-title" type="text" required autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Descrição</span>
+              <input id="wizard-gallery-description" type="text" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Bundle (caminho)</span>
+              <input id="wizard-gallery-bundle" type="text" autocomplete="off" />
+            </label>
+          </div>
+        </details>
+
+        <details class="wizard-group">
+          <summary>Fonte</summary>
+          <div class="wizard-grid">
+            <label class="field">
+              <span>Pasta das fotos finais</span>
+              <input id="wizard-source-path" type="text" spellcheck="false" autocomplete="off" placeholder="fotos" />
+            </label>
+          </div>
+        </details>
+
+        <details class="wizard-group">
+          <summary>Destinos de publicação</summary>
+          <div class="wizard-grid">
+            <label class="field">
+              <span>Repository — provider *</span>
+              <input id="wizard-repository-provider" type="text" required autocomplete="off" placeholder="github" />
+            </label>
+            <label class="field">
+              <span>Repository *</span>
+              <input id="wizard-repository-name" type="text" required autocomplete="off" placeholder="fotografo/projeto" />
+            </label>
+            <label class="field">
+              <span>Branch</span>
+              <input id="wizard-repository-branch" type="text" autocomplete="off" placeholder="main" />
+            </label>
+            <label class="field">
+              <span>Hosting — provider *</span>
+              <input id="wizard-hosting-provider" type="text" required autocomplete="off" placeholder="vercel" />
+            </label>
+            <label class="field">
+              <span>Hosting — projeto</span>
+              <input id="wizard-hosting-project" type="text" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Hosting — team ID</span>
+              <input id="wizard-hosting-team" type="text" autocomplete="off" />
+            </label>
+          </div>
+        </details>
+
+        <details class="wizard-group">
+          <summary>Storage — Preview</summary>
+          <div class="wizard-grid">
+            <label class="field">
+              <span>Provider *</span>
+              <input id="wizard-preview-provider" type="text" required autocomplete="off" placeholder="github" />
+            </label>
+            <label class="field">
+              <span>Prefix</span>
+              <input id="wizard-preview-prefix" type="text" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Public base URL</span>
+              <input id="wizard-preview-public-url" type="text" autocomplete="off" />
+            </label>
+          </div>
+        </details>
+
+        <details class="wizard-group">
+          <summary>Storage — Alta resolução</summary>
+          <div class="wizard-grid">
+            <label class="field">
+              <span>Provider *</span>
+              <input id="wizard-hires-provider" type="text" required autocomplete="off" placeholder="r2" />
+            </label>
+            <label class="field">
+              <span>Bucket</span>
+              <input id="wizard-hires-bucket" type="text" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Prefix</span>
+              <input id="wizard-hires-prefix" type="text" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Account ID</span>
+              <input id="wizard-hires-account" type="text" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Public base URL</span>
+              <input id="wizard-hires-public-url" type="text" autocomplete="off" />
+            </label>
+          </div>
+        </details>
+
+        <details class="wizard-group">
+          <summary>Domínio</summary>
+          <div class="wizard-grid">
+            <label class="field">
+              <span>URL</span>
+              <input id="wizard-domain-url" type="text" autocomplete="off" />
+            </label>
+          </div>
+        </details>
+
+        <div class="wizard-grid">
+          <label class="field">
+            <span>Onde gravar o project.json *</span>
+            <input id="wizard-project-path" type="text" required spellcheck="false" autocomplete="off" placeholder="C:\Projetos\cliente\project.json" />
+          </label>
+        </div>
+
+        <div class="actions">
+          <button type="button" id="create-cancel" class="secondary">Cancelar</button>
+          <button type="button" id="create-submit" class="primary">Criar projeto</button>
+        </div>
+
+        <section id="create-result" class="card result" hidden aria-live="polite">
+          <h2 id="create-result-title">Projeto criado</h2>
+          <p id="create-status" class="status"></p>
+        </section>
       </section>
 
       <footer class="statusbar">
