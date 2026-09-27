@@ -9,9 +9,34 @@
   <body>
     <main class="app">
       <header class="app-header">
-        <h1 id="app-title">Photo Publisher</h1>
-        <p id="app-version" class="version"></p>
+        <div>
+          <h1 id="app-title">Photo Publisher</h1>
+          <p id="app-version" class="version"></p>
+        </div>
+        <span id="global-status" class="status-chip" role="status">Pronto</span>
       </header>
+
+      <!-- Sequência visual do fluxo: publicação -->
+      <nav class="pipeline" aria-label="Sequência">
+        <ol class="pipeline-steps">
+          <li id="step-project" class="step current">
+            <span class="step-index">1</span>
+            <span class="step-label">Projeto</span>
+          </li>
+          <li id="step-validate" class="step">
+            <span class="step-index">2</span>
+            <span class="step-label">Validar</span>
+          </li>
+          <li id="step-dryrun" class="step">
+            <span class="step-index">3</span>
+            <span class="step-label">Dry Run</span>
+          </li>
+          <li id="step-publish" class="step">
+            <span class="step-index">4</span>
+            <span class="step-label">Publicar</span>
+          </li>
+        </ol>
+      </nav>
 
       <section class="card" aria-labelledby="project-section-title">
         <h2 id="project-section-title">Projeto</h2>
@@ -26,10 +51,14 @@
           />
         </label>
         <div class="actions">
-          <button id="validate-button" type="button">Validar projeto</button>
+          <button id="validate-button" type="button" class="primary">Validar projeto</button>
           <button id="dry-run-button" type="button" disabled>Executar Dry Run</button>
           <button id="publish-button" type="button" disabled>Publicar</button>
         </div>
+        <p class="hint">
+          O Publicar só fica disponível depois de validar o projeto e executar
+          um Dry Run com sucesso.
+        </p>
       </section>
 
       <section id="project-result" class="card result" hidden aria-live="polite">
@@ -59,11 +88,17 @@
         <p id="publish-status" class="status"></p>
       </section>
 
-      <section id="recover-section" class="card result" hidden aria-live="polite">
+      <section id="recover-section" class="card result attention" hidden aria-live="polite">
         <h2 id="recover-result-title">Recuperação</h2>
         <p id="recover-status" class="status"></p>
+        <p class="hint">
+          Após a recuperação, o fluxo continua: validar novamente, executar o
+          Dry Run, e então publicar.
+        </p>
         <div class="actions">
-          <button id="recover-button" type="button" disabled>Recuperar publicação</button>
+          <button id="recover-button" type="button" class="primary" disabled>
+            Recuperar publicação
+          </button>
         </div>
       </section>
 
@@ -73,7 +108,7 @@
       </section>
 
       <footer class="statusbar">
-        Status: <span id="global-status" role="status">Pronto</span>
+        <span class="muted">Photo Publisher — sem telemetria, sem registro persistente.</span>
       </footer>
     </main>
     <script src="app.js"></script>

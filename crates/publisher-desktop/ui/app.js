@@ -71,11 +71,58 @@ function refreshButtons() {
   el("dry-run-button").disabled = state.busy || !state.validated;
   el("publish-button").disabled = !canPublish();
   el("recover-button").disabled = !canRecover();
+  // O passo ativo da sequência visual acompanha o estado corrente.
+  setPipelineStep();
+}
+
+function setPipelineStep() {
+  const steps = [
+    "step-project",
+    "step-validate",
+    "step-dryrun",
+    "step-publish",
+  ];
+  for (const id of steps) {
+    el(id).classList.remove("current");
+  }
+  const label = el("global-status").textContent;
+  let active = "step-project";
+  if (state.needsRecovery) {
+    active = "step-publish"; // recovery renders inside its own section
+  } else if (label.includes("recuperar") || label.includes("Recupera")) {
+    active = "step-publish";
+  } else if (label.includes("publica")) {
+    active = "step-publish";
+  } else if (label.includes("Dry Run") || label.includes("dry")) {
+    active = "step-dryrun";
+  } else if (label.includes("Valid") || label.includes("valid")) {
+    active = "step-validate";
+  } else if (state.validated && !state.dryRunReady) {
+    active = "step-validate";
+  } else if (state.dryRunReady) {
+    active = "step-dryrun";
+  }
+  el(active).classList.add("current");
 }
 
 function setBusy(busy, label) {
+
+function setBusy(busy, label) {
   state.busy = busy;
-  el("global-status").textContent = label;
+  const chip = el("global-status");
+  chip.textContent = label;
+  // Tonalidade puramente visual; o texto continua sendo a mensagem produzida
+  // pelos handlers existentes (nenhuma regra alterada).
+  chip.className = "status-chip";
+  if (busy) {
+    chip.classList.add("busy");
+  } else if (label.includes("Falha") || label.includes("Erro")) {
+    chip.classList.add("error");
+  } else if (label === "Pronto") {
+    chip.classList.add("ok");
+  } else {
+    chip.classList.add("done");
+  }
   refreshButtons();
 }
 
@@ -282,7 +329,15 @@ function addActivity(message, failed) {
   const list = el("activity-list");
   const item = document.createElement("li");
   item.textContent = message;
-  if (failed) item.classList.add("failed");
+  // Tonalidade da entrada é derivada do texto produzido pela camada de
+  // apresentação — nunca de uma decisão nova.
+  if (failed) {
+    item.classList.add("failed");
+  } else if (message.endsWith("…")) {
+    item.classList.add("in-progress");
+  } else {
+    item.classList.add("done");
+  }
   list.appendChild(item);
   while (list.children.length > ACTIVITY_LIMIT) {
     list.removeChild(list.firstChild);

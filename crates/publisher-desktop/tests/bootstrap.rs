@@ -689,6 +689,69 @@ fn exactly_one_event_listener_is_installed() {
 }
 
 #[test]
+fn the_ux_structure_presents_the_publication_and_recovery_sequence() {
+    let html = read_source("/ui/index.html");
+    let css = read_source("/ui/style.css");
+    // Hierarchy of actions, in visual order: project → validate → dry run →
+    // publish; and the recovery section when the publish says so.
+    for element in [
+        "id=\"step-project\"",
+        "id=\"step-validate\"",
+        "id=\"step-dryrun\"",
+        "id=\"step-publish\"",
+        "id=\"project-path\"",
+        "id=\"global-status\"",
+        "id=\"validate-button\"",
+        "id=\"dry-run-button\"",
+        "id=\"publish-button\"",
+        "id=\"recover-button\"",
+        "id=\"recover-section\"",
+        "id=\"project-result\"",
+        "id=\"dry-run-result\"",
+        "id=\"publish-result\"",
+        "id=\"activity-list\"",
+    ] {
+        assert!(html.contains(element), "index.html must contain {element}");
+    }
+    // Status visuals are distinguishable (info / in-progress / ok / error).
+    for class in [
+        ".status-chip",
+        ".result.ok",
+        ".result.error",
+        ".result.attention",
+        ".activity-list li.failed",
+        ".activity-list li.in-progress",
+        ".activity-list li.done",
+        ".step.current",
+    ] {
+        assert!(css.contains(class), "style.css must define {class}");
+    }
+    // The visual sequence is only presentation: the JS drives the same labels already
+    // published, no new state machine was introduced.
+    let js = read_source("/ui/app.js");
+    assert!(js.contains("function setPipelineStep()"));
+    assert!(js.contains("refreshButtons();"));
+    assert!(js.contains("setBusy(false"));
+    // Nothing was added that would qualify as a frontend framework.
+    let all = (html + &css + &js).to_lowercase();
+    for forbidden in ["react", "vite", "tailwindcss", "bootstrapcdn"] {
+        assert!(!all.contains(forbidden), "Ux layer must avoid {forbidden}");
+    }
+}
+
+#[test]
+fn the_status_chip_shows_existing_messages_only() {
+    let js = read_source("/ui/app.js");
+    // The chip only reflects the messages the handlers already produce.
+    assert!(js.contains("chip.textContent = label"));
+    // And the tone applied is presentation-only (no new labels/texts invented).
+    assert!(js.contains("chip.className = \"status-chip\""));
+    // The chip exists and is the single global status surface.
+    let html = read_source("/ui/index.html");
+    assert_eq!(html.matches("id=\"global-status\"").count(), 1);
+}
+
+#[test]
 fn recover_project_is_registered_and_remains_a_pure_adapter() {
     // The command set now includes recover_project alongside the four
     // existing commands, with the same single event channel.

@@ -1,13 +1,16 @@
 :root {
   color-scheme: light;
-  --bg: #f5f6f8;
+  --bg: #f4f5f7;
   --card: #ffffff;
   --text: #1d2430;
   --muted: #5c6472;
   --accent: #1c4f96;
   --accent-hover: #163e78;
   --danger: #a33434;
+  --success: #1e7a3c;
+  --attention: #a05a08;
   --border: #d6dae1;
+  --border-strong: #b8bfca;
   font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
 }
 
@@ -22,35 +25,80 @@ body {
 }
 
 .app {
-  max-width: 780px;
+  max-width: 840px;
   margin: 0 auto;
-  padding: 24px;
+  padding: 20px 24px 24px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
+  min-height: 100vh;
 }
 
 .app-header {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  justify-content: space-between;
   gap: 12px;
 }
 
 .app-header h1 {
   margin: 0;
-  font-size: 22px;
+  font-size: 20px;
 }
 
 .version {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Sequência visual do fluxo (apresentação apenas; a autoridade do estado é
+   a regra imperativa no JS). */
+.pipeline {
+  margin: 2px 0 4px;
+}
+
+.pipeline-steps {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   margin: 0;
+  padding: 0;
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card);
   color: var(--muted);
   font-size: 13px;
+}
+
+.step .step-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  font-size: 11px;
+}
+
+.step.current {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .card {
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 10px;
   padding: 16px;
 }
 
@@ -75,10 +123,17 @@ body {
   font-size: 14px;
   border: 1px solid var(--border);
   border-radius: 6px;
+  background: #ffffff;
+}
+
+.field input:focus {
+  border-color: var(--accent);
+  outline: none;
 }
 
 .actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 12px;
 }
@@ -99,8 +154,48 @@ button:hover:not(:disabled) {
 
 button:disabled {
   border-color: var(--border);
-  background: #aeb6c2;
+  background: #c3c9d2;
+  color: var(--muted);
   cursor: not-allowed;
+}
+
+button.primary:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.hint {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Card de status (chip no header) */
+.status-chip {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--card);
+  color: var(--text);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+/* Resultados (validate / dry-run / publish / recovery) */
+.result {
+  border-left: 4px solid var(--border-strong);
+}
+
+.result.ok {
+  border-left-color: var(--success);
+}
+
+.result.error {
+  border-left-color: var(--danger);
+}
+
+.result.attention {
+  border-left-color: var(--attention);
 }
 
 .result .status {
@@ -128,7 +223,8 @@ button:disabled {
 
 .statusbar {
   color: var(--muted);
-  font-size: 13px;
+  font-size: 12px;
+  margin-top: auto;
 }
 
 .activity-list {
@@ -142,8 +238,11 @@ button:disabled {
 }
 
 .activity-list li {
-  padding: 3px 0;
+  padding: 3px 6px;
   border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
 }
 
 .activity-list li:last-child {
@@ -152,4 +251,12 @@ button:disabled {
 
 .activity-list li.failed {
   color: var(--danger);
+}
+
+.activity-list li.in-progress {
+  color: var(--accent);
+}
+
+.activity-list li.done {
+  color: var(--success);
 }
