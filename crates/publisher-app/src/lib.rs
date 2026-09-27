@@ -12,6 +12,7 @@ pub mod outcome;
 pub mod project;
 pub mod providers;
 pub mod setup;
+pub mod setup_service;
 pub mod use_cases;
 
 pub use errors::{ApplicationError, ApplicationErrorKind};
@@ -21,6 +22,11 @@ pub use project::{
     load_project_document, resolve_output_dir, resolve_source_dir, ProjectHandle, ProjectKind,
 };
 pub use providers::PublicationProviders;
+pub use setup::{
+    DomainSetup, GallerySetup, HostingSetup, ProjectIdentity, ProjectSetup, RepositorySetup,
+    SourceSetup, StorageSetup, StorageTargetSetup,
+};
+pub use setup_service::{create_project_setup, ProjectSetupOutcome};
 pub use use_cases::{
     dry_run_project, inspect_project, publish_project, recover_publication, validate_project,
     DryRunOutcome, InspectOutcome, JournalSummary, PublishOptions, PublishOutcome, RecoverOutcome,
