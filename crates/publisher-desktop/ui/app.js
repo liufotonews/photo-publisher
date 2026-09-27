@@ -106,8 +106,6 @@ function setPipelineStep() {
 }
 
 function setBusy(busy, label) {
-
-function setBusy(busy, label) {
   state.busy = busy;
   const chip = el("global-status");
   chip.textContent = label;
