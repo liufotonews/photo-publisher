@@ -2,12 +2,14 @@
 
 pub mod dry_run;
 pub mod inspect;
+pub mod preflight;
 pub mod publish;
 pub mod recover;
 pub mod validate;
 
 pub use dry_run::{dry_run_project, DryRunOutcome};
 pub use inspect::{inspect_project, InspectOutcome, JournalSummary};
+pub use preflight::{preflight_project, PreflightIssue, PreflightIssueCode, PreflightOutcome};
 pub use publish::{publish_project, PublishOptions, PublishOutcome};
 pub use recover::{recover_publication, RecoverOutcome, RecoveryState};
 pub use validate::validate_project;

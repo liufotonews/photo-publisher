@@ -448,6 +448,54 @@ pub fn delete_credential(name: &str) -> Result<(), CommandError> {
     Ok(())
 }
 
+/// One preflight precondition failure, ready for presentation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreflightIssueDto {
+    pub code: String,
+    pub field: String,
+    pub message: String,
+}
+
+/// Outcome of the standalone preflight (Phase 7-F): a deterministic,
+/// secret-free precondition report. Reports only — never plans, never
+/// publishes, never touches a provider remotely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreflightOutcomeDto {
+    pub ready: bool,
+    pub schema_version: u8,
+    pub project_id: String,
+    pub project_name: String,
+    pub issues: Vec<PreflightIssueDto>,
+}
+
+/// Checks whether a project has every precondition for a publication
+/// attempt (Phase 7-F). Pure adapter: all rules live in `publisher-app`;
+/// the credential backend comes from the composition root. No providers
+/// are built, no network is reached, no plan is computed.
+pub fn preflight_project(
+    project_path: &str,
+    events: &mut EventSink<'_>,
+) -> Result<PreflightOutcomeDto, CommandError> {
+    let path = check_path(project_path)?;
+    let store = crate::composition::credential_store();
+    let outcome = publisher_app::preflight_project(&path, &store, events)?;
+    Ok(PreflightOutcomeDto {
+        ready: outcome.ready,
+        schema_version: outcome.schema_version,
+        project_id: outcome.project_id,
+        project_name: outcome.project_name,
+        issues: outcome
+            .issues
+            .iter()
+            .map(|issue| PreflightIssueDto {
+                code: issue.code.as_str().to_owned(),
+                field: issue.field.clone(),
+                message: issue.message.clone(),
+            })
+            .collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,6 +990,84 @@ mod tests {
             .unwrap()
             .iter()
             .all(|entry| !entry.configured));
+        clear_all_credentials();
+    }
+
+    // --- Preflight (Phase 7-F) ----------------------------------------------
+    //
+    // Environment-backed credential bits are required here, so these tests
+    // serialize on the crate-wide ENV_LOCK and always restore the absent
+    // state afterwards.
+
+    fn set_all_credentials(value: &str) {
+        for name in publisher_app::SUPPORTED_CREDENTIALS {
+            set_credential(name, value.to_owned()).unwrap();
+        }
+    }
+
+    #[test]
+    fn preflight_project_reports_ready_for_a_configured_v2_project() {
+        let _guard = crate::composition::ENV_LOCK.lock().unwrap();
+        clear_all_credentials();
+        set_all_credentials("test-value");
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("fotos")).unwrap();
+        let path = write_coherent_v2_project(root.path());
+        let outcome = preflight_project(path.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert!(outcome.ready, "issues: {:?}", outcome.issues);
+        assert_eq!(outcome.schema_version, 2);
+        assert_eq!(outcome.project_id, "joao-maria-2026");
+        assert!(outcome.issues.is_empty());
+        clear_all_credentials();
+    }
+
+    #[test]
+    fn preflight_project_reports_missing_credentials_without_values() {
+        let _guard = crate::composition::ENV_LOCK.lock().unwrap();
+        clear_all_credentials();
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("fotos")).unwrap();
+        let path = write_coherent_v2_project(root.path());
+        let outcome = preflight_project(path.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert!(!outcome.ready);
+        assert_eq!(outcome.issues.len(), 4);
+        assert!(outcome
+            .issues
+            .iter()
+            .all(|issue| issue.code == "credential_missing"));
+        let json = serde_json::to_string(&outcome).unwrap();
+        // Credential *names* are safe identifiers; values and environment
+        // variable names never appear.
+        assert!(json.contains("github.token"));
+        assert!(json.contains("vercel.token"));
+        for needle in ["test-value", "PHOTO_PUBLISHER_GITHUB_TOKEN"] {
+            assert!(!json.contains(needle), "preflight DTO leaked {needle}");
+        }
+        clear_all_credentials();
+    }
+
+    #[test]
+    fn preflight_project_needs_no_credentials_for_a_v1_project() {
+        let _guard = crate::composition::ENV_LOCK.lock().unwrap();
+        clear_all_credentials();
+        let root = tempdir().unwrap();
+        let path = write_project(root.path()); // existing v1 fixture (with source dir)
+        let outcome = preflight_project(path.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert!(outcome.ready, "issues: {:?}", outcome.issues);
+        assert_eq!(outcome.schema_version, 1);
+        clear_all_credentials();
+    }
+
+    #[test]
+    fn preflight_project_keeps_level_1_classifications() {
+        let _guard = crate::composition::ENV_LOCK.lock().unwrap();
+        clear_all_credentials();
+        let error = preflight_project("   ", &mut |_| {}).unwrap_err();
+        assert_eq!(error.kind, "project_invalid");
+        let root = tempdir().unwrap();
+        let missing = root.path().join("project.json");
+        let error = preflight_project(missing.to_str().unwrap(), &mut |_| {}).unwrap_err();
+        assert_eq!(error.kind, "resource_missing");
         clear_all_credentials();
     }
 }

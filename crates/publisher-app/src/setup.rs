@@ -127,13 +127,22 @@ impl ProjectSetup {
     /// Loads a `project.json` into the contract: identical validation as the
     /// application layer's existing loader, then a semantic decode.
     pub fn load(path: &Path) -> Result<Self, ApplicationError> {
+        Self::load_with_document(path).map(|(model, _)| model)
+    }
+
+    /// Same load as [`ProjectSetup::load`], also returning the validated raw
+    /// document — used by consumers (e.g. preflight) that additionally need
+    /// the existing path-resolution rules without a second read+validate.
+    pub(crate) fn load_with_document(
+        path: &Path,
+    ) -> Result<(Self, serde_json::Value), ApplicationError> {
         let document = crate::project::load_project_document(path)?;
         let model: Self = serde_json::from_value(document.clone()).map_err(|error| {
             project_invalid(format!(
                 "project.json does not match the setup contract: {error}"
             ))
         })?;
-        Ok(model)
+        Ok((model, document))
     }
 
     /// Serializes the model to a JSON string (stable content for a given

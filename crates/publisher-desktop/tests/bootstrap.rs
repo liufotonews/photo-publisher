@@ -398,7 +398,7 @@ fn command_layer_contains_no_provider_or_network_wiring() {
 }
 
 #[test]
-fn binary_registers_exactly_the_ten_commands_and_the_single_channel() {
+fn binary_registers_exactly_the_eleven_commands_and_the_single_channel() {
     // The Tauri binary is the only place that may touch `tauri`; the command
     // set and the event channel feed must remain exactly what this phase
     // specifies. Line endings are normalized (CI checkouts on Windows use
@@ -428,7 +428,8 @@ fn binary_registers_exactly_the_ten_commands_and_the_single_channel() {
             "validate_project_configuration",
             "get_credential_status",
             "set_credential",
-            "delete_credential"
+            "delete_credential",
+            "preflight_project"
         ]
     );
     assert!(source.contains("publisher_desktop::events::PUBLISHER_EVENT_CHANNEL"));
@@ -785,7 +786,8 @@ fn recover_project_is_registered_and_remains_a_pure_adapter() {
             "validate_project_configuration",
             "get_credential_status",
             "set_credential",
-            "delete_credential"
+            "delete_credential",
+            "preflight_project"
         ]
     );
     // The desktop command layer delegates to the application use case.
@@ -826,7 +828,7 @@ fn create_project_setup_is_registered_and_a_pure_adapter() {
         .filter(|n| !n.is_empty())
         .collect();
     assert!(names.contains(&"create_project_setup"));
-    assert_eq!(names.len(), 10);
+    assert_eq!(names.len(), 11);
     let commands = read_source("/src/commands.rs");
     assert!(commands.contains("publisher_app::create_project_setup"));
     assert!(commands.contains("pub struct CreateProjectSetupOutcomeDto"));
@@ -973,6 +975,66 @@ fn credential_commands_are_registered_and_pure_adapters() {
             );
         }
     }
+}
+
+#[test]
+fn preflight_project_is_registered_and_a_pure_adapter() {
+    // Phase 7-F: the command is registered and delegates to the publisher-app
+    // preflight use case. It never plans (dry-run), never publishes, never
+    // recovers, never builds a provider, never reaches the network — its only
+    // credential surface is the configured bits via the composition root.
+    let main = read_source("/src/main.rs");
+    let handler = main
+        .split("generate_handler![")
+        .nth(1)
+        .unwrap()
+        .split(']')
+        .next()
+        .unwrap();
+    assert!(handler.contains("preflight_project"));
+    let commands = read_source("/src/commands.rs");
+    assert!(commands.contains("publisher_app::preflight_project"));
+    assert!(commands.contains("pub struct PreflightOutcomeDto"));
+    let body = commands
+        .split("pub fn preflight_project")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "publish_project(",
+        "dry_run_project(",
+        "recover_project(",
+        "create_project_setup(",
+        "preflight_publication(",
+        "build_providers(",
+        "EnvironmentCredentialStore",
+        "std::env",
+        ".publish(",
+        ".put(",
+        ".commit(",
+        ".delete(",
+        "reqwest",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "preflight_project command must not contain {forbidden}"
+        );
+    }
+    // The publication boundary stays exclusively on the publish wrapper.
+    let main_normalized = read_source("/src/main.rs");
+    let preflight_wrapper = main_normalized
+        .split("fn preflight_project(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(
+        !preflight_wrapper.contains("spawn_blocking"),
+        "preflight stays synchronous: it performs no remote work"
+    );
 }
 
 #[test]
@@ -1655,4 +1717,218 @@ fn credential_state_is_independent_of_the_publication_flow() {
         .next()
         .unwrap();
     assert!(mode.contains("refreshCredentialStatus()"));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7-F — Preflight independente do Dry Run
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preflight_button_step_and_result_area_exist_in_order() {
+    let html = read_source("/ui/index.html");
+    for id in [
+        "id=\"step-preflight\"",
+        "id=\"preflight-button\"",
+        "id=\"preflight-result\"",
+        "id=\"preflight-result-title\"",
+        "id=\"preflight-status\"",
+        "id=\"preflight-issues\"",
+    ] {
+        assert!(html.contains(id), "index.html must contain {id}");
+    }
+    // The visual sequence is Projeto → Validar → Preflight → Dry Run →
+    // Publicar, in the markup itself.
+    let validate_pos = html.find("id=\"step-validate\"").unwrap();
+    let preflight_pos = html.find("id=\"step-preflight\"").unwrap();
+    let dryrun_pos = html.find("id=\"step-dryrun\"").unwrap();
+    let publish_pos = html.find("id=\"step-publish\"").unwrap();
+    assert!(validate_pos < preflight_pos && preflight_pos < dryrun_pos);
+    assert!(dryrun_pos < publish_pos);
+    // The button is wired to its handler.
+    let script = read_source("/ui/app.js");
+    assert!(script.contains("el(\"preflight-button\").addEventListener(\"click\", onPreflight)"));
+}
+
+#[test]
+fn preflight_requires_validation_and_unlocks_dry_run() {
+    let script = read_source("/ui/app.js");
+    // The publish flow gained its own preflight state.
+    assert!(script.contains("preflightReady"));
+    // Gate 1: Preflight requires a current validation.
+    let can_preflight = script
+        .split("function canPreflight()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "!state.busy",
+        "state.validated",
+        "currentPath() === state.projectPath",
+    ] {
+        assert!(
+            can_preflight.contains(required),
+            "canPreflight needs {required}"
+        );
+    }
+    let handler = script
+        .split("async function onPreflight()")
+        .nth(1)
+        .expect("onPreflight must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(handler.contains("if (state.busy || !state.validated) return;"));
+    // Gate 2: a successful Preflight is what unlocks the Dry Run; a failed
+    // one keeps it locked. Publish still requires both preflight and dry-run.
+    let can_dry_run = script
+        .split("function canDryRun()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(can_dry_run.contains("state.preflightReady"));
+    assert!(can_dry_run.contains("state.validated"));
+    assert!(handler.contains("state.preflightReady = Boolean(outcome.ready)"));
+    let catch_block = handler.split("} catch (error) {").nth(1).unwrap();
+    assert!(catch_block.contains("state.preflightReady = false"));
+    assert!(
+        !catch_block.contains("state.dryRunReady = true"),
+        "a failed preflight must never unlock the Dry Run"
+    );
+    let can_publish = script
+        .split("function canPublish()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "state.validated",
+        "state.preflightReady",
+        "state.dryRunReady",
+    ] {
+        assert!(
+            can_publish.contains(required),
+            "canPublish needs {required}"
+        );
+    }
+    // The button recalculations route through the guards.
+    let refresh = script
+        .split("function refreshButtons()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(refresh.contains("el(\"preflight-button\").disabled = !canPreflight()"));
+    assert!(refresh.contains("el(\"dry-run-button\").disabled = !canDryRun()"));
+}
+
+#[test]
+fn preflight_invokes_only_preflight_and_keeps_the_flows_independent() {
+    let script = read_source("/ui/app.js");
+    let handler = script
+        .split("async function onPreflight()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(handler.contains("tauri.invoke(\"preflight_project\""));
+    for forbidden in [
+        "invoke(\"validate_project\"",
+        "publish_project",
+        "dry_run_project",
+        "recover_project",
+        "create_project_setup",
+        "get_credential_status",
+        "set_credential",
+        "delete_credential",
+        "credentialsState",
+    ] {
+        assert!(
+            !handler.contains(forbidden),
+            "preflight must never reference {forbidden}"
+        );
+    }
+    // Preflight never mutates the dry-run/recovery state itself.
+    assert!(!handler.contains("state.dryRunReady = true"));
+    assert!(!handler.contains("state.needsRecovery"));
+    // Same generation/stale discipline as every other pipeline handler.
+    assert!(handler.contains("beginOperation()"));
+    let await_pos = handler.find("await tauri.invoke").unwrap();
+    let guard_pos = handler.find("isCurrentOperation(").unwrap();
+    assert!(
+        await_pos < guard_pos,
+        "the generation check must follow the await"
+    );
+    let stale = "if (currentPath() !== projectPath) {\n      return;\n    }";
+    assert!(
+        handler.contains(stale),
+        "stale preflight results are ignored"
+    );
+    let stale_block = handler[handler.find("isCurrentOperation(").unwrap()..]
+        .split("return;")
+        .next()
+        .unwrap();
+    assert!(
+        !stale_block.contains("setBusy"),
+        "stale preflight never touches the busy state"
+    );
+    // Rendering is text-only.
+    let show = script
+        .split("function showPreflight(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(show.contains("outcome.issues"));
+    assert!(show.contains("textContent"));
+    assert!(!show.contains("innerHTML"));
+}
+
+#[test]
+fn preflight_is_invalidated_by_path_change_and_mode_switch() {
+    let script = read_source("/ui/app.js");
+    let path_handler = script
+        .split("function onProjectPathChanged()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "state.preflightReady = false",
+        "el(\"preflight-button\").disabled = true",
+        "hide(\"preflight-result\")",
+    ] {
+        assert!(
+            path_handler.contains(required),
+            "path change must contain {required}"
+        );
+    }
+    // A revalidation also restarts the preflight step for the same path.
+    let validate_handler = script
+        .split("async function onValidate()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(validate_handler.contains("state.preflightReady = false"));
+    assert!(validate_handler.contains("hide(\"preflight-result\")"));
+    // The wizard/credentials modes hide the preflight result with the rest
+    // of the publication flow.
+    let mode = script
+        .split("function setCreateMode(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(mode.contains("el(\"preflight-result\")"));
 }

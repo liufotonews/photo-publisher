@@ -15,7 +15,8 @@
 
 use publisher_desktop::commands::{
     AppInfo, CommandError, CreateProjectSetupOutcomeDto, CredentialStatusDto, DryRunOutcomeDto,
-    PublishOutcomeDto, RecoverOutcomeDto, ValidateConfigurationOutcomeDto, ValidateProjectOutcome,
+    PreflightOutcomeDto, PublishOutcomeDto, RecoverOutcomeDto, ValidateConfigurationOutcomeDto,
+    ValidateProjectOutcome,
 };
 use tauri::Emitter;
 
@@ -136,6 +137,17 @@ fn delete_credential(name: String) -> Result<(), CommandError> {
     publisher_desktop::commands::delete_credential(&name)
 }
 
+/// Runs the standalone preflight (Phase 7-F) — a synchronous, local-only
+/// precondition check delegated to the publisher-app use case (the
+/// credential store supplies only configured bits; nothing remote runs).
+#[tauri::command]
+fn preflight_project(
+    app_handle: tauri::AppHandle,
+    project_path: String,
+) -> Result<PreflightOutcomeDto, CommandError> {
+    publisher_desktop::commands::preflight_project(&project_path, &mut forward_events(&app_handle))
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(DesktopState)
@@ -149,7 +161,8 @@ fn main() {
             validate_project_configuration,
             get_credential_status,
             set_credential,
-            delete_credential
+            delete_credential,
+            preflight_project
         ])
         .run(tauri::generate_context!("tauri.conf.json"))
         .expect("error while running the Photo Publisher desktop application");

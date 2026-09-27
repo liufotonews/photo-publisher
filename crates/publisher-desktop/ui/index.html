@@ -34,12 +34,16 @@
             <span class="step-index">2</span>
             <span class="step-label">Validar</span>
           </li>
-          <li id="step-dryrun" class="step">
+          <li id="step-preflight" class="step">
             <span class="step-index">3</span>
+            <span class="step-label">Preflight</span>
+          </li>
+          <li id="step-dryrun" class="step">
+            <span class="step-index">4</span>
             <span class="step-label">Dry Run</span>
           </li>
           <li id="step-publish" class="step">
-            <span class="step-index">4</span>
+            <span class="step-index">5</span>
             <span class="step-label">Publicar</span>
           </li>
         </ol>
@@ -62,13 +66,14 @@
           <button id="config-validate-button" type="button" class="secondary">
             Validar configuração
           </button>
+          <button id="preflight-button" type="button" disabled>Executar Preflight</button>
           <button id="dry-run-button" type="button" disabled>Executar Dry Run</button>
           <button id="publish-button" type="button" disabled>Publicar</button>
         </div>
         <p class="hint">
-          O Publicar só fica disponível depois de validar o projeto e executar
-          um Dry Run com sucesso. Validar configuração é um diagnóstico da
-          configuração declarada — não altera o fluxo de publicação.
+          Valide o projeto, execute o Preflight (configuração e credenciais),
+          execute o Dry Run e só então publique. Validar configuração é um
+          diagnóstico estrutural — não altera o fluxo de publicação.
         </p>
       </section>
 
@@ -86,6 +91,12 @@
         <h2 id="configuration-result-title">Configuração</h2>
         <p id="config-status" class="status"></p>
         <ul id="config-issues" class="issue-list"></ul>
+      </section>
+
+      <section id="preflight-result" class="card result" hidden aria-live="polite">
+        <h2 id="preflight-result-title">Preflight</h2>
+        <p id="preflight-status" class="status"></p>
+        <ul id="preflight-issues" class="issue-list"></ul>
       </section>
 
       <section id="dry-run-result" class="card result" hidden aria-live="polite">

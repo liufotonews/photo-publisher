@@ -14,6 +14,7 @@ const tauriEvents = window.__TAURI__ ? window.__TAURI__.event : null;
 const state = {
   projectPath: "",
   validated: false,
+  preflightReady: false,
   dryRunReady: false,
   busy: false,
   needsRecovery: false,
@@ -49,7 +50,29 @@ function canPublish() {
   return (
     !state.busy &&
     state.validated &&
+    state.preflightReady &&
     state.dryRunReady &&
+    state.projectPath !== "" &&
+    currentPath() === state.projectPath
+  );
+}
+
+// O Dry Run exige um Preflight bem-sucedido do projeto atualmente validado;
+// o Preflight exige uma validação corrente. Ambos seguem o mesmo caminho.
+function canPreflight() {
+  return (
+    !state.busy &&
+    state.validated &&
+    state.projectPath !== "" &&
+    currentPath() === state.projectPath
+  );
+}
+
+function canDryRun() {
+  return (
+    !state.busy &&
+    state.validated &&
+    state.preflightReady &&
     state.projectPath !== "" &&
     currentPath() === state.projectPath
   );
@@ -69,7 +92,8 @@ function canRecover() {
 function refreshButtons() {
   el("validate-button").disabled = state.busy;
   el("config-validate-button").disabled = state.busy;
-  el("dry-run-button").disabled = state.busy || !state.validated;
+  el("preflight-button").disabled = !canPreflight();
+  el("dry-run-button").disabled = !canDryRun();
   el("publish-button").disabled = !canPublish();
   el("recover-button").disabled = !canRecover();
   // O passo ativo da sequência visual acompanha o estado corrente.
@@ -80,6 +104,7 @@ function setPipelineStep() {
   const steps = [
     "step-project",
     "step-validate",
+    "step-preflight",
     "step-dryrun",
     "step-publish",
   ];
@@ -94,12 +119,16 @@ function setPipelineStep() {
     active = "step-publish";
   } else if (label.includes("publica")) {
     active = "step-publish";
+  } else if (label.includes("Preflight")) {
+    active = "step-preflight";
   } else if (label.includes("Dry Run") || label.includes("dry")) {
     active = "step-dryrun";
   } else if (label.includes("Valid") || label.includes("valid")) {
     active = "step-validate";
-  } else if (state.validated && !state.dryRunReady) {
-    active = "step-validate";
+  } else if (state.validated && !state.preflightReady) {
+    active = "step-preflight";
+  } else if (state.preflightReady && !state.dryRunReady) {
+    active = "step-dryrun";
   } else if (state.dryRunReady) {
     active = "step-dryrun";
   }
@@ -182,6 +211,87 @@ function showConfigurationError(error) {
   el("config-status").textContent =
     error && error.message ? error.message : "Erro desconhecido.";
   el("config-issues").textContent = "";
+}
+
+// ---------------------------------------------------------------------------
+// Preflight (Phase 7-F)
+//
+// Verificação de pré-condições para uma tentativa de publicação: usa o
+// comando dedicado (que só lê bits de credencial, configuração e a pasta de
+// origem) e atualiza o estado `preflightReady`. É um passo explícito entre
+// Validar e Dry Run — nunca publica, nunca planeia, nunca executa nada
+// remoto.
+// ---------------------------------------------------------------------------
+
+function showPreflight(outcome) {
+  el("preflight-result").hidden = false;
+  el("preflight-result-title").textContent = "Preflight";
+  const list = el("preflight-issues");
+  // Limpa via textContent: nenhum HTML é gerado a partir de dados externos.
+  list.textContent = "";
+  if (outcome.ready) {
+    el("preflight-status").textContent =
+      outcome.schema_version === 2
+        ? "✓ Pronto para publicação integrada."
+        : "✓ Pronto para publicação local.";
+    return;
+  }
+  el("preflight-status").textContent =
+    "⚠ Não é possível continuar até corrigir o assinalado.";
+  for (const issue of outcome.issues) {
+    const item = document.createElement("li");
+    item.textContent = `${issue.field}: ${issue.message}`;
+    list.appendChild(item);
+  }
+}
+
+function showPreflightError(error) {
+  el("preflight-result").hidden = false;
+  el("preflight-result-title").textContent = "Preflight";
+  el("preflight-status").textContent =
+    error && error.message ? error.message : "Erro desconhecido.";
+  el("preflight-issues").textContent = "";
+}
+
+async function onPreflight() {
+  if (state.busy || !state.validated) return;
+  const projectPath = state.projectPath;
+  if (!projectPath || currentPath() !== projectPath) return;
+  const generation = beginOperation();
+  state.preflightReady = false;
+  hide("preflight-result");
+  setBusy(true, "A executar Preflight…");
+  try {
+    const outcome = await tauri.invoke("preflight_project", { projectPath });
+    // Mesma disciplina de stale/ABA dos outros handlers: uma resposta antiga
+    // não toca o estado atual.
+    if (currentPath() !== projectPath) {
+      return;
+    }
+    if (state.projectPath !== projectPath) {
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
+      return;
+    }
+    state.preflightReady = Boolean(outcome.ready);
+    showPreflight(outcome);
+    setBusy(
+      false,
+      outcome.ready ? "Preflight concluído." : "Preflight requer correções."
+    );
+    el("dry-run-button").disabled = !canDryRun();
+  } catch (error) {
+    if (currentPath() !== projectPath) {
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
+      return;
+    }
+    state.preflightReady = false;
+    showPreflightError(error);
+    setBusy(false, "Falha no Preflight.");
+  }
 }
 
 async function onValidateConfiguration() {
@@ -435,6 +545,11 @@ async function onValidate() {
   hide("publish-result");
   state.validated = false;
   state.dryRunReady = false;
+  // Uma nova validação invalida sempre o Preflight anterior: a sequência
+  // volta a exigir Validar → Preflight → Dry Run para este caminho.
+  state.preflightReady = false;
+  hide("preflight-result");
+  el("preflight-button").disabled = true;
   el("dry-run-button").disabled = true;
   el("publish-button").disabled = true;
   state.projectPath = projectPath;
@@ -458,7 +573,8 @@ async function onValidate() {
     state.validated = Boolean(outcome.valid);
     showValidation(outcome);
     setBusy(false, "Projeto válido.");
-    el("dry-run-button").disabled = !state.validated;
+    el("preflight-button").disabled = !canPreflight();
+    el("dry-run-button").disabled = !canDryRun();
     el("publish-button").disabled = !canPublish();
   } catch (error) {
     if (currentPath() !== projectPath) {
@@ -591,12 +707,15 @@ function onProjectPathChanged() {
   state.needsRecovery = false;
   hide("recover-result");
   hide("recover-section");
+  state.preflightReady = false;
   state.dryRunReady = false;
   state.projectPath = "";
+  el("preflight-button").disabled = true;
   el("dry-run-button").disabled = true;
   el("publish-button").disabled = true;
   hide("project-result");
   hide("configuration-result");
+  hide("preflight-result");
   hide("dry-run-result");
   hide("publish-result");
   // The superseded operation is no longer current: the UI frees its busy
@@ -875,6 +994,7 @@ function setCreateMode(active) {
   document.querySelector('[aria-labelledby="project-section-title"]').hidden = active;
   el("project-result").hidden = active;
   el("configuration-result").hidden = active;
+  el("preflight-result").hidden = active;
   el("dry-run-result").hidden = active;
   el("publish-result").hidden = active;
   el("recover-section").hidden = active;
@@ -888,6 +1008,7 @@ function setCreateMode(active) {
 async function main() {
   el("validate-button").addEventListener("click", onValidate);
   el("config-validate-button").addEventListener("click", onValidateConfiguration);
+  el("preflight-button").addEventListener("click", onPreflight);
   el("dry-run-button").addEventListener("click", onDryRun);
   el("publish-button").addEventListener("click", onPublish);
   el("recover-button").addEventListener("click", onRecover);
