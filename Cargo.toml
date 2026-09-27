@@ -15,4 +15,7 @@ members = [
     "crates/provider-github",
     "crates/provider-r2",
     "crates/provider-vercel",
+    "crates/provisioner-github",
+    "crates/provisioner-r2",
+    "crates/provisioner-vercel",
 ]

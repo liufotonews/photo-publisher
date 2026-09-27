@@ -75,3 +75,65 @@ pub trait DomainProvisioner {
         credentials: &dyn CredentialStore,
     ) -> ProvisioningResult<ProvisioningOutcome<DomainIdentity>>;
 }
+
+/// The explicit non-implementation of domain provisioning (Phase 7-H).
+///
+/// The project currently has no DNS-management or domain-attachment
+/// abstraction to build on, and inventing one would mean inventing an
+/// unbacked API. This provisioner makes the absence *explicit and safe*:
+/// every call deterministically returns
+/// [`ProvisioningErrorKind::Unsupported`] without any network, credential,
+/// or filesystem interaction.
+pub struct UnsupportedDomainProvisioner;
+
+impl DomainProvisioner for UnsupportedDomainProvisioner {
+    fn provision_domain(
+        &mut self,
+        _config: &DomainProvisionConfig,
+        _credentials: &dyn CredentialStore,
+    ) -> ProvisioningResult<ProvisioningOutcome<DomainIdentity>> {
+        Err(ProvisioningError::new(
+            ProvisioningErrorKind::Unsupported,
+            "domain provisioning is not supported by this application version (no DNS/domain backend exists)",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use photo_publisher_provider_contracts::ProviderResult;
+
+    struct NoCredentials;
+
+    impl CredentialStore for NoCredentials {
+        fn get(&self, _name: &str) -> ProviderResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn set(&mut self, _name: &str, _secret: &[u8]) -> ProviderResult<()> {
+            unimplemented!("unsupported provisioning never stores credentials")
+        }
+        fn delete(&mut self, _name: &str) -> ProviderResult<()> {
+            unimplemented!("unsupported provisioning never deletes credentials")
+        }
+    }
+
+    #[test]
+    fn domain_provisioning_is_explicitly_and_deterministically_unsupported() {
+        let mut provisioner = UnsupportedDomainProvisioner;
+        let config = DomainProvisionConfig::new("galeria.exemplo.com").unwrap();
+        let credentials = NoCredentials;
+        let error = provisioner
+            .provision_domain(&config, &credentials)
+            .unwrap_err();
+        assert_eq!(error.kind, ProvisioningErrorKind::Unsupported);
+        // Deterministic, public-safe message: hostname is configuration,
+        // never a credential — and the message carries nothing beyond the
+        // rule itself.
+        assert!(error.to_string().contains("not supported"));
+        assert!(!error.to_string().contains("galeria.exemplo.com"));
+        let mut again = UnsupportedDomainProvisioner;
+        let repeated = again.provision_domain(&config, &credentials).unwrap_err();
+        assert_eq!(repeated.kind, error.kind);
+    }
+}

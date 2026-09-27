@@ -1,0 +1,16 @@
+[package]
+name = "publisher-provisioner-r2"
+version = "0.1.0"
+edition = "2021"
+description = "Cloudflare R2 StorageProvisioner for Photo Publisher (bucket infrastructure only, never objects)."
+
+[dependencies]
+publisher-provisioning = { path = "../provisioning" }
+photo-publisher-provider-contracts = { path = "../provider-contracts" }
+aws-config = "1"
+aws-sdk-s3 = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+mockito = "1"
+
