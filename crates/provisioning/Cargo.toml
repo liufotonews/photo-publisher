@@ -1,0 +1,8 @@
+[package]
+name = "publisher-provisioning"
+version = "0.1.0"
+edition = "2021"
+description = "Formal provisioning contracts for Photo Publisher (traits only, no implementations)."
+
+[dependencies]
+photo-publisher-provider-contracts = { path = "../provider-contracts" }

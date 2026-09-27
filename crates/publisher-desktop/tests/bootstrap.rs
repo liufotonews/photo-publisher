@@ -1038,6 +1038,35 @@ fn preflight_project_is_registered_and_a_pure_adapter() {
 }
 
 #[test]
+fn desktop_registers_no_provisioning_surface_in_this_phase() {
+    // Phase 7-G introduces contracts only: the desktop must not depend on
+    // the provisioning crate and must not register any provisioning command.
+    let manifest = read_source("/Cargo.toml");
+    assert!(
+        !manifest.contains("publisher-provisioning"),
+        "the desktop crate must not depend on publisher-provisioning"
+    );
+    let main = read_source("/src/main.rs");
+    let commands = read_source("/src/commands.rs");
+    let composition = read_source("/src/composition.rs");
+    for source in [&main, &commands, &composition] {
+        for forbidden in [
+            "publisher_provisioning",
+            "Provisioner",
+            "provision_repository",
+            "provision_storage",
+            "provision_hosting",
+            "provision_domain",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "desktop surface must not reference {forbidden} in this phase"
+            );
+        }
+    }
+}
+
+#[test]
 fn needs_recovery_unlocks_recovery_but_blocked_never_does() {
     let script = read_source("/ui/app.js");
     let html = read_source("/ui/index.html");

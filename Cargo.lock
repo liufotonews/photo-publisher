@@ -4153,6 +4153,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "publisher-provisioning"
+version = "0.1.0"
+dependencies = [
+ "photo-publisher-provider-contracts",
+]
+
+[[package]]
 name = "pulp"
 version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
