@@ -13,6 +13,7 @@ pub mod events;
 pub mod outcome;
 pub mod project;
 pub mod providers;
+pub mod provisioning;
 pub mod setup;
 pub mod setup_service;
 pub mod use_cases;
@@ -31,6 +32,10 @@ pub use project::{
     load_project_document, resolve_output_dir, resolve_source_dir, ProjectHandle, ProjectKind,
 };
 pub use providers::PublicationProviders;
+pub use provisioning::{
+    provision_project, ProvisionProjectReport, ProvisionedResource, ProvisioningFailure,
+    ProvisioningProviders,
+};
 pub use setup::{
     DomainSetup, GallerySetup, HostingSetup, ProjectIdentity, ProjectSetup, RepositorySetup,
     SourceSetup, StorageSetup, StorageTargetSetup,

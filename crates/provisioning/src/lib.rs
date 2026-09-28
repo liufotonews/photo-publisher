@@ -319,12 +319,13 @@ mod tests {
 
     #[test]
     fn publishing_layers_do_not_depend_on_the_provisioning_crate() {
-        // No existing crate may depend on (or even name) the provisioning
-        // contracts in this phase: Setup ≠ Provisioning ≠ Publishing.
+        // No publishing-side crate may depend on (or even name) the
+        // provisioning contracts. The single sanctioned consumer is
+        // `publisher-app`, which hosts the Phase 7-I application service —
+        // and even there the dependency is the contracts crate alone.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for member in [
             "crates/contract-validator",
-            "crates/publisher-app",
             "crates/publisher-cli",
             "crates/publisher-core",
             "crates/publisher-desktop",
@@ -363,5 +364,14 @@ mod tests {
                 }
             }
         }
+
+        // The one seam that MAY exist: publisher-app depends on the
+        // contracts crate only — never on a concrete provisioner.
+        let app_manifest =
+            std::fs::read_to_string(root.join("crates/publisher-app/Cargo.toml")).unwrap();
+        assert!(
+            !app_manifest.contains("publisher-provisioner-"),
+            "publisher-app must never depend on a concrete provisioner"
+        );
     }
 }

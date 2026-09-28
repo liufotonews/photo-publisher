@@ -18,6 +18,10 @@ pub enum ApplicationErrorKind {
     Validation,
     Publication,
     Recovery,
+    /// A failure of the explicit provisioning operation (Phase 7-I). This is
+    /// deliberately NOT the `Publication` kind: provisioning is a separate
+    /// boundary, and mislabeling it would misreport which operation failed.
+    Provisioning,
     Internal,
 }
 
@@ -30,6 +34,7 @@ impl ApplicationErrorKind {
             Self::Validation => "validation",
             Self::Publication => "publication_failed",
             Self::Recovery => "recovery_failed",
+            Self::Provisioning => "provisioning_failed",
             Self::Internal => "internal",
         }
     }

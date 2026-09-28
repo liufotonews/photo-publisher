@@ -449,6 +449,9 @@ fn map_app_error(error: publisher_app::ApplicationError) -> CliError {
         publisher_app::ApplicationErrorKind::Validation => ErrorKind::Validation,
         publisher_app::ApplicationErrorKind::Publication => ErrorKind::Publication,
         publisher_app::ApplicationErrorKind::Recovery => ErrorKind::Recovery,
+        // Provisioning never runs through the CLI today; the arm exists so
+        // the mapping stays total. Existing exit codes are untouched.
+        publisher_app::ApplicationErrorKind::Provisioning => ErrorKind::Internal,
         publisher_app::ApplicationErrorKind::Internal => ErrorKind::Internal,
     };
     CliError::new(kind, error.to_string())
