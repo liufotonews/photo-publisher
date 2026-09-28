@@ -2281,3 +2281,158 @@ fn preflight_rerun_invalidates_the_previous_dry_run() {
         .unwrap();
     assert!(can_publish.contains("state.dryRunReady"));
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7-J concurrency fix — backend-exclusive provisioning slot
+//
+// The UI can free its busy flag while a provisioning worker is still
+// running (a path change invalidates the current operation), so JavaScript
+// can never be the real exclusion. These structural tests pin the binary
+// wiring: Tauri-managed gate, atomic acquisition BEFORE any blocking work,
+// immediate refusal that runs nothing, and a permit that only the worker's
+// completion can release.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn provisioning_exclusion_is_managed_state_acquired_before_the_blocking_work() {
+    let main = read_source("/src/main.rs");
+    // The gate is registered as Tauri-managed state at bootstrap.
+    assert!(
+        main.contains(".manage(ProvisioningGate::new())"),
+        "the gate must be registered as managed state"
+    );
+    let wrapper = main
+        .split("async fn provision_project")
+        .nth(1)
+        .expect("the provisioning wrapper must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // Acquisition precedes the blocking task...
+    let acquire = wrapper
+        .find("try_acquire()")
+        .expect("the wrapper must acquire the gate");
+    let spawn = wrapper
+        .find("spawn_blocking")
+        .expect("the wrapper must run the work in a blocking task");
+    assert!(
+        acquire < spawn,
+        "the slot must be acquired before any blocking work is queued"
+    );
+    // ...and the refusal is immediate: it returns before anything is queued.
+    let refusal = wrapper
+        .find("provisioning_busy_failure()")
+        .expect("the refusal must be the dedicated busy failure");
+    assert!(refusal < spawn, "a refused attempt must not queue any work");
+    // The refusal branch is a pure return: no command, no runner, no spawn.
+    let refusal_block = wrapper[wrapper.find("else {").unwrap()..]
+        .split('}')
+        .next()
+        .unwrap();
+    for forbidden in [
+        "provision_project",
+        "provision_exclusive",
+        "spawn_blocking",
+        "build_provisioners",
+    ] {
+        assert!(
+            !refusal_block.contains(forbidden),
+            "the refusal must never reference {forbidden}"
+        );
+    }
+    assert!(refusal_block.contains("return Err"));
+    assert!(refusal_block.contains("provisioning_busy_failure()"));
+}
+
+#[test]
+fn the_permit_covers_the_whole_blocking_execution_and_only_the_worker_releases_it() {
+    let main = read_source("/src/main.rs");
+    let wrapper = main
+        .split("async fn provision_project")
+        .nth(1)
+        .expect("the provisioning wrapper must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // The acquired permit moves INTO the blocking worker and is handed to
+    // the exclusive runner, so the slot stays held for the entire
+    // execution and is released exactly when the worker finishes.
+    let exclusive_call = wrapper
+        .split("provision_exclusive(")
+        .nth(1)
+        .expect("the wrapper must run the work through the exclusive runner");
+    assert!(
+        exclusive_call.contains("permit,"),
+        "the permit must move into the exclusive runner"
+    );
+    assert!(
+        exclusive_call.contains("publisher_desktop::commands::provision_project"),
+        "the work must be the provisioning command"
+    );
+    // The wrapper itself never releases the slot: exactly one acquisition
+    // point, and no explicit drop of the permit outside the worker.
+    assert_eq!(
+        wrapper.matches("try_acquire()").count(),
+        1,
+        "exactly one acquisition point exists"
+    );
+    assert!(
+        !wrapper.contains("drop(permit"),
+        "the wrapper must never release the slot itself"
+    );
+}
+
+#[test]
+fn the_exclusive_slot_is_a_permit_released_only_by_the_worker_completion() {
+    // Library side of the contract: the gate is managed-state friendly, the
+    // permit is a data-free RAII token whose drop is the single release
+    // point, the exclusive runner holds it for its whole body, and the
+    // refusal is pure fixed data.
+    let commands = read_source("/src/commands.rs");
+    for required in [
+        "pub struct ProvisioningGate",
+        "pub struct ProvisioningPermit",
+        "impl Drop for ProvisioningPermit",
+        "pub fn try_acquire",
+        "pub fn provision_exclusive",
+        "pub fn provisioning_busy_failure",
+        "pub const PROVISIONING_BUSY_KIND",
+    ] {
+        assert!(
+            commands.contains(required),
+            "the gate must define {required}"
+        );
+    }
+    // The runner holds the permit for its whole body and only then drops it.
+    let runner = commands
+        .split("pub fn provision_exclusive")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(runner.contains("let _held = permit;"));
+    assert!(runner.contains("work(project_path)"));
+    // The refusal constructs pure data only: no provisioner, no application
+    // service, no environment, no path.
+    let refusal = commands
+        .split("pub fn provisioning_busy_failure")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "provision_project(",
+        "build_provisioners",
+        "std::env",
+        "reqwest",
+        "project_path",
+    ] {
+        assert!(
+            !refusal.contains(forbidden),
+            "the refusal must not reference {forbidden}"
+        );
+    }
+    assert!(refusal.contains("PROVISIONING_BUSY_KIND"));
+}

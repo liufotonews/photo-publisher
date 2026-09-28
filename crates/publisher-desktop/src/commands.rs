@@ -8,6 +8,12 @@
 //! The functions deliberately carry no `#[tauri::command]` macro: the library
 //! stays free of the Tauri runtime (so tests link nothing webview-related),
 //! and the desktop binary registers thin wrappers for each of them.
+//!
+//! Besides the adapters, this module hosts the provisioning exclusion
+//! primitive (Phase 7-J concurrency fix): a gate whose single slot is
+//! registered as Tauri-managed state, acquired atomically before any
+//! blocking work is queued, and released only when that work finishes.
+//! The UI's busy flag stays presentation-only; this is the real exclusion.
 
 use publisher_app::events::EventSink;
 use serde::Serialize;
@@ -495,6 +501,130 @@ pub struct ProvisionProjectFailureDto {
     pub kind: String,
     pub message: String,
     pub report: Box<ProvisionProjectOutcomeDto>,
+}
+
+// ---------------------------------------------------------------------------
+// Provisioning exclusion (Phase 7-J concurrency fix)
+//
+// The UI releases its busy flag whenever the project path changes — but a
+// provisioning already running in a blocking worker keeps running. The busy
+// flag is therefore presentation only: real exclusion lives HERE, in the
+// desktop backend, as Tauri-managed state. One slot exists per application:
+// acquired atomically before any work is queued, held for the whole blocking
+// execution, and released only by the worker finishing (success or error). A
+// stale UI result can never release it, because the UI never reaches it.
+// ---------------------------------------------------------------------------
+
+/// Stable desktop classification of the concurrent-provisioning refusal.
+/// This is deliberately not an application-layer failure kind: the refused
+/// run never started, so nothing failed — the backend is saying "one
+/// provisioning at a time".
+pub const PROVISIONING_BUSY_KIND: &str = "provisioning_busy";
+
+/// Tauri-managed exclusive slot for provisioning (Phase 7-J).
+///
+/// Registered once by the desktop bootstrap as managed state and never
+/// recreated afterwards. The flag is `true` while exactly one provisioning
+/// is running anywhere in the application. The inner mutex guards only the
+/// instant check-and-set of [`ProvisioningGate::try_acquire`] and the
+/// instant reset of the permit's drop — it is never held across any
+/// provisioning work, so a second attempt can never wait on the running
+/// operation: it is answered immediately.
+#[derive(Debug, Default)]
+pub struct ProvisioningGate {
+    slot: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+/// A live acquisition of [`ProvisioningGate`].
+///
+/// Owning this value is what "a provisioning is running" means. It owns its
+/// share of the slot (so it can move into the blocking worker) and releases
+/// on drop — the ONLY release path, which happens exactly when the worker
+/// holding it finishes, with success or error. The value carries no data:
+/// no path, no credentials, no results.
+#[derive(Debug)]
+pub struct ProvisioningPermit {
+    slot: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+impl ProvisioningGate {
+    /// One free slot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Atomically acquires the single provisioning slot.
+    ///
+    /// `Some(permit)`: the caller now exclusively owns provisioning until
+    /// the permit drops. `None`: a provisioning is already running and this
+    /// attempt is refused immediately — no waiting, no provisioner
+    /// construction, no application service call. The check-and-set runs
+    /// under the slot mutex, which is held only for that instant.
+    pub fn try_acquire(&self) -> Option<ProvisioningPermit> {
+        let mut busy = Self::lock_slot(&self.slot);
+        if *busy {
+            return None;
+        }
+        *busy = true;
+        Some(ProvisioningPermit {
+            slot: std::sync::Arc::clone(&self.slot),
+        })
+    }
+
+    /// Locks the slot flag. Poisoning could only originate in a panic
+    /// inside the instant check-and-set/reset sections; the flag carries no
+    /// invariant a panic could corrupt, so recovering the guard is always
+    /// the correct (and deadlock-free) choice.
+    fn lock_slot(slot: &std::sync::Mutex<bool>) -> std::sync::MutexGuard<'_, bool> {
+        slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for ProvisioningPermit {
+    /// The single release point: the worker finished (its closure dropped
+    /// this permit), so the slot becomes free for the next provisioning.
+    fn drop(&mut self) {
+        *ProvisioningGate::lock_slot(&self.slot) = false;
+    }
+}
+
+/// The immediate refusal returned when a provisioning is attempted while
+/// another one is still running.
+///
+/// Pure fixed data: a stable kind, one public sentence, and an empty report
+/// — nothing ran, so nothing completed. No path, no environment name, and
+/// no secret material can ever appear here, because the refusal consults
+/// nothing.
+pub fn provisioning_busy_failure() -> ProvisionProjectFailureDto {
+    ProvisionProjectFailureDto {
+        kind: PROVISIONING_BUSY_KIND.to_owned(),
+        message:
+            "a provisioning operation is already in progress; wait for it to finish before starting another"
+                .to_owned(),
+        report: Box::new(ProvisionProjectOutcomeDto::default()),
+    }
+}
+
+/// Runs one provisioning attempt holding the exclusively acquired slot
+/// (Phase 7-J concurrency fix).
+///
+/// The permit crosses by value: it stays alive for the entire body — the
+/// acquisition covers the whole blocking execution — and drops exactly when
+/// `work` returns, with success or error, which is the only moment the slot
+/// is released. `work` is the command adapter (the Tauri wrapper passes
+/// [`provision_project`]); it is a parameter so the exclusion contract can
+/// be tested without providers or network reach. A refused attempt never
+/// reaches this function at all: without a permit there is nothing to run.
+pub fn provision_exclusive<F>(
+    permit: ProvisioningPermit,
+    project_path: &str,
+    work: F,
+) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto>
+where
+    F: FnOnce(&str) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto>,
+{
+    let _held = permit;
+    work(project_path)
 }
 
 /// Runs the explicit infrastructure provisioning for a project (Phase 7-J).
@@ -1257,5 +1387,267 @@ mod tests {
         }
         // Deterministic serialization.
         assert_eq!(json, serde_json::to_string(&report).unwrap());
+    }
+
+    // --- Provisioning exclusion (Phase 7-J concurrency fix) ------------------
+    //
+    // The desktop backend — not the JavaScript — enforces "one provisioning
+    // at a time". The tests exercise the exact wrapper shape: acquire the
+    // single slot atomically, run the work holding the permit, and release
+    // only when the work finishes.
+
+    /// Mirrors the Tauri wrapper's acquire-then-run shape, so the tests
+    /// exercise the same composition the binary performs.
+    fn gated_attempt(
+        gate: &ProvisioningGate,
+        project_path: &str,
+        work: impl FnOnce(&str) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto>,
+    ) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto> {
+        match gate.try_acquire() {
+            Some(permit) => provision_exclusive(permit, project_path, work),
+            None => Err(provisioning_busy_failure()),
+        }
+    }
+
+    fn sample_outcome() -> ProvisionProjectOutcomeDto {
+        ProvisionProjectOutcomeDto {
+            project_id: "joao-maria-2026".to_owned(),
+            ..ProvisionProjectOutcomeDto::default()
+        }
+    }
+
+    #[test]
+    fn second_provisioning_is_rejected_while_the_first_is_active() {
+        let gate = ProvisioningGate::new();
+        // The first provisioning acquires the slot — from this moment the
+        // refusal is already in force, before its blocking worker even
+        // starts, exactly like the queued worker of the desktop runtime.
+        let permit = gate
+            .try_acquire()
+            .expect("the first provisioning must acquire the slot");
+        assert!(
+            gate.try_acquire().is_none(),
+            "a second attempt must be refused before the worker starts"
+        );
+
+        // The first provisioning runs in a worker thread and stays
+        // mid-"remote call" until the test lets it finish.
+        let (resume, hold) = std::sync::mpsc::channel::<()>();
+        let (started, started_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            provision_exclusive(permit, "first", move |_| {
+                hold.recv().unwrap(); // the remote provisioning is still running
+                Ok(sample_outcome())
+            })
+        });
+        started_rx.recv().unwrap();
+
+        // While the first provisioning is active, the second is refused
+        // immediately, with the fixed busy DTO — not a worker result.
+        let failure = gated_attempt(&gate, "second", |_| Ok(sample_outcome()))
+            .expect_err("an active provisioning must block a second one");
+        assert_eq!(failure.kind, PROVISIONING_BUSY_KIND);
+        assert_eq!(*failure.report, ProvisionProjectOutcomeDto::default());
+
+        // Let the first provisioning finish: the slot is released exactly
+        // when its worker completes, with success.
+        resume.send(()).unwrap();
+        let first = worker
+            .join()
+            .unwrap()
+            .expect("the first provisioning completed successfully");
+        assert_eq!(first.project_id, "joao-maria-2026");
+
+        // After the first finished, the slot is free and a new provisioning
+        // runs normally — end to end.
+        let second_run = gated_attempt(&gate, "second", |_| Ok(sample_outcome()))
+            .expect("a new provisioning must run after the previous one finishes");
+        assert_eq!(second_run.project_id, "joao-maria-2026");
+    }
+
+    #[test]
+    fn the_refused_attempt_never_calls_the_application_service() {
+        let gate = ProvisioningGate::new();
+        // The first provisioning is active: its permit is alive.
+        let _active = gate.try_acquire().expect("the first attempt acquires");
+
+        // The refusal is the fixed busy DTO — NOT the outcome the real
+        // command would have produced (a v1 project answers project_invalid
+        // through the application service). Observing the busy kind proves
+        // the service was never invoked for the refused attempt.
+        let root = tempdir().unwrap();
+        let v1 = write_project(root.path());
+        let failure = gated_attempt(&gate, v1.to_str().unwrap(), provision_project)
+            .expect_err("the second attempt must be refused");
+        assert_eq!(failure.kind, PROVISIONING_BUSY_KIND);
+        assert_eq!(*failure.report, ProvisionProjectOutcomeDto::default());
+
+        // A counting seam confirms the same for the generic work: a refusal
+        // never runs anything.
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let counted = {
+            let calls = std::sync::Arc::clone(&calls);
+            move |_: &str| {
+                *calls.lock().unwrap() += 1;
+                Ok(sample_outcome())
+            }
+        };
+        let again = gated_attempt(&gate, "second", counted).expect_err("still refused");
+        assert_eq!(again.kind, PROVISIONING_BUSY_KIND);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            0,
+            "no work may run for a refused attempt"
+        );
+    }
+
+    #[test]
+    fn the_slot_is_released_after_a_successful_run() {
+        let gate = ProvisioningGate::new();
+        let outcome = gated_attempt(&gate, "project", |_| Ok(sample_outcome()))
+            .expect("the first run succeeds");
+        assert_eq!(outcome.project_id, "joao-maria-2026");
+        // The worker finished successfully: the slot is free again...
+        assert!(
+            gate.try_acquire().is_some(),
+            "the slot must be free after a successful run"
+        );
+        // ...and a full new provisioning runs normally.
+        assert!(
+            gated_attempt(&gate, "project", |_| Ok(sample_outcome())).is_ok(),
+            "a new provisioning must run after the previous one finishes"
+        );
+    }
+
+    #[test]
+    fn the_slot_is_released_after_a_failed_run() {
+        let gate = ProvisioningGate::new();
+        let failure = gated_attempt(&gate, "project", |_| {
+            Err(ProvisionProjectFailureDto {
+                kind: "provisioning_failed".to_owned(),
+                message: "simulated provisioning failure".to_owned(),
+                report: Box::new(sample_outcome()),
+            })
+        })
+        .expect_err("the run fails");
+        assert_eq!(failure.kind, "provisioning_failed");
+        // The worker finished with an error: the slot is free again.
+        assert!(
+            gate.try_acquire().is_some(),
+            "the slot must be free after a failed run"
+        );
+    }
+
+    #[test]
+    fn the_slot_is_released_after_the_real_command_fails_before_any_network() {
+        // The real production composition: the work is the actual command,
+        // which fails at the application layer before any remote call (the
+        // project document is missing). The slot must free on that error.
+        let gate = ProvisioningGate::new();
+        let root = tempdir().unwrap();
+        let missing = root.path().join("project.json");
+        let failure = gated_attempt(&gate, missing.to_str().unwrap(), provision_project)
+            .expect_err("the real command must fail on a missing document");
+        assert_eq!(failure.kind, "resource_missing");
+        assert!(
+            gate.try_acquire().is_some(),
+            "the slot must be free after the real command errored"
+        );
+    }
+
+    #[test]
+    fn stale_results_never_release_the_slot() {
+        let gate = ProvisioningGate::new();
+        let _active = gate
+            .try_acquire()
+            .expect("the first provisioning is active");
+        // Everything the UI side can do with a stale result — receive it,
+        // render it, discard it unread — operates on plain data. None of it
+        // can touch the slot: the permit is unreachable from any result, so
+        // the slot stays held.
+        let stale_ok =
+            Ok::<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto>(sample_outcome());
+        let stale_refusal = provisioning_busy_failure();
+        let _ = format!("{stale_ok:?} {stale_refusal:?}");
+        let _ = serde_json::to_string(&stale_refusal).unwrap();
+        drop(stale_ok);
+        drop(stale_refusal);
+        assert!(
+            gate.try_acquire().is_none(),
+            "stale results can never release the slot"
+        );
+        // Only the worker finishing releases it — the guarantee the UI
+        // staleness guard could never provide on its own.
+        drop(_active);
+        assert!(
+            gate.try_acquire().is_some(),
+            "the worker finishing releases the slot"
+        );
+    }
+
+    #[test]
+    fn acquisition_is_atomic_exactly_one_attempt_wins_across_threads() {
+        // Eight concurrent attempts race for the single slot; the barrier
+        // guarantees nobody releases before every attempt has happened, so
+        // the outcome is deterministic: exactly one winner.
+        const ATTEMPTS: usize = 8;
+        let gate = std::sync::Arc::new(ProvisioningGate::new());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(ATTEMPTS));
+        let wins = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let mut threads = Vec::new();
+        for _ in 0..ATTEMPTS {
+            let gate = std::sync::Arc::clone(&gate);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let wins = std::sync::Arc::clone(&wins);
+            threads.push(std::thread::spawn(move || {
+                let permit = gate.try_acquire();
+                barrier.wait(); // every attempt has now happened; nobody released yet
+                if let Some(permit) = permit {
+                    drop(permit); // release only after all attempts completed
+                    *wins.lock().unwrap() += 1;
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            *wins.lock().unwrap(),
+            1,
+            "exactly one concurrent attempt may acquire the slot"
+        );
+        // And after the winner released, the slot works again.
+        assert!(gate.try_acquire().is_some());
+    }
+
+    #[test]
+    fn the_busy_refusal_carries_no_sensitive_information() {
+        let failure = provisioning_busy_failure();
+        assert_eq!(failure.kind, PROVISIONING_BUSY_KIND);
+        // The refusal consults nothing: no path is read, no environment
+        // name is touched, so nothing sensitive can leak into it.
+        let json = serde_json::to_string(&failure).unwrap();
+        for needle in [
+            "PHOTO_PUBLISHER_",
+            "token",
+            "secret",
+            "password",
+            "c:\\",
+            "http",
+        ] {
+            assert!(
+                !json.to_lowercase().contains(needle),
+                "the refusal must not carry {needle}: {json}"
+            );
+        }
+        // Deterministic: the refusal is the same fixed data every time.
+        assert_eq!(
+            json,
+            serde_json::to_string(&provisioning_busy_failure()).unwrap()
+        );
+        // Nothing ran: the report is empty and the message is public text.
+        assert_eq!(*failure.report, ProvisionProjectOutcomeDto::default());
+        assert!(!failure.message.is_empty());
     }
 }
