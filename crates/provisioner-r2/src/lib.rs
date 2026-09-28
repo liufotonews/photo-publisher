@@ -2,21 +2,21 @@
 //!
 //! Bucket infrastructure only: this provisioner checks whether the bucket
 //! exists and creates it when it does not. It never uploads, lists, reads,
-//! or deletes objects Ã¢â‚¬â€ buckets are infrastructure; objects are Publishing
+//! or deletes objects — buckets are infrastructure; objects are Publishing
 //! (`provider-r2`), and this crate neither imports nor calls any of it.
 //!
 //! Endpoint semantics (deterministic; creation is single-shot):
 //!
 //! ```text
 //! HEAD bucket
-//!   200 Ã¢â€ â€™ Unchanged (existing and compatible by construction: the desired
+//!   200 -> Unchanged (existing and compatible by construction: the desired
 //!         state declared today is only the bucket's existence)
-//!   404 Ã¢â€ â€™ creation path
+//!   404 -> creation path
 //! PUT bucket
-//!   200 Ã¢â€ â€™ Created
-//!   BucketAlreadyOwnedByYou Ã¢â€ â€™ Unchanged (the deterministic race outcome Ã¢â‚¬â€
+//!   200 -> Created
+//!   BucketAlreadyOwnedByYou -> Unchanged (the deterministic race outcome:
 //!   the bucket is ours and compatible, exactly the idempotent contract)
-//!   BucketAlreadyExists (someone else's namespace) Ã¢â€ â€™ Conflict
+//!   BucketAlreadyExists (someone else's namespace) -> Conflict
 //! ```
 
 use aws_config::{retry::RetryConfig, BehaviorVersion};
@@ -49,7 +49,7 @@ impl R2StorageProvisioner {
         Self::build(None)
     }
 
-    /// Endpoint override Ã¢â‚¬â€ used by the offline tests.
+    /// Endpoint override — used by the offline tests.
     pub fn with_endpoint_url(endpoint: impl Into<String>) -> ProvisioningResult<Self> {
         Self::build(Some(endpoint.into()))
     }
@@ -94,10 +94,14 @@ impl R2StorageProvisioner {
         }
     }
 
+    /// Builds one S3 client with the *given* retry policy. The policy is a
+    /// deliberate per-operation-class choice: callers pass a bounded retry
+    /// for reads and [`RetryConfig::disabled`] for creation.
     fn client(
         &self,
         config: &StorageProvisionConfig,
         credentials: &dyn CredentialStore,
+        retry: RetryConfig,
     ) -> ProvisioningResult<Client> {
         let access_key = Self::credential(credentials, ACCESS_KEY_NAME, "R2 access key")?;
         let secret_key = Self::credential(credentials, SECRET_KEY_NAME, "R2 secret key")?;
@@ -108,10 +112,7 @@ impl R2StorageProvisioner {
         let shared = self.runtime.block_on(async move {
             aws_config::defaults(BehaviorVersion::latest())
                 .region(Region::new("auto"))
-                // Creation is single-shot (a PUT misread must never be
-                // resent blindly); the head check is a read, so a bounded
-                // retry is honest Ã¢â‚¬â€ the SDK already classifies failures.
-                .retry_config(RetryConfig::standard().with_max_attempts(2))
+                .retry_config(retry)
                 .credentials_provider(Credentials::new(
                     access_key,
                     secret_key,
@@ -152,7 +153,7 @@ impl R2StorageProvisioner {
             _ => ProvisioningErrorKind::Internal,
         };
         // The SDK error embeds response payloads; nothing of it may cross
-        // this boundary Ã¢â‚¬â€ only the mapped kind and a fixed public message.
+        // this boundary — only the mapped kind and a fixed public message.
         ProvisioningError::new(kind, "the R2 bucket operation failed")
     }
 }
@@ -163,21 +164,33 @@ impl StorageProvisioner for R2StorageProvisioner {
         config: &StorageProvisionConfig,
         credentials: &dyn CredentialStore,
     ) -> ProvisioningResult<ProvisioningOutcome<StorageIdentity>> {
-        let client = self.client(config, credentials)?;
+        // Read client: bounded retry is acceptable for `head_bucket`.
+        let read_client = self.client(
+            config,
+            credentials,
+            RetryConfig::standard().with_max_attempts(2),
+        )?;
         let bucket = config.bucket.clone();
         let head = self
             .runtime
-            .block_on(client.head_bucket().bucket(&bucket).send());
+            .block_on(read_client.head_bucket().bucket(&bucket).send());
         match head {
             Ok(_) => return Ok(ProvisioningOutcome::Unchanged(config.identity())),
-            Err(SdkError::ServiceError(service)) if service.raw().status().as_u16() == 404 => {}
-            // 404 Ã¢â€¡â€™ the bucket does not exist: creation path below.
+            Err(SdkError::ServiceError(service)) if service.raw().status().as_u16() == 404 => {
+                // 404 => the bucket does not exist: creation path below.
+            }
             Err(error) => return Err(Self::map_sdk_error(&error)),
         }
 
+        // Creation client: retry DISABLED. An ambiguous answer (timeout,
+        // reset, lost response) may mean the bucket WAS created server-side;
+        // the creation call must never be resent automatically. The caller
+        // receives a classified error and may simply re-run the whole
+        // provisioning — the race-safe mappings below keep that idempotent.
+        let create_client = self.client(config, credentials, RetryConfig::disabled())?;
         let create = self
             .runtime
-            .block_on(client.create_bucket().bucket(&bucket).send());
+            .block_on(create_client.create_bucket().bucket(&bucket).send());
         match create {
             Ok(_) => Ok(ProvisioningOutcome::Created(config.identity())),
             Err(SdkError::ServiceError(service)) => {
@@ -313,6 +326,58 @@ mod tests {
     }
 
     #[test]
+    fn create_bucket_is_truly_single_shot_even_when_the_answer_is_ambiguous() {
+        // THE microfix invariant: a transient failure during CreateBucket
+        // (500, timeout, reset...) may mean the bucket was created anyway,
+        // so the SDK must not automatically resend it. The mock fails hard
+        // if a second creation call ever arrives.
+        let mut server = Server::new();
+        server.mock("HEAD", Matcher::Any).with_status(404).create();
+        let create = server
+            .mock("PUT", Matcher::Any)
+            .with_status(500)
+            .expect(1) // any retry would make this assertion explode
+            .create();
+        let mut provisioner = provisioner(&server);
+        let error = provisioner
+            .provision_storage(&config(), &credentials_full())
+            .unwrap_err();
+        assert_eq!(error.kind, ProvisioningErrorKind::Network);
+        create.assert();
+    }
+
+    #[test]
+    fn head_may_retry_but_creation_never_does() {
+        // Reads keep their bounded retry: first HEAD answers 500, second
+        // answers 200, so the bucket turns out to exist and no creation call
+        // is ever made.
+        let mut server = Server::new();
+        let head = server
+            .mock("HEAD", Matcher::Any)
+            .with_status(500)
+            .expect(1)
+            .create();
+        let head_ok = server
+            .mock("HEAD", Matcher::Any)
+            .with_status(200)
+            .expect(1)
+            .create();
+        let never_created = server
+            .mock("PUT", Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create();
+        let mut provisioner = provisioner(&server);
+        let outcome = provisioner
+            .provision_storage(&config(), &credentials_full())
+            .unwrap();
+        assert_eq!(outcome.status().as_str(), "unchanged");
+        head.assert();
+        head_ok.assert();
+        never_created.assert();
+    }
+
+    #[test]
     fn missing_credentials_fail_before_any_http_call() {
         let server = Server::new();
         let mut provisioner = provisioner(&server);
@@ -365,7 +430,7 @@ mod tests {
     #[test]
     fn sdk_timeouts_are_network_errors_not_conflicts() {
         // A 5xx from the endpoint maps to Network (transient), never to
-        // Conflict (a misleading "divergence") Ã¢â‚¬â€ ambiguity stays honest.
+        // Conflict (a misleading "divergence") — ambiguity stays honest.
         let mut server = Server::new();
         server
             .mock("HEAD", Matcher::Any)
@@ -381,7 +446,7 @@ mod tests {
 
     #[test]
     fn the_provisioner_never_touches_publishing_surfaces() {
-        // Structural proof: bucket infrastructure only Ã¢â‚¬â€ no object verbs,
+        // Structural proof: bucket infrastructure only — no object verbs,
         // no publishing traits, no application layers.
         let source =
             std::fs::read_to_string(format!("{}/src/lib.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
@@ -407,5 +472,8 @@ mod tests {
                 "r2 provisioner must not reference {forbidden}"
             );
         }
+        // The single-shot rule is structural too: the creation path must
+        // select the disabled retry policy explicitly.
+        assert!(source.contains("RetryConfig::disabled()"));
     }
 }
