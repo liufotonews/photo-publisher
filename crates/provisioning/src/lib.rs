@@ -51,7 +51,9 @@ pub mod outcome;
 pub mod repository;
 pub mod storage;
 
-pub use domain::{DomainIdentity, DomainProvisionConfig, DomainProvisioner};
+pub use domain::{
+    DomainIdentity, DomainProvisionConfig, DomainProvisioner, UnsupportedDomainProvisioner,
+};
 pub use errors::{ProvisioningError, ProvisioningErrorKind, ProvisioningResult};
 pub use hosting::{HostingIdentity, HostingProvisionConfig, HostingProvisioner};
 pub use outcome::{ProvisioningOutcome, ProvisioningStatus};
@@ -320,15 +322,15 @@ mod tests {
     #[test]
     fn publishing_layers_do_not_depend_on_the_provisioning_crate() {
         // No publishing-side crate may depend on (or even name) the
-        // provisioning contracts. The single sanctioned consumer is
-        // `publisher-app`, which hosts the Phase 7-I application service —
-        // and even there the dependency is the contracts crate alone.
+        // provisioning contracts. The single sanctioned consumers are
+        // `publisher-app` (the Phase 7-I application service) and
+        // `publisher-desktop` (the Phase 7-J composition root that wires the
+        // concrete provisioners). Everything publishing-side stays sealed.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for member in [
             "crates/contract-validator",
             "crates/publisher-cli",
             "crates/publisher-core",
-            "crates/publisher-desktop",
             "crates/publisher-integration",
             "crates/publisher-pipeline",
             "crates/provider-contracts",

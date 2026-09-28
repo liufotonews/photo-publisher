@@ -25,6 +25,10 @@ photo-publisher-provider-contracts = { path = "../provider-contracts" }
 photo-publisher-provider-github = { path = "../provider-github" }
 photo-publisher-provider-r2 = { path = "../provider-r2" }
 photo-publisher-provider-vercel = { path = "../provider-vercel" }
+publisher-provisioning = { path = "../provisioning" }
+publisher-provisioner-github = { path = "../provisioner-github" }
+publisher-provisioner-r2 = { path = "../provisioner-r2" }
+publisher-provisioner-vercel = { path = "../provisioner-vercel" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = "2"

@@ -203,6 +203,13 @@ button.primary:not(:disabled) {
   color: var(--muted);
 }
 
+/* Provisioning (Phase 7-J). */
+.result-inline {
+  border-left: 4px solid var(--border-strong);
+  padding-left: 12px;
+  margin-top: 12px;
+}
+
 .summary {
   margin: 0;
   display: grid;

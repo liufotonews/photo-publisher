@@ -93,6 +93,27 @@
         <ul id="config-issues" class="issue-list"></ul>
       </section>
 
+      <!-- Infraestrutura (Phase 7-J): ação explícita e separada de Publicar.
+           Provisionar cria/reconcilia a infraestrutura declarada; nunca
+           publica conteúdo. -->
+      <section id="provision-section" class="card" aria-labelledby="provision-title">
+        <h2 id="provision-title">Infraestrutura</h2>
+        <p class="hint">
+          Provisionar cria ou reconcilia a infraestrutura do projeto
+          (repositório, armazenamento, hosting, domínio) — uma ação explícita,
+           independente da publicação.
+        </p>
+        <div class="actions">
+          <button id="provision-button" type="button" class="secondary" disabled>
+            Provisionar infraestrutura
+          </button>
+        </div>
+        <div id="provision-result" class="result-inline" hidden>
+          <p id="provision-status" class="status"></p>
+          <ul id="provision-resources" class="issue-list"></ul>
+        </div>
+      </section>
+
       <section id="preflight-result" class="card result" hidden aria-live="polite">
         <h2 id="preflight-result-title">Preflight</h2>
         <p id="preflight-status" class="status"></p>

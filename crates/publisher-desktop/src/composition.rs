@@ -104,6 +104,69 @@ pub fn credential_store() -> EnvironmentCredentialStore {
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Concrete provisioners constructed for the explicit provisioning action
+/// (Phase 7-J). The composition root owns them; the application layer only
+/// ever sees the contract traits, through
+/// [`DesktopProvisioners::as_provisioning_providers`].
+///
+/// Provisioning ≠ Publishing: these types create/reconcile infrastructure;
+/// they never write content and are never invoked by any publication path.
+/// Construction is pure — no remote call happens here; credentials are read
+/// per operation by the provisioners themselves through the store below.
+pub struct DesktopProvisioners {
+    repository: publisher_provisioner_github::GitHubRepositoryProvisioner,
+    storage: publisher_provisioner_r2::R2StorageProvisioner,
+    hosting: publisher_provisioner_vercel::VercelHostingProvisioner,
+    domain: publisher_provisioning::UnsupportedDomainProvisioner,
+    credentials: EnvironmentCredentialStore,
+}
+
+impl DesktopProvisioners {
+    /// Borrows the concrete provisioners as the provider-neutral structure
+    /// the application layer consumes.
+    pub fn as_provisioning_providers(&mut self) -> publisher_app::ProvisioningProviders<'_> {
+        publisher_app::ProvisioningProviders {
+            repository: &mut self.repository,
+            storage: &mut self.storage,
+            hosting: &mut self.hosting,
+            domain: &mut self.domain,
+            credentials: &self.credentials,
+        }
+    }
+}
+
+/// Constructs the concrete provisioners. No remote call happens here;
+/// constructors only validate their local, non-secret settings.
+pub fn build_provisioners() -> Result<DesktopProvisioners, ApplicationError> {
+    let repository =
+        publisher_provisioner_github::GitHubRepositoryProvisioner::new().map_err(|error| {
+            ApplicationError::new(
+                ApplicationErrorKind::Internal,
+                format!("failed to construct the repository provisioner: {error}"),
+            )
+        })?;
+    let storage = publisher_provisioner_r2::R2StorageProvisioner::new().map_err(|error| {
+        ApplicationError::new(
+            ApplicationErrorKind::Internal,
+            format!("failed to construct the storage provisioner: {error}"),
+        )
+    })?;
+    let hosting =
+        publisher_provisioner_vercel::VercelHostingProvisioner::new().map_err(|error| {
+            ApplicationError::new(
+                ApplicationErrorKind::Internal,
+                format!("failed to construct the hosting provisioner: {error}"),
+            )
+        })?;
+    Ok(DesktopProvisioners {
+        repository,
+        storage,
+        hosting,
+        domain: publisher_provisioning::UnsupportedDomainProvisioner,
+        credentials: EnvironmentCredentialStore,
+    })
+}
+
 /// Enforces the provider matrix supported by this phase, using only the raw
 /// validated project document. Unknown providers are rejected before any
 /// configuration object, credential read, or provider is constructed.
@@ -476,6 +539,20 @@ mod tests {
         // Building twice is deterministic in error surface too.
         let configuration2 = preflight_publication(&document, &project_path).unwrap();
         assert_eq!(configuration.project_id, configuration2.project_id.clone());
+        clear_credentials();
+    }
+
+    #[test]
+    fn composition_builds_provisioners_without_remote_calls_or_credentials() {
+        // Provisioning composition: constructors are pure wiring only — no
+        // HTTP, no credential read, nothing remote. The credential store is
+        // the same existing environment-backed boundary.
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_credentials();
+        let mut provisioners = build_provisioners().unwrap();
+        let _providers = provisioners.as_provisioning_providers();
+        // Building twice is side-effect free too.
+        let _again = build_provisioners().unwrap();
         clear_credentials();
     }
 

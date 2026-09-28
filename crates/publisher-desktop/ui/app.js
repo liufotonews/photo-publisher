@@ -14,6 +14,7 @@ const tauriEvents = window.__TAURI__ ? window.__TAURI__.event : null;
 const state = {
   projectPath: "",
   validated: false,
+  configReady: false,
   preflightReady: false,
   dryRunReady: false,
   busy: false,
@@ -78,6 +79,19 @@ function canDryRun() {
   );
 }
 
+// Provisionar exige projeto atual validado E configuração coerente (7-D),
+// nenhuma operação em curso e nenhum recovery pendente. Nunca é automático.
+function canProvision() {
+  return (
+    !state.busy &&
+    state.validated &&
+    state.configReady &&
+    state.projectPath !== "" &&
+    currentPath() === state.projectPath &&
+    !state.needsRecovery
+  );
+}
+
 // Recovery is reachable only after a publish result says "needs_recovery"
 // for the path currently displayed and nothing else is running.
 function canRecover() {
@@ -92,6 +106,7 @@ function canRecover() {
 function refreshButtons() {
   el("validate-button").disabled = state.busy;
   el("config-validate-button").disabled = state.busy;
+  el("provision-button").disabled = !canProvision();
   el("preflight-button").disabled = !canPreflight();
   el("dry-run-button").disabled = !canDryRun();
   el("publish-button").disabled = !canPublish();
@@ -253,6 +268,103 @@ function showPreflightError(error) {
   el("preflight-issues").textContent = "";
 }
 
+// ---------------------------------------------------------------------------
+// Provisioning (Phase 7-J)
+//
+// Ação explícita, separada de Publicar: chama o comando dedicado e mostra o
+// relatório por recurso. Depois de provisionar (sucesso ou falha parcial),
+// a infraestrutura pode ter mudado — por isso qualquer resultado operacional
+// anterior (Preflight/Dry Run) fica inválido e Publicar continua desligado
+// até o fluxo ser refeito. O estado fica na disciplina habitual de
+// geração/ABA; nenhuma informação sensível é renderizada.
+// ---------------------------------------------------------------------------
+
+const PROVISION_RESOURCE_LABELS = {
+  repository: "Repositório",
+  storage: "Armazenamento",
+  hosting: "Hosting",
+  domain: "Domínio",
+};
+
+const PROVISION_STATUS_LABELS = {
+  created: "criado",
+  unchanged: "inalterado",
+  configured: "configurado",
+  changed: "alterado",
+};
+
+function renderProvisionResources(container, report) {
+  container.textContent = "";
+  for (const key of ["repository", "storage", "hosting", "domain"]) {
+    const entry = report ? report[key] : null;
+    if (!entry) continue;
+    const item = document.createElement("li");
+    const label = PROVISION_RESOURCE_LABELS[key] || key;
+    const status = PROVISION_STATUS_LABELS[entry.status] || entry.status;
+    item.textContent = `${label}: ${status} (${entry.identity})`;
+    container.appendChild(item);
+  }
+}
+
+function showProvision(outcome) {
+  el("provision-result").hidden = false;
+  el("provision-status").textContent = "✓ Infraestrutura provisionada.";
+  renderProvisionResources(el("provision-resources"), outcome);
+  el("provision-result").classList.add("ok");
+}
+
+function showProvisionError(error) {
+  el("provision-result").hidden = false;
+  el("provision-status").textContent =
+    error && error.message ? error.message : "Erro desconhecido.";
+  // Falha parcial: o relatório embutido preserva o que concluiu antes.
+  renderProvisionResources(el("provision-resources"), error ? error.report : null);
+  el("provision-result").classList.add("attention");
+}
+
+async function onProvision() {
+  if (!canProvision()) return;
+  const projectPath = state.projectPath;
+  const generation = beginOperation();
+  hide("provision-result");
+  el("provision-result").classList.remove("ok");
+  el("provision-result").classList.remove("attention");
+  setBusy(true, "A provisionar infraestrutura…");
+  try {
+    const outcome = await tauri.invoke("provision_project", { projectPath });
+    // Mesma disciplina de stale/ABA dos outros handlers: uma resposta antiga
+    // não toca o estado atual.
+    if (currentPath() !== projectPath) {
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
+      return;
+    }
+    showProvision(outcome);
+    // A infraestrutura mudou: Preflight/Dry Run anteriores deixam de valer
+    // e Publicar continua bloqueado até refazer o fluxo.
+    state.preflightReady = false;
+    state.dryRunReady = false;
+    hide("preflight-result");
+    hide("dry-run-result");
+    hide("publish-result");
+    setBusy(false, "Provisionamento concluído.");
+  } catch (error) {
+    if (currentPath() !== projectPath) {
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
+      return;
+    }
+    showProvisionError(error);
+    // Mesmo na falha parcial a infraestrutura pode ter mudado: invalida-se
+    // o mesmo que no sucesso.
+    state.preflightReady = false;
+    state.dryRunReady = false;
+    setBusy(false, "Falha no provisionamento.");
+  }
+}
+
 async function onPreflight() {
   if (state.busy || !state.validated) return;
   const projectPath = state.projectPath;
@@ -317,6 +429,7 @@ async function onValidateConfiguration() {
       return;
     }
     showConfiguration(outcome);
+    state.configReady = Boolean(outcome.valid);
     setBusy(
       false,
       outcome.valid
@@ -330,6 +443,7 @@ async function onValidateConfiguration() {
     if (!isCurrentOperation(generation, projectPath)) {
       return;
     }
+    state.configReady = false;
     showConfigurationError(error);
     setBusy(false, "Erro na validação da configuração.");
   }
@@ -549,9 +663,13 @@ async function onValidate() {
   hide("publish-result");
   state.validated = false;
   state.dryRunReady = false;
-  // Uma nova validação invalida sempre o Preflight anterior: a sequência
-  // volta a exigir Validar → Preflight → Dry Run para este caminho.
+  // Uma nova validação invalida configuração e Preflight anteriores: a
+  // sequência volta a exigir Validar → Configuração → Preflight para este
+  // caminho (e Provisionar fica travado até lá).
   state.preflightReady = false;
+  state.configReady = false;
+  hide("provision-result");
+  el("provision-button").disabled = true;
   hide("preflight-result");
   el("preflight-button").disabled = true;
   el("dry-run-button").disabled = true;
@@ -713,12 +831,15 @@ function onProjectPathChanged() {
   hide("recover-section");
   state.preflightReady = false;
   state.dryRunReady = false;
+  state.configReady = false;
   state.projectPath = "";
+  el("provision-button").disabled = true;
   el("preflight-button").disabled = true;
   el("dry-run-button").disabled = true;
   el("publish-button").disabled = true;
   hide("project-result");
   hide("configuration-result");
+  hide("provision-result");
   hide("preflight-result");
   hide("dry-run-result");
   hide("publish-result");
@@ -998,6 +1119,7 @@ function setCreateMode(active) {
   document.querySelector('[aria-labelledby="project-section-title"]').hidden = active;
   el("project-result").hidden = active;
   el("configuration-result").hidden = active;
+  el("provision-section").hidden = active;
   el("preflight-result").hidden = active;
   el("dry-run-result").hidden = active;
   el("publish-result").hidden = active;
@@ -1012,6 +1134,7 @@ function setCreateMode(active) {
 async function main() {
   el("validate-button").addEventListener("click", onValidate);
   el("config-validate-button").addEventListener("click", onValidateConfiguration);
+  el("provision-button").addEventListener("click", onProvision);
   el("preflight-button").addEventListener("click", onPreflight);
   el("dry-run-button").addEventListener("click", onDryRun);
   el("publish-button").addEventListener("click", onPublish);

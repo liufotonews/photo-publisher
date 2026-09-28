@@ -448,6 +448,93 @@ pub fn delete_credential(name: &str) -> Result<(), CommandError> {
     Ok(())
 }
 
+/// One provisioned resource, ready for presentation: the contractual
+/// disposition (`created` / `unchanged` / `configured` / `changed`) plus
+/// the stable public identity. Never secrets, never provider payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProvisionedResourceDto {
+    pub status: String,
+    pub identity: String,
+}
+
+fn resource_dto(resource: &publisher_app::ProvisionedResource) -> ProvisionedResourceDto {
+    ProvisionedResourceDto {
+        status: resource.status.as_str().to_owned(),
+        identity: resource.identity.clone(),
+    }
+}
+
+/// The aggregated provisioning report (Phase 7-J) for the desktop UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ProvisionProjectOutcomeDto {
+    pub project_id: String,
+    pub project_name: String,
+    pub repository: Option<ProvisionedResourceDto>,
+    pub storage: Option<ProvisionedResourceDto>,
+    pub hosting: Option<ProvisionedResourceDto>,
+    pub domain: Option<ProvisionedResourceDto>,
+}
+
+fn report_dto(report: &publisher_app::ProvisionProjectReport) -> ProvisionProjectOutcomeDto {
+    ProvisionProjectOutcomeDto {
+        project_id: report.project_id.clone(),
+        project_name: report.project_name.clone(),
+        repository: report.repository.as_ref().map(resource_dto),
+        storage: report.storage.as_ref().map(resource_dto),
+        hosting: report.hosting.as_ref().map(resource_dto),
+        domain: report.domain.as_ref().map(resource_dto),
+    }
+}
+
+/// A provisioning failure (Phase 7-J): the application classification and
+/// safe message, plus the *partial* report — everything that completed
+/// before the failure stays visible; nothing was rolled back. The report is
+/// boxed so the `Result` of the command stays a small type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProvisionProjectFailureDto {
+    pub kind: String,
+    pub message: String,
+    pub report: Box<ProvisionProjectOutcomeDto>,
+}
+
+/// Runs the explicit infrastructure provisioning for a project (Phase 7-J).
+///
+/// Pure adapter: the composition root builds the concrete provisioners, the
+/// application service owns every rule, and this function only converts
+/// shapes. Never publishes, never plans, never reads a credential value.
+pub fn provision_project(
+    project_path: &str,
+) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto> {
+    let path = match check_path(project_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return Err(ProvisionProjectFailureDto {
+                kind: error.kind,
+                message: error.message,
+                report: Box::new(ProvisionProjectOutcomeDto::default()),
+            });
+        }
+    };
+    let mut provisioners = match crate::composition::build_provisioners() {
+        Ok(provisioners) => provisioners,
+        Err(error) => {
+            return Err(ProvisionProjectFailureDto {
+                kind: error.kind.as_str().to_owned(),
+                message: error.to_string(),
+                report: Box::new(ProvisionProjectOutcomeDto::default()),
+            });
+        }
+    };
+    match publisher_app::provision_project(&path, &mut provisioners.as_provisioning_providers()) {
+        Ok(report) => Ok(report_dto(&report)),
+        Err(failure) => Err(ProvisionProjectFailureDto {
+            kind: failure.error.kind.as_str().to_owned(),
+            message: failure.error.to_string(),
+            report: Box::new(report_dto(&failure.report)),
+        }),
+    }
+}
+
 /// One preflight precondition failure, ready for presentation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PreflightIssueDto {
@@ -998,7 +1085,6 @@ mod tests {
     // Environment-backed credential bits are required here, so these tests
     // serialize on the crate-wide ENV_LOCK and always restore the absent
     // state afterwards.
-
     fn set_all_credentials(value: &str) {
         for name in publisher_app::SUPPORTED_CREDENTIALS {
             set_credential(name, value.to_owned()).unwrap();
@@ -1069,5 +1155,107 @@ mod tests {
         let error = preflight_project(missing.to_str().unwrap(), &mut |_| {}).unwrap_err();
         assert_eq!(error.kind, "resource_missing");
         clear_all_credentials();
+    }
+
+    // --- Provisioning (Phase 7-J) --------------------------------------------
+    //
+    // The command itself is exercised only along paths that fail BEFORE any
+    // provisioner is constructed or any network is possible (the happy path
+    // would require real HTTP; it is covered at the application layer with
+    // stubs, and construction is covered in composition tests).
+
+    #[test]
+    fn provision_project_rejects_invalid_or_missing_documents_before_any_work() {
+        // NOTE: these paths fail before any provisioner is constructed or
+        // any network could happen — exactly what the adapter guarantees.
+        let error = provision_project("   ").unwrap_err();
+        assert_eq!(error.kind, "project_invalid");
+        assert!(error.report.repository.is_none());
+        assert!(error.report.project_id.is_empty());
+
+        let root = tempdir().unwrap();
+        let missing = root.path().join("project.json");
+        let error = provision_project(missing.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.kind, "resource_missing");
+        assert!(error.report.repository.is_none());
+    }
+
+    #[test]
+    fn provision_project_rejects_v1_and_incoherent_configs_without_network() {
+        let root = tempdir().unwrap();
+        // v1: local-only contract — provisioning is an explicit No here.
+        let v1 = write_project(root.path());
+        let error = provision_project(v1.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.kind, "project_invalid");
+        assert!(error.report.repository.is_none());
+
+        // Coherent shape but an unsupported provider: stopped at level 2.
+        let root2 = tempdir().unwrap();
+        let v2 = write_coherent_v2_project(root2.path());
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&v2).unwrap()).unwrap();
+        document["hosting"]["provider"] = serde_json::Value::String("other-host".to_owned());
+        std::fs::write(&v2, serde_json::to_vec(&document).unwrap()).unwrap();
+        let error = provision_project(v2.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.kind, "validation");
+        assert!(error.report.hosting.is_none());
+    }
+
+    #[test]
+    fn partial_failure_reports_keep_the_completed_prefix() {
+        // report_dto is the pure adapter; a partial application report maps
+        // to the same partial DTO — the completed prefix is preserved, the
+        // rest stays absent.
+        let report = publisher_app::ProvisionProjectReport {
+            project_id: "joao-maria-2026".to_owned(),
+            repository: Some(publisher_app::ProvisionedResource {
+                status: publisher_provisioning::ProvisioningStatus::Created,
+                identity: "fotografo/joao-maria-2026".to_owned(),
+            }),
+            storage: Some(publisher_app::ProvisionedResource {
+                status: publisher_provisioning::ProvisioningStatus::Unchanged,
+                identity: "account-example/fotografia".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let dto = report_dto(&report);
+        assert_eq!(dto.project_id, "joao-maria-2026");
+        assert_eq!(dto.repository.unwrap().status, "created");
+        assert_eq!(dto.storage.unwrap().status, "unchanged");
+        assert!(dto.hosting.is_none());
+        assert!(dto.domain.is_none());
+    }
+
+    #[test]
+    fn provisioning_dto_maps_every_disposition_and_never_carries_secrets() {
+        let report = ProvisionProjectOutcomeDto {
+            project_id: "p".to_owned(),
+            project_name: "n".to_owned(),
+            repository: Some(ProvisionedResourceDto {
+                status: "created".to_owned(),
+                identity: "fotografo/joao-maria-2026".to_owned(),
+            }),
+            storage: Some(ProvisionedResourceDto {
+                status: "unchanged".to_owned(),
+                identity: "account-example/fotografia".to_owned(),
+            }),
+            hosting: Some(ProvisionedResourceDto {
+                status: "configured".to_owned(),
+                identity: "joao-maria-2026".to_owned(),
+            }),
+            domain: Some(ProvisionedResourceDto {
+                status: "changed".to_owned(),
+                identity: "galeria.exemplo.com".to_owned(),
+            }),
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        for expected in ["created", "unchanged", "configured", "changed"] {
+            assert!(json.contains(expected), "DTO must carry {expected}");
+        }
+        for needle in ["PHOTO_PUBLISHER_", "secret", "token", "password"] {
+            assert!(!json.to_lowercase().contains(needle), "DTO leaked {needle}");
+        }
+        // Deterministic serialization.
+        assert_eq!(json, serde_json::to_string(&report).unwrap());
     }
 }

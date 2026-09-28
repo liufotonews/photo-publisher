@@ -15,8 +15,8 @@
 
 use publisher_desktop::commands::{
     AppInfo, CommandError, CreateProjectSetupOutcomeDto, CredentialStatusDto, DryRunOutcomeDto,
-    PreflightOutcomeDto, PublishOutcomeDto, RecoverOutcomeDto, ValidateConfigurationOutcomeDto,
-    ValidateProjectOutcome,
+    PreflightOutcomeDto, ProvisionProjectFailureDto, ProvisionProjectOutcomeDto, PublishOutcomeDto,
+    RecoverOutcomeDto, ValidateConfigurationOutcomeDto, ValidateProjectOutcome,
 };
 use tauri::Emitter;
 
@@ -148,6 +148,28 @@ fn preflight_project(
     publisher_desktop::commands::preflight_project(&project_path, &mut forward_events(&app_handle))
 }
 
+/// Runs the explicit provisioning action (Phase 7-J). Like publication, it
+/// performs remote work, so it shares the exact same boundary: synchronous
+/// business logic in `commands::provision_project`, async only here at the
+/// Tauri wrapper. The application layer emits no provisioning events today,
+/// so there is nothing to forward — the result DTO is the whole report.
+#[tauri::command]
+async fn provision_project(
+    project_path: String,
+) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        publisher_desktop::commands::provision_project(&project_path)
+    })
+    .await
+    .map_err(|_| ProvisionProjectFailureDto {
+        kind: publisher_app::ApplicationErrorKind::Internal
+            .as_str()
+            .to_owned(),
+        message: "provisioning task failed to join".to_owned(),
+        report: Box::new(ProvisionProjectOutcomeDto::default()),
+    })?
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(DesktopState)
@@ -162,7 +184,8 @@ fn main() {
             get_credential_status,
             set_credential,
             delete_credential,
-            preflight_project
+            preflight_project,
+            provision_project
         ])
         .run(tauri::generate_context!("tauri.conf.json"))
         .expect("error while running the Photo Publisher desktop application");

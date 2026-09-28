@@ -398,7 +398,7 @@ fn command_layer_contains_no_provider_or_network_wiring() {
 }
 
 #[test]
-fn binary_registers_exactly_the_eleven_commands_and_the_single_channel() {
+fn binary_registers_exactly_the_twelve_commands_and_the_single_channel() {
     // The Tauri binary is the only place that may touch `tauri`; the command
     // set and the event channel feed must remain exactly what this phase
     // specifies. Line endings are normalized (CI checkouts on Windows use
@@ -429,7 +429,8 @@ fn binary_registers_exactly_the_eleven_commands_and_the_single_channel() {
             "get_credential_status",
             "set_credential",
             "delete_credential",
-            "preflight_project"
+            "preflight_project",
+            "provision_project"
         ]
     );
     assert!(source.contains("publisher_desktop::events::PUBLISHER_EVENT_CHANNEL"));
@@ -500,13 +501,15 @@ fn publish_v2_without_credentials_fails_before_any_remote_effect() {
 fn publication_boundary_is_async_only_at_the_tauri_wrapper() {
     let source = read_source("/src/main.rs").replace("\r\n", "\n");
     assert!(source.contains("async fn publish_project"));
+    assert!(source.contains("async fn provision_project"));
     assert!(source.contains("tauri::async_runtime::spawn_blocking"));
     assert!(source.contains("fn validate_project("));
     assert!(source.contains("fn dry_run_project("));
     assert!(source.contains("fn get_app_info("));
-    // Exactly one async point exists: the publish wrapper.
-    assert_eq!(source.matches("async fn").count(), 1);
-    assert_eq!(source.matches("spawn_blocking").count(), 1);
+    // Exactly two async points exist, both doing remote work: the publish
+    // wrapper and the provisioning wrapper. Everything else stays synchronous.
+    assert_eq!(source.matches("async fn").count(), 2);
+    assert_eq!(source.matches("spawn_blocking").count(), 2);
 }
 
 #[test]
@@ -520,6 +523,7 @@ fn the_library_stays_synchronous() {
     // The synchronous application use cases are still the delegations.
     assert!(commands.contains("publisher_app::publish_project"));
     assert!(commands.contains("publisher_app::dry_run_project"));
+    assert!(commands.contains("publisher_app::provision_project"));
 }
 
 #[test]
@@ -787,7 +791,8 @@ fn recover_project_is_registered_and_remains_a_pure_adapter() {
             "get_credential_status",
             "set_credential",
             "delete_credential",
-            "preflight_project"
+            "preflight_project",
+            "provision_project"
         ]
     );
     // The desktop command layer delegates to the application use case.
@@ -828,7 +833,7 @@ fn create_project_setup_is_registered_and_a_pure_adapter() {
         .filter(|n| !n.is_empty())
         .collect();
     assert!(names.contains(&"create_project_setup"));
-    assert_eq!(names.len(), 11);
+    assert_eq!(names.len(), 12);
     let commands = read_source("/src/commands.rs");
     assert!(commands.contains("publisher_app::create_project_setup"));
     assert!(commands.contains("pub struct CreateProjectSetupOutcomeDto"));
@@ -1038,32 +1043,72 @@ fn preflight_project_is_registered_and_a_pure_adapter() {
 }
 
 #[test]
-fn desktop_registers_no_provisioning_surface_in_this_phase() {
-    // Phase 7-G introduces contracts only: the desktop must not depend on
-    // the provisioning crate and must not register any provisioning command.
-    let manifest = read_source("/Cargo.toml");
-    assert!(
-        !manifest.contains("publisher-provisioning"),
-        "the desktop crate must not depend on publisher-provisioning"
-    );
+fn desktop_provisioning_lives_only_in_the_adapter_and_composition() {
+    // Phase 7-J wired provisioning into the desktop: the composition root
+    // builds the four concrete provisioners, the command layer delegates to
+    // the application service, and nothing else touches them. The publish
+    // path stays free of provisioning.
     let main = read_source("/src/main.rs");
+    assert!(main.contains("provision_project"));
     let commands = read_source("/src/commands.rs");
-    let composition = read_source("/src/composition.rs");
-    for source in [&main, &commands, &composition] {
-        for forbidden in [
-            "publisher_provisioning",
-            "Provisioner",
-            "provision_repository",
-            "provision_storage",
-            "provision_hosting",
-            "provision_domain",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "desktop surface must not reference {forbidden} in this phase"
-            );
-        }
+    assert!(commands.contains("crate::composition::build_provisioners"));
+    assert!(commands.contains("publisher_app::provision_project"));
+    let body = commands
+        .split("pub fn provision_project")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "publish_project(",
+        "dry_run_project(",
+        "recover_project(",
+        "create_project_setup(",
+        "validate_project_configuration(",
+        "preflight_project(",
+        "GitHubRepositoryProvisioner",
+        "R2StorageProvisioner",
+        "VercelHostingProvisioner",
+        "EnvironmentCredentialStore",
+        "std::env",
+        "reqwest",
+        ".publish(",
+        ".put(",
+        ".commit(",
+        ".delete(",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "provision_project command must not contain {forbidden}"
+        );
     }
+    // The composition root is the single place naming the concrete backends.
+    let composition = read_source("/src/composition.rs");
+    for required in [
+        "GitHubRepositoryProvisioner",
+        "R2StorageProvisioner",
+        "VercelHostingProvisioner",
+        "UnsupportedDomainProvisioner",
+        "as_provisioning_providers",
+    ] {
+        assert!(
+            composition.contains(required),
+            "composition must wire {required}"
+        );
+    }
+    // Publish never provisions: the publish command body keeps its boundary.
+    let publish = commands
+        .split("pub fn publish_project")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(
+        !publish.contains("provision_project"),
+        "publish must never call provisioning"
+    );
 }
 
 #[test]
@@ -1960,6 +2005,217 @@ fn preflight_is_invalidated_by_path_change_and_mode_switch() {
         .next()
         .unwrap();
     assert!(mode.contains("el(\"preflight-result\")"));
+    assert!(mode.contains("el(\"provision-section\")"));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7-J — Desktop Provisioning UX
+// ---------------------------------------------------------------------------
+
+#[test]
+fn provisioning_section_exists_as_an_explicit_separate_action() {
+    let html = read_source("/ui/index.html");
+    for id in [
+        "id=\"provision-section\"",
+        "id=\"provision-title\"",
+        "id=\"provision-button\"",
+        "id=\"provision-result\"",
+        "id=\"provision-status\"",
+        "id=\"provision-resources\"",
+    ] {
+        assert!(html.contains(id), "index.html must contain {id}");
+    }
+    // Explicitly labeled as infrastructure — never confused with publishing.
+    assert!(html.contains("Provisionar infraestrutura"));
+    let script = read_source("/ui/app.js");
+    assert!(script.contains("el(\"provision-button\").addEventListener(\"click\", onProvision)"));
+}
+
+#[test]
+fn provision_requires_valid_configuration_and_never_runs_automatically() {
+    let script = read_source("/ui/app.js");
+    // Preconditions: current validated project + coherent configuration +
+    // idle UI + no pending recovery + same path.
+    let guard = script
+        .split("function canProvision()")
+        .nth(1)
+        .expect("canProvision must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "!state.busy",
+        "state.validated",
+        "state.configReady",
+        "currentPath() === state.projectPath",
+        "!state.needsRecovery",
+    ] {
+        assert!(guard.contains(required), "canProvision needs {required}");
+    }
+    let handler = script
+        .split("async function onProvision()")
+        .nth(1)
+        .expect("onProvision must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(handler.contains("if (!canProvision()) return;"));
+    // The configuration check feeds configReady (and resets it on failure).
+    let config_handler = script
+        .split("async function onValidateConfiguration()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(config_handler.contains("state.configReady = Boolean(outcome.valid)"));
+    assert!(config_handler.contains("state.configReady = false"));
+    // Provision is invoked EXACTLY once across the whole UI: nothing else
+    // (validate, preflight, dry-run, publish, wizard, credentials) triggers it.
+    assert_eq!(script.matches("invoke(\"provision_project\"").count(), 1);
+}
+
+#[test]
+fn provision_invalidates_prior_publish_results_but_never_enables_publish() {
+    let script = read_source("/ui/app.js");
+    let handler = script
+        .split("async function onProvision()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // Success branch and failure branch both invalidate preflight/dry-run
+    // results (the infrastructure may haved changed in either case).
+    let success = handler
+        .split("showProvision(outcome);")
+        .nth(1)
+        .unwrap()
+        .split("} catch (error) {")
+        .next()
+        .unwrap();
+    assert!(success.contains("state.preflightReady = false"));
+    assert!(success.contains("state.dryRunReady = false"));
+    assert!(
+        !success.contains("publish-button\").disabled = false"),
+        "a successful provision must never re-enable Publish"
+    );
+    let failure = handler.split("} catch (error) {").nth(1).unwrap();
+    assert!(failure.contains("state.preflightReady = false"));
+    assert!(failure.contains("state.dryRunReady = false"));
+    // Publish continues to require validated + preflight + dry-run.
+    let can_publish = script
+        .split("function canPublish()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(can_publish.contains("state.preflightReady"));
+    assert!(can_publish.contains("state.dryRunReady"));
+}
+
+#[test]
+fn provision_rejects_stale_results_and_never_invokes_other_commands() {
+    let script = read_source("/ui/app.js");
+    let handler = script
+        .split("async function onProvision()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(handler.contains("tauri.invoke(\"provision_project\""));
+    for forbidden in [
+        "publish_project",
+        "dry_run_project",
+        "recover_project",
+        "create_project_setup",
+        "validate_project",
+        "preflight_project",
+        "get_credential_status",
+        "set_credential",
+        "delete_credential",
+        "credentialsState",
+    ] {
+        assert!(
+            !handler.contains(forbidden),
+            "provisioning must never reference {forbidden}"
+        );
+    }
+    // Generation/stale discipline identical to the other pipeline handlers.
+    assert!(handler.contains("beginOperation()"));
+    let await_pos = handler.find("await tauri.invoke").unwrap();
+    let guard_pos = handler.find("isCurrentOperation(").unwrap();
+    assert!(
+        await_pos < guard_pos,
+        "the generation check must follow the await"
+    );
+    let stale_block = handler[handler.find("isCurrentOperation(").unwrap()..]
+        .split("return;")
+        .next()
+        .unwrap();
+    assert!(
+        !stale_block.contains("setBusy"),
+        "stale provisioning never touches the busy state"
+    );
+    // Busy guard: generation is captured before the async boundary.
+    let busy_pos = handler.find("setBusy(true").unwrap();
+    assert!(handler.find("beginOperation()").unwrap() < busy_pos);
+}
+
+#[test]
+fn provision_renders_per_resource_results_without_secrets_or_html() {
+    let script = read_source("/ui/app.js");
+    let render = script
+        .split("function renderProvisionResources(")
+        .nth(1)
+        .expect("renderProvisionResources must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(render.contains("textContent"));
+    assert!(render.contains("appendChild"));
+    assert!(!render.contains("innerHTML"));
+    // All four resource keys are rendered when present; statuses are mapped
+    // from the contract vocabulary.
+    for key in ["repository", "storage", "hosting", "domain"] {
+        assert!(render.contains(key), "render must cover {key}");
+    }
+    for status in ["created", "unchanged", "configured", "changed"] {
+        assert!(script.contains(status), "status mapping must know {status}");
+    }
+    // Partial failure: the error rendering consumes the embedded report.
+    let error = script
+        .split("function showProvisionError(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(error.contains("error.report"));
+}
+
+#[test]
+fn path_change_invalidates_provisioning_too() {
+    let script = read_source("/ui/app.js");
+    let path_handler = script
+        .split("function onProjectPathChanged()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "state.configReady = false",
+        "el(\"provision-button\").disabled = true",
+        "hide(\"provision-result\")",
+    ] {
+        assert!(
+            path_handler.contains(required),
+            "path change must contain {required}"
+        );
+    }
 }
 
 #[test]
