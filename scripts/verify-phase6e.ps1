@@ -342,9 +342,7 @@ $frozenPaths = @(
     'crates/publisher-core/',
     'crates/publisher-pipeline/',
     'crates/provider-contracts/',
-    'crates/provider-github/',
     'crates/provider-r2/',
-    'crates/provider-vercel/',
     'crates/contract-validator/',
     '.github/workflows/release.yml'
 )
