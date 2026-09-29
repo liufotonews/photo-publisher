@@ -20,7 +20,10 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const API_VERSION: &str = "2026-03-10";
+/// Official, published GitHub REST API version. GitHub rejects requests
+/// carrying an unsupported version header, so this value must name a real
+/// version from the GitHub changelog — never a placeholder date.
+const API_VERSION: &str = "2022-11-28";
 const DEFAULT_BRANCH: &str = "main";
 const DEFAULT_TOKEN_NAME: &str = "github.token";
 const MAX_SHORT_RETRY_SECONDS: u64 = 2;
@@ -565,6 +568,33 @@ mod tests {
             provider.ensure_repository(),
             Err(ProviderError::NotFound)
         ));
+        repository.assert();
+        branch.assert();
+    }
+
+    #[test]
+    fn requests_carry_the_official_published_api_version() {
+        // The API version header must name an official, published GitHub
+        // REST API version. Mockito answers only when the exact header
+        // matches, so a fictional value — or a missing header — leaves the
+        // request unanswered and fails this test without any real network.
+        let mut server = Server::new();
+        let repository = server
+            .mock("GET", "/repos/owner/repo")
+            .match_header("x-github-api-version", "2022-11-28")
+            .with_status(200)
+            .with_body(r#"{"default_branch":"main"}"#)
+            .create();
+        let branch = server
+            .mock("GET", "/repos/owner/repo/git/ref/heads/main")
+            .with_status(200)
+            .with_body(r#"{"object":{"sha":"abc","type":"commit"}}"#)
+            .create();
+        let mut config = GitHubRepositoryConfig::new("owner", "repo");
+        config.api_base_url = server.url();
+        let credentials = MemoryCredentials(Mutex::new(Some(b"secret".to_vec())));
+        let mut provider = GitHubRepositoryProvider::new(config, credentials).unwrap();
+        provider.ensure_repository().unwrap();
         repository.assert();
         branch.assert();
     }

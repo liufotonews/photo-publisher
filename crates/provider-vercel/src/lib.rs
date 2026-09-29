@@ -19,6 +19,9 @@ const DEFAULT_API_BASE_URL: &str = "https://api.vercel.com";
 const MAX_GET_RETRIES: usize = 2;
 const MAX_POLL_ATTEMPTS: usize = 10;
 const RETRY_DELAY: Duration = Duration::from_millis(10);
+/// Explicit upper bound for every HTTP request: a hung call must fail as a
+/// network error instead of blocking the publish worker indefinitely.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct VercelConfig {
@@ -94,6 +97,7 @@ impl<C: CredentialStore> VercelHostingProvider<C> {
     pub fn new(config: VercelConfig, credentials: C) -> ProviderResult<Self> {
         config.validate()?;
         let client = Client::builder()
+            .timeout(HTTP_TIMEOUT)
             .build()
             .map_err(|_| ProviderError::Other)?;
         Ok(Self {
@@ -707,5 +711,24 @@ mod tests {
             .create();
         let provider = provider(&server, Some(b"opaque-test-credential"));
         hosting_contract(&provider);
+    }
+
+    #[test]
+    fn the_http_client_carries_an_explicit_bounded_timeout() {
+        // reqwest exposes no getter for the configured timeout, so the pin
+        // is two-fold: the value below, and the structural proof that the
+        // client builder applies it (the same source-scan pattern the
+        // provisioners use for their configuration guarantees). Both are
+        // deterministic and need no network.
+        assert_eq!(HTTP_TIMEOUT, Duration::from_secs(30));
+        let source = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(
+            source.contains(".timeout(HTTP_TIMEOUT)"),
+            "the client builder must apply the explicit bounded timeout"
+        );
+        // The timeout must not smuggle in extra retry behavior: the single
+        // POST stays single-shot and only the GET retries remain.
+        assert_eq!(MAX_GET_RETRIES, 2);
+        assert_eq!(MAX_POLL_ATTEMPTS, 10);
     }
 }
