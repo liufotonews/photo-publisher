@@ -865,6 +865,8 @@ mod tests {
                 ApplicationEvent::LeftStep { step, ok } => format!("left:{step:?}:{ok}"),
                 ApplicationEvent::Finished => "finished".to_owned(),
                 ApplicationEvent::Failed => "failed".to_owned(),
+                ApplicationEvent::ProvisioningResourceStarted(_) => "provisioning".to_owned(),
+                ApplicationEvent::ProvisioningResourceFinished { .. } => "provisioning".to_owned(),
                 ApplicationEvent::Operation(operation) => {
                     use photo_publisher_integration::IntegrationEvent as I;
                     match operation {

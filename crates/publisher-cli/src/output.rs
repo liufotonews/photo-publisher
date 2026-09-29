@@ -15,6 +15,7 @@ pub fn format_event(event: &ApplicationEvent) -> String {
             WorkflowStep::InspectProject => "[INSPECT] Inspecionando publicação".to_owned(),
             WorkflowStep::RecoverPublication => "[RECOVER] Verificando recuperação".to_owned(),
             WorkflowStep::Preflight => "[PREFLIGHT] Verificando configuração".to_owned(),
+            WorkflowStep::Provisioning => "[PROVISION] Provisionando infraestrutura".to_owned(),
             WorkflowStep::LocalPublication => "[LOCAL] Construindo publicação local".to_owned(),
             WorkflowStep::BuildPlan => "[PLAN] Construindo plano".to_owned(),
             WorkflowStep::PublishIntegrate => "[PUBLISH] Executando publicação".to_owned(),
@@ -27,6 +28,7 @@ pub fn format_event(event: &ApplicationEvent) -> String {
                 WorkflowStep::InspectProject => "INSPECT",
                 WorkflowStep::RecoverPublication => "RECOVER",
                 WorkflowStep::Preflight => "PREFLIGHT",
+                WorkflowStep::Provisioning => "PROVISION",
                 WorkflowStep::LocalPublication => "LOCAL",
                 WorkflowStep::BuildPlan => "PLAN",
                 WorkflowStep::PublishIntegrate => "PUBLISH",
@@ -41,6 +43,30 @@ pub fn format_event(event: &ApplicationEvent) -> String {
         ApplicationEvent::Finished => "[OK] Operação concluída".to_owned(),
         ApplicationEvent::Failed => "[ERROR] Operação falhou".to_owned(),
         ApplicationEvent::Operation(operation) => format_operation(operation),
+        ApplicationEvent::ProvisioningResourceStarted(resource) => {
+            format!(
+                "[PROVISION] {}: iniciando",
+                provisioning_resource_label(resource)
+            )
+        }
+        ApplicationEvent::ProvisioningResourceFinished { resource, ok } => {
+            let label = provisioning_resource_label(resource);
+            if *ok {
+                format!("[OK] {label} provisionado")
+            } else {
+                format!("[ERROR] falha ao provisionar {label}")
+            }
+        }
+    }
+}
+
+/// Human label of a provisioning resource (the taxonomy is provider-neutral).
+fn provisioning_resource_label(resource: &publisher_app::ProvisioningResource) -> &'static str {
+    match resource {
+        publisher_app::ProvisioningResource::Repository => "repositório",
+        publisher_app::ProvisioningResource::Storage => "armazenamento",
+        publisher_app::ProvisioningResource::Hosting => "hosting",
+        publisher_app::ProvisioningResource::Domain => "domínio",
     }
 }
 

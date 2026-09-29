@@ -9,7 +9,7 @@
 //! variant has an explicit mapping.
 
 use photo_publisher_integration::{IntegrationEvent, OperationFailure};
-use publisher_app::{ApplicationEvent, WorkflowStep};
+use publisher_app::{ApplicationEvent, ProvisioningResource, WorkflowStep};
 use serde::Serialize;
 
 /// The single Tauri event channel used for all application events.
@@ -29,6 +29,21 @@ pub enum DesktopEvent {
     Workflow(WorkflowEventDto),
     /// Granular publication operation observed during an integrated publish.
     Operation(OperationEventDto),
+    /// Granular provisioning operation observed during the provisioning
+    /// action (Phase 7-K.5).
+    Provisioning(ProvisioningEventDto),
+}
+
+/// Stable provisioning lifecycle payload: the fixed resource taxonomy and a
+/// lifecycle marker only — identities and dispositions stay in the command
+/// result, never in an event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProvisioningEventDto {
+    /// Stable snake_case resource name: repository | storage | hosting |
+    /// domain.
+    pub resource: &'static str,
+    /// Stable lifecycle marker: started | finished_ok | finished_failed.
+    pub lifecycle: &'static str,
 }
 
 /// Stable workflow lifecycle payload.
@@ -154,10 +169,20 @@ fn step_name(step: &WorkflowStep) -> &'static str {
         WorkflowStep::InspectProject => "inspect_project",
         WorkflowStep::RecoverPublication => "recover_publication",
         WorkflowStep::Preflight => "preflight",
+        WorkflowStep::Provisioning => "provisioning",
         WorkflowStep::LocalPublication => "local_publication",
         WorkflowStep::BuildPlan => "build_plan",
         WorkflowStep::PublishIntegrate => "publish_integrate",
         WorkflowStep::DryRun => "dry_run",
+    }
+}
+
+fn resource_name(resource: &ProvisioningResource) -> &'static str {
+    match resource {
+        ProvisioningResource::Repository => "repository",
+        ProvisioningResource::Storage => "storage",
+        ProvisioningResource::Hosting => "hosting",
+        ProvisioningResource::Domain => "domain",
     }
 }
 
@@ -182,6 +207,22 @@ impl From<&ApplicationEvent> for DesktopEvent {
             }),
             ApplicationEvent::Operation(operation) => {
                 DesktopEvent::Operation(operation_event(operation))
+            }
+            ApplicationEvent::ProvisioningResourceStarted(resource) => {
+                DesktopEvent::Provisioning(ProvisioningEventDto {
+                    resource: resource_name(resource),
+                    lifecycle: "started",
+                })
+            }
+            ApplicationEvent::ProvisioningResourceFinished { resource, ok } => {
+                DesktopEvent::Provisioning(ProvisioningEventDto {
+                    resource: resource_name(resource),
+                    lifecycle: if *ok {
+                        "finished_ok"
+                    } else {
+                        "finished_failed"
+                    },
+                })
             }
         }
     }
@@ -535,6 +576,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn provisioning_events_translate_to_stable_safe_shape() {
+        // Phase 7-K.5: the granular provisioning markers and the workflow
+        // envelope all map to stable snake_case payloads.
+        let flow = [
+            ApplicationEvent::EnteredStep(WorkflowStep::Provisioning),
+            ApplicationEvent::ProvisioningResourceStarted(ProvisioningResource::Repository),
+            ApplicationEvent::ProvisioningResourceFinished {
+                resource: ProvisioningResource::Repository,
+                ok: true,
+            },
+            ApplicationEvent::ProvisioningResourceFinished {
+                resource: ProvisioningResource::Hosting,
+                ok: false,
+            },
+            ApplicationEvent::LeftStep {
+                step: WorkflowStep::Provisioning,
+                ok: false,
+            },
+            ApplicationEvent::Failed,
+        ];
+        let parts: Vec<String> = flow.iter().map(serialize).collect();
+        assert_eq!(
+            parts,
+            vec![
+                r#"{"type":"workflow","data":{"step":"provisioning","lifecycle":"entered"}}"#,
+                r#"{"type":"provisioning","data":{"resource":"repository","lifecycle":"started"}}"#,
+                r#"{"type":"provisioning","data":{"resource":"repository","lifecycle":"finished_ok"}}"#,
+                r#"{"type":"provisioning","data":{"resource":"hosting","lifecycle":"finished_failed"}}"#,
+                r#"{"type":"workflow","data":{"step":"provisioning","lifecycle":"left_failed"}}"#,
+                r#"{"type":"workflow","data":{"step":"workflow","lifecycle":"failed"}}"#,
+            ]
+        );
+        // Every provisioning resource name is stable.
+        for (resource, name) in [
+            (ProvisioningResource::Repository, "repository"),
+            (ProvisioningResource::Storage, "storage"),
+            (ProvisioningResource::Hosting, "hosting"),
+            (ProvisioningResource::Domain, "domain"),
+        ] {
+            let json = serialize(&ApplicationEvent::ProvisioningResourceStarted(resource));
+            assert!(
+                json.contains(&format!("\"resource\":\"{name}\"")),
+                "{json} must carry {name}"
+            );
+        }
+        // Pure taxonomy: no secrets, no paths, no timestamps, no Rust names.
+        let joined = parts.join(" ");
+        for needle in [
+            "token",
+            "secret",
+            "authorization",
+            "PHOTO_PUBLISHER_",
+            "C:\\",
+            "::",
+            "Provisioning",
+            "Repository",
+        ] {
+            assert!(
+                !joined.contains(needle),
+                "provisioning event leaked {needle}: {joined}"
+            );
+        }
+        assert_eq!(serialize(&flow[0]), serialize(&flow[0]), "deterministic");
     }
 
     #[test]

@@ -149,20 +149,21 @@ fn preflight_project(
     publisher_desktop::commands::preflight_project(&project_path, &mut forward_events(&app_handle))
 }
 
-/// Runs the explicit provisioning action (Phase 7-J). Like publication, it
-/// performs remote work, so it shares the exact same boundary: synchronous
-/// business logic in `commands::provision_project`, async only here at the
-/// Tauri wrapper. Provisioning is additionally EXCLUSIVE in the backend: the
-/// single slot of the managed gate is acquired atomically below, BEFORE any
-/// blocking work is queued, and the acquired permit moves into the worker,
-/// so the slot stays held for its entire execution. A second attempt while
-/// one is running is refused immediately — no provisioner is constructed, no
-/// application service is called — and the slot is released only when the
-/// worker finishes, with success or error. The application layer emits no
-/// provisioning events today, so there is nothing to forward — the result
-/// DTO is the whole report.
+/// Runs the explicit provisioning action (Phase 7-J, wired to the event
+/// channel in Phase 7-K.5). Like publication, it performs remote work, so it
+/// shares the exact same boundary: synchronous business logic in
+/// `commands::provision_project`, async only here at the Tauri wrapper, with
+/// the application events forwarded through the single channel. Provisioning
+/// is additionally EXCLUSIVE in the backend: the single slot of the managed
+/// gate is acquired atomically below, BEFORE any blocking work is queued,
+/// and the acquired permit moves into the worker, so the slot stays held for
+/// its entire execution. A second attempt while one is running is refused
+/// immediately — no provisioner is constructed, no application service is
+/// called — and the slot is released only when the worker finishes, with
+/// success or error.
 #[tauri::command]
 async fn provision_project(
+    app_handle: tauri::AppHandle,
     gate: tauri::State<'_, ProvisioningGate>,
     project_path: String,
 ) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto> {
@@ -173,6 +174,12 @@ async fn provision_project(
         return Err(publisher_desktop::commands::provisioning_busy_failure());
     };
     tauri::async_runtime::spawn_blocking(move || {
+        let mut sink = |event: publisher_app::ApplicationEvent| {
+            let _ = app_handle.emit(
+                publisher_desktop::events::PUBLISHER_EVENT_CHANNEL,
+                publisher_desktop::events::DesktopEvent::from(&event),
+            );
+        };
         // The permit lives inside the worker for its entire execution; it
         // drops here when the work returns (success or error) or while a
         // panic unwinds — the single release point of the slot.
@@ -180,6 +187,7 @@ async fn provision_project(
             permit,
             &project_path,
             publisher_desktop::commands::provision_project,
+            &mut sink,
         )
     })
     .await

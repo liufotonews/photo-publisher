@@ -16,10 +16,22 @@ pub enum WorkflowStep {
     InspectProject,
     RecoverPublication,
     Preflight,
+    Provisioning,
     LocalPublication,
     BuildPlan,
     PublishIntegrate,
     DryRun,
+}
+
+/// One infrastructure resource of a provisioning run, in the fixed
+/// contractual order. Plain taxonomy only — identities, statuses, and
+/// dispositions belong to the run report, never to an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisioningResource {
+    Repository,
+    Storage,
+    Hosting,
+    Domain,
 }
 
 /// An application event emitted while a use case runs.
@@ -38,6 +50,16 @@ pub enum ApplicationEvent {
     /// as produced: it never invents operations (a no-op publish emits none,
     /// and dry-run never produces any).
     Operation(IntegrationEvent),
+    /// A granular provisioning operation started (Phase 7-K.5). Content-free
+    /// infrastructure work: never files, never payloads, never identities.
+    ProvisioningResourceStarted(ProvisioningResource),
+    /// A granular provisioning operation finished, with an explicit success
+    /// flag. A failed or ambiguous step is marked `ok: false` — never
+    /// reported as started-only.
+    ProvisioningResourceFinished {
+        resource: ProvisioningResource,
+        ok: bool,
+    },
 }
 
 impl fmt::Display for ApplicationEvent {
@@ -48,6 +70,12 @@ impl fmt::Display for ApplicationEvent {
             Self::Finished => "finished".to_owned(),
             Self::Failed => "failed".to_owned(),
             Self::Operation(event) => format!("operation:{event:?}"),
+            Self::ProvisioningResourceStarted(resource) => {
+                format!("provisioning-resource-started:{resource:?}")
+            }
+            Self::ProvisioningResourceFinished { resource, ok } => {
+                format!("provisioning-resource-finished:{resource:?}:ok={ok}")
+            }
         };
         formatter.write_str(&text)
     }

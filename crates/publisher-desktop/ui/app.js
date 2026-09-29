@@ -16,6 +16,7 @@ const state = {
   validated: false,
   configReady: false,
   preflightReady: false,
+  provisioned: false,
   localReady: false,
   dryRunReady: false,
   busy: false,
@@ -94,13 +95,15 @@ function canPrepareLocal() {
   );
 }
 
-// Provisionar exige projeto atual validado E configuração coerente (7-D),
-// nenhuma operação em curso e nenhum recovery pendente. Nunca é automático.
+// Provisionar (Phase 7-K.5) é a etapa explícita APÓS o Preflight: o
+// Preflight já inclui a coerência da configuração (7-D), a pasta de origem,
+// o template e os bits de credencial — a coerência passa a ser exigida por
+// ele. Nunca é automático e nunca exige galeria local, Dry Run ou Publicar.
 function canProvision() {
   return (
     !state.busy &&
     state.validated &&
-    state.configReady &&
+    state.preflightReady &&
     state.projectPath !== "" &&
     currentPath() === state.projectPath &&
     !state.needsRecovery
@@ -136,6 +139,7 @@ function setPipelineStep() {
     "step-project",
     "step-validate",
     "step-preflight",
+    "step-provision",
     "step-prepare",
     "step-dryrun",
     "step-publish",
@@ -153,6 +157,8 @@ function setPipelineStep() {
     active = "step-publish";
   } else if (label.includes("prepar")) {
     active = "step-prepare";
+  } else if (label.includes("rovision")) {
+    active = "step-provision";
   } else if (label.includes("Preflight")) {
     active = "step-preflight";
   } else if (label.includes("Dry Run") || label.includes("dry")) {
@@ -161,6 +167,8 @@ function setPipelineStep() {
     active = "step-validate";
   } else if (state.validated && !state.preflightReady) {
     active = "step-preflight";
+  } else if (state.preflightReady && !state.provisioned) {
+    active = "step-provision";
   } else if (state.preflightReady && !state.dryRunReady) {
     active = "step-dryrun";
   } else if (state.dryRunReady) {
@@ -334,10 +342,16 @@ function showProvision(outcome) {
 
 function showProvisionError(error) {
   el("provision-result").hidden = false;
-  el("provision-status").textContent =
-    error && error.message ? error.message : "Erro desconhecido.";
-  // Falha parcial: o relatório embutido preserva o que concluiu antes.
-  renderProvisionResources(el("provision-resources"), error ? error.report : null);
+  // Falha ou falha parcial: o relatório embutido preserva o que concluiu
+  // antes — o resultado nunca é apresentado como sucesso total.
+  const report = error ? error.report : null;
+  const partial =
+    report && ["repository", "storage", "hosting", "domain"].some((key) => report[key]);
+  const message = error && error.message ? error.message : "Erro desconhecido.";
+  el("provision-status").textContent = partial
+    ? `O provisionamento foi concluído parcialmente. ${message}`
+    : message;
+  renderProvisionResources(el("provision-resources"), report);
   el("provision-result").classList.add("attention");
 }
 
@@ -345,6 +359,7 @@ async function onProvision() {
   if (!canProvision()) return;
   const projectPath = state.projectPath;
   const generation = beginOperation();
+  state.provisioned = false;
   hide("provision-result");
   el("provision-result").classList.remove("ok");
   el("provision-result").classList.remove("attention");
@@ -360,11 +375,14 @@ async function onProvision() {
       return;
     }
     showProvision(outcome);
-    // A infraestrutura mudou: Preflight/Dry Run anteriores deixam de valer
-    // e Publicar continua bloqueado até refazer o fluxo.
-    state.preflightReady = false;
+    // Provisionamento concluído é um estado efêmero de sessão — a
+    // infraestrutura remota continua sendo a autoridade; nada é persistido.
+    state.provisioned = true;
+    // A infraestrutura REMOTA mudou: um Dry Run anterior deixa de
+    // representar esse estado e Publicar exige um plano novo. O Preflight
+    // permanece válido — o que ele verifica (configuração, origem,
+    // template, bits de credencial) é local ou declarado e não mudou.
     state.dryRunReady = false;
-    hide("preflight-result");
     hide("dry-run-result");
     hide("publish-result");
     setBusy(false, "Provisionamento concluído.");
@@ -376,9 +394,9 @@ async function onProvision() {
       return;
     }
     showProvisionError(error);
-    // Mesmo na falha parcial a infraestrutura pode ter mudado: invalida-se
-    // o mesmo que no sucesso.
-    state.preflightReady = false;
+    // Mesmo na falha parcial a infraestrutura pode ter mudado: um plano
+    // anterior fica inválido; o Preflight, como acima, continua válido.
+    state.provisioned = false;
     state.dryRunReady = false;
     setBusy(false, "Falha no provisionamento.");
   }
@@ -654,6 +672,11 @@ const WORKFLOW_STEP_MESSAGES = {
     left_ok: "Preparação concluída.",
     left_failed: "Falha na preparação.",
   },
+  provisioning: {
+    entered: "Provisionando infraestrutura…",
+    left_ok: "Provisionamento concluído.",
+    left_failed: "Falha no provisionamento.",
+  },
   local_publication: {
     entered: "Preparando publicação local…",
     left_ok: "Publicação local pronta.",
@@ -691,6 +714,31 @@ const OPERATION_MESSAGES = {
   hosting_publish_failed: "Falha ao publicar o site.",
 };
 
+// Provisionamento (Phase 7-K.5): o evento granular só identifica o recurso
+// e o momento — identidades e disposições (created/…) vivem no resultado.
+const PROVISION_STEP_MESSAGES = {
+  repository: {
+    started: "Provisionando repositório…",
+    finished_ok: "Repositório provisionado.",
+    finished_failed: "Falha ao provisionar o repositório.",
+  },
+  storage: {
+    started: "Provisionando armazenamento…",
+    finished_ok: "Armazenamento provisionado.",
+    finished_failed: "Falha ao provisionar o armazenamento.",
+  },
+  hosting: {
+    started: "Provisionando hosting…",
+    finished_ok: "Hosting provisionado.",
+    finished_failed: "Falha ao provisionar o hosting.",
+  },
+  domain: {
+    started: "Provisionando domínio…",
+    finished_ok: "Domínio provisionado.",
+    finished_failed: "Falha ao provisionar o domínio.",
+  },
+};
+
 // Maximum rendered entries — kept bounded so a single long run cannot grow
 // the list forever. Presentation-only trim.
 const ACTIVITY_LIMIT = 100;
@@ -711,6 +759,13 @@ function describePublisherEvent(event) {
   if (event.type === "operation" && event.data) {
     const text = OPERATION_MESSAGES[event.data.event];
     return text ? { text, failed: event.data.event.endsWith("_failed") } : null;
+  }
+  if (event.type === "provisioning" && event.data) {
+    const resource = PROVISION_STEP_MESSAGES[event.data.resource];
+    const text = resource ? resource[event.data.lifecycle] : null;
+    return text
+      ? { text, failed: event.data.lifecycle === "finished_failed" }
+      : null;
   }
   return null;
 }
@@ -755,9 +810,10 @@ async function onValidate() {
   state.validated = false;
   state.dryRunReady = false;
   // Uma nova validação invalida configuração e Preflight anteriores: a
-  // sequência volta a exigir Validar → Configuração → Preflight para este
-  // caminho (e Provisionar fica travado até lá).
+  // sequência volta a exigir Validar → Preflight → Provisionar para este
+  // caminho (o estado efêmero de provisionamento também caduca aqui).
   state.preflightReady = false;
+  state.provisioned = false;
   state.localReady = false;
   state.configReady = false;
   hide("provision-result");
@@ -927,6 +983,7 @@ function onProjectPathChanged() {
   hide("recover-result");
   hide("recover-section");
   state.preflightReady = false;
+  state.provisioned = false;
   state.localReady = false;
   state.dryRunReady = false;
   state.configReady = false;

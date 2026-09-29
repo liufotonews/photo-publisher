@@ -619,21 +619,29 @@ pub fn provision_exclusive<F>(
     permit: ProvisioningPermit,
     project_path: &str,
     work: F,
+    events: &mut EventSink<'_>,
 ) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto>
 where
-    F: FnOnce(&str) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto>,
+    F: FnOnce(
+        &str,
+        &mut EventSink<'_>,
+    ) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto>,
 {
     let _held = permit;
-    work(project_path)
+    work(project_path, events)
 }
 
-/// Runs the explicit infrastructure provisioning for a project (Phase 7-J).
+/// Runs the explicit infrastructure provisioning for a project (Phase 7-J,
+/// wired to the event channel in Phase 7-K.5).
 ///
 /// Pure adapter: the composition root builds the concrete provisioners, the
 /// application service owns every rule, and this function only converts
 /// shapes. Never publishes, never plans, never reads a credential value.
+/// The event sink is forwarded verbatim so the single desktop channel can
+/// render the run live.
 pub fn provision_project(
     project_path: &str,
+    events: &mut EventSink<'_>,
 ) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto> {
     let path = match check_path(project_path) {
         Ok(path) => path,
@@ -655,7 +663,11 @@ pub fn provision_project(
             });
         }
     };
-    match publisher_app::provision_project(&path, &mut provisioners.as_provisioning_providers()) {
+    match publisher_app::provision_project(
+        &path,
+        &mut provisioners.as_provisioning_providers(),
+        events,
+    ) {
         Ok(report) => Ok(report_dto(&report)),
         Err(failure) => Err(ProvisionProjectFailureDto {
             kind: failure.error.kind.as_str().to_owned(),
@@ -1361,14 +1373,14 @@ mod tests {
     fn provision_project_rejects_invalid_or_missing_documents_before_any_work() {
         // NOTE: these paths fail before any provisioner is constructed or
         // any network could happen — exactly what the adapter guarantees.
-        let error = provision_project("   ").unwrap_err();
+        let error = provision_project("   ", &mut |_| {}).unwrap_err();
         assert_eq!(error.kind, "project_invalid");
         assert!(error.report.repository.is_none());
         assert!(error.report.project_id.is_empty());
 
         let root = tempdir().unwrap();
         let missing = root.path().join("project.json");
-        let error = provision_project(missing.to_str().unwrap()).unwrap_err();
+        let error = provision_project(missing.to_str().unwrap(), &mut |_| {}).unwrap_err();
         assert_eq!(error.kind, "resource_missing");
         assert!(error.report.repository.is_none());
     }
@@ -1378,7 +1390,7 @@ mod tests {
         let root = tempdir().unwrap();
         // v1: local-only contract — provisioning is an explicit No here.
         let v1 = write_project(root.path());
-        let error = provision_project(v1.to_str().unwrap()).unwrap_err();
+        let error = provision_project(v1.to_str().unwrap(), &mut |_| {}).unwrap_err();
         assert_eq!(error.kind, "project_invalid");
         assert!(error.report.repository.is_none());
 
@@ -1389,9 +1401,37 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&v2).unwrap()).unwrap();
         document["hosting"]["provider"] = serde_json::Value::String("other-host".to_owned());
         std::fs::write(&v2, serde_json::to_vec(&document).unwrap()).unwrap();
-        let error = provision_project(v2.to_str().unwrap()).unwrap_err();
+        let error = provision_project(v2.to_str().unwrap(), &mut |_| {}).unwrap_err();
         assert_eq!(error.kind, "validation");
         assert!(error.report.hosting.is_none());
+    }
+
+    #[test]
+    fn provision_project_forwards_application_events_to_the_caller_sink() {
+        // Phase 7-K.5: even on a failure closed before any network, the
+        // command already forwards the application lifecycle — the desktop
+        // channel can render "Provisioning started / failed" from it. A v1
+        // project proves it without any provider contact.
+        let root = tempdir().unwrap();
+        let v1 = write_project(root.path());
+        let mut events: Vec<publisher_app::ApplicationEvent> = Vec::new();
+        let error =
+            provision_project(v1.to_str().unwrap(), &mut |event| events.push(event)).unwrap_err();
+        assert_eq!(error.kind, "project_invalid");
+        assert_eq!(
+            events,
+            vec![
+                publisher_app::ApplicationEvent::EnteredStep(
+                    publisher_app::WorkflowStep::Provisioning
+                ),
+                publisher_app::ApplicationEvent::LeftStep {
+                    step: publisher_app::WorkflowStep::Provisioning,
+                    ok: false
+                },
+                publisher_app::ApplicationEvent::Failed,
+            ]
+        );
+        assert!(!events.contains(&publisher_app::ApplicationEvent::Finished));
     }
 
     #[test]
@@ -1464,10 +1504,13 @@ mod tests {
     fn gated_attempt(
         gate: &ProvisioningGate,
         project_path: &str,
-        work: impl FnOnce(&str) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto>,
+        work: impl FnOnce(
+            &str,
+            &mut EventSink<'_>,
+        ) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto>,
     ) -> Result<ProvisionProjectOutcomeDto, ProvisionProjectFailureDto> {
         match gate.try_acquire() {
-            Some(permit) => provision_exclusive(permit, project_path, work),
+            Some(permit) => provision_exclusive(permit, project_path, work, &mut |_| {}),
             None => Err(provisioning_busy_failure()),
         }
     }
@@ -1499,16 +1542,21 @@ mod tests {
         let (started, started_rx) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
             started.send(()).unwrap();
-            provision_exclusive(permit, "first", move |_| {
-                hold.recv().unwrap(); // the remote provisioning is still running
-                Ok(sample_outcome())
-            })
+            provision_exclusive(
+                permit,
+                "first",
+                move |_, _| {
+                    hold.recv().unwrap(); // the remote provisioning is still running
+                    Ok(sample_outcome())
+                },
+                &mut |_| {},
+            )
         });
         started_rx.recv().unwrap();
 
         // While the first provisioning is active, the second is refused
         // immediately, with the fixed busy DTO — not a worker result.
-        let failure = gated_attempt(&gate, "second", |_| Ok(sample_outcome()))
+        let failure = gated_attempt(&gate, "second", |_, _| Ok(sample_outcome()))
             .expect_err("an active provisioning must block a second one");
         assert_eq!(failure.kind, PROVISIONING_BUSY_KIND);
         assert_eq!(*failure.report, ProvisionProjectOutcomeDto::default());
@@ -1524,7 +1572,7 @@ mod tests {
 
         // After the first finished, the slot is free and a new provisioning
         // runs normally — end to end.
-        let second_run = gated_attempt(&gate, "second", |_| Ok(sample_outcome()))
+        let second_run = gated_attempt(&gate, "second", |_, _| Ok(sample_outcome()))
             .expect("a new provisioning must run after the previous one finishes");
         assert_eq!(second_run.project_id, "joao-maria-2026");
     }
@@ -1551,7 +1599,7 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
         let counted = {
             let calls = std::sync::Arc::clone(&calls);
-            move |_: &str| {
+            move |_: &str, _: &mut EventSink<'_>| {
                 *calls.lock().unwrap() += 1;
                 Ok(sample_outcome())
             }
@@ -1568,7 +1616,7 @@ mod tests {
     #[test]
     fn the_slot_is_released_after_a_successful_run() {
         let gate = ProvisioningGate::new();
-        let outcome = gated_attempt(&gate, "project", |_| Ok(sample_outcome()))
+        let outcome = gated_attempt(&gate, "project", |_, _| Ok(sample_outcome()))
             .expect("the first run succeeds");
         assert_eq!(outcome.project_id, "joao-maria-2026");
         // The worker finished successfully: the slot is free again...
@@ -1578,7 +1626,7 @@ mod tests {
         );
         // ...and a full new provisioning runs normally.
         assert!(
-            gated_attempt(&gate, "project", |_| Ok(sample_outcome())).is_ok(),
+            gated_attempt(&gate, "project", |_, _| Ok(sample_outcome())).is_ok(),
             "a new provisioning must run after the previous one finishes"
         );
     }
@@ -1586,7 +1634,7 @@ mod tests {
     #[test]
     fn the_slot_is_released_after_a_failed_run() {
         let gate = ProvisioningGate::new();
-        let failure = gated_attempt(&gate, "project", |_| {
+        let failure = gated_attempt(&gate, "project", |_, _| {
             Err(ProvisionProjectFailureDto {
                 kind: "provisioning_failed".to_owned(),
                 message: "simulated provisioning failure".to_owned(),

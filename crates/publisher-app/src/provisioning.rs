@@ -24,12 +24,13 @@ use std::path::Path;
 use photo_publisher_provider_contracts::CredentialStore;
 use publisher_provisioning::{
     DomainProvisionConfig, DomainProvisioner, HostingProvisionConfig, HostingProvisioner,
-    ProvisioningError, ProvisioningOutcome, ProvisioningStatus, RepositoryProvisionConfig,
-    RepositoryProvisioner, StorageProvisionConfig, StorageProvisioner,
+    ProvisioningError, ProvisioningOutcome, ProvisioningResult, ProvisioningStatus,
+    RepositoryProvisionConfig, RepositoryProvisioner, StorageProvisionConfig, StorageProvisioner,
 };
 
 use crate::config_validation::validate_setup;
 use crate::errors::{ApplicationError, ApplicationErrorKind};
+use crate::events::{ApplicationEvent, EventSink, ProvisioningResource, WorkflowStep};
 use crate::setup::ProjectSetup;
 
 /// The provisioner set consumed by the application layer: contracts and the
@@ -112,12 +113,62 @@ fn record<R: ToString>(slot: &mut Option<ProvisionedResource>, outcome: Provisio
     });
 }
 
+/// Runs one provisioning step wrapped in its granular lifecycle events
+/// (Phase 7-K.5): exactly one started marker and one finished marker per
+/// call, and a failure is always marked `ok: false` — never silently. The
+/// events carry the resource kind only; identities and dispositions belong
+/// to the run report.
+fn provision_resource<R>(
+    resource: ProvisioningResource,
+    events: &mut EventSink<'_>,
+    work: impl FnOnce() -> ProvisioningResult<ProvisioningOutcome<R>>,
+) -> ProvisioningResult<ProvisioningOutcome<R>> {
+    events(ApplicationEvent::ProvisioningResourceStarted(resource));
+    let result = work();
+    events(ApplicationEvent::ProvisioningResourceFinished {
+        resource,
+        ok: result.is_ok(),
+    });
+    result
+}
+
 /// Provisions the infrastructure declared by an integrated (schema v2)
 /// project, in the fixed order repository → high-resolution storage →
 /// hosting → domain. Explicit, sequential, and stop-on-first-failure.
+///
+/// Emits the existing event lifecycle (`WorkflowStep::Provisioning`, plus
+/// one granular marker pair per resource) so interfaces can render the run
+/// live; events are observation-only and never change the outcome.
 pub fn provision_project(
     project_path: &Path,
     providers: &mut ProvisioningProviders<'_>,
+    events: &mut EventSink<'_>,
+) -> Result<ProvisionProjectReport, ProvisioningFailure> {
+    events(ApplicationEvent::EnteredStep(WorkflowStep::Provisioning));
+    let result = run(project_path, providers, events);
+    match &result {
+        Ok(_) => {
+            events(ApplicationEvent::LeftStep {
+                step: WorkflowStep::Provisioning,
+                ok: true,
+            });
+            events(ApplicationEvent::Finished);
+        }
+        Err(_) => {
+            events(ApplicationEvent::LeftStep {
+                step: WorkflowStep::Provisioning,
+                ok: false,
+            });
+            events(ApplicationEvent::Failed);
+        }
+    }
+    result
+}
+
+fn run(
+    project_path: &Path,
+    providers: &mut ProvisioningProviders<'_>,
+    events: &mut EventSink<'_>,
 ) -> Result<ProvisionProjectReport, ProvisioningFailure> {
     let mut report = ProvisionProjectReport::default();
 
@@ -226,35 +277,43 @@ pub fn provision_project(
 
     // 1. Repository. The declared matrix keeps exactly ONE repository; the
     //    github preview storage rides on it (no second resource exists).
-    let outcome = providers
-        .repository
-        .provision_repository(&repository_config, providers.credentials)
-        .map_err(|error| failure(report.clone(), from_provisioner(error)))?;
+    let outcome = provision_resource(ProvisioningResource::Repository, events, || {
+        providers
+            .repository
+            .provision_repository(&repository_config, providers.credentials)
+    })
+    .map_err(|error| failure(report.clone(), from_provisioner(error)))?;
     record(&mut report.repository, outcome);
 
     // 2. High-resolution storage bucket (prefix/publicBaseUrl are publishing
     //    concerns and deliberately never provisioning input).
-    let outcome = providers
-        .storage
-        .provision_storage(&storage_config, providers.credentials)
-        .map_err(|error| failure(report.clone(), from_provisioner(error)))?;
+    let outcome = provision_resource(ProvisioningResource::Storage, events, || {
+        providers
+            .storage
+            .provision_storage(&storage_config, providers.credentials)
+    })
+    .map_err(|error| failure(report.clone(), from_provisioner(error)))?;
     record(&mut report.storage, outcome);
 
     // 3. Hosting project (no deployments, no files, no domain attachment).
-    let outcome = providers
-        .hosting
-        .provision_hosting(&hosting_config, providers.credentials)
-        .map_err(|error| failure(report.clone(), from_provisioner(error)))?;
+    let outcome = provision_resource(ProvisioningResource::Hosting, events, || {
+        providers
+            .hosting
+            .provision_hosting(&hosting_config, providers.credentials)
+    })
+    .map_err(|error| failure(report.clone(), from_provisioner(error)))?;
     record(&mut report.hosting, outcome);
 
     // 4. Domain, only when declared. Today's boundary is explicitly
     //    `Unsupported`; that error surfaces as an explicit failure — never
     //    silently downgraded to success, never worked around via Vercel.
     if let Some(domain_config) = domain_config {
-        let outcome = providers
-            .domain
-            .provision_domain(&domain_config, providers.credentials)
-            .map_err(|error| failure(report.clone(), from_provisioner(error)))?;
+        let outcome = provision_resource(ProvisioningResource::Domain, events, || {
+            providers
+                .domain
+                .provision_domain(&domain_config, providers.credentials)
+        })
+        .map_err(|error| failure(report.clone(), from_provisioner(error)))?;
         record(&mut report.domain, outcome);
     }
 
@@ -504,7 +563,23 @@ mod tests {
             domain: &mut rig.domain,
             credentials: &rig.credentials,
         };
-        provision_project(path, &mut providers)
+        provision_project(path, &mut providers, &mut |_| {})
+    }
+
+    /// Same run, capturing every application event in order.
+    fn provision_capturing(
+        path: &Path,
+        rig: &mut Rig,
+        captured: &mut Vec<ApplicationEvent>,
+    ) -> Result<ProvisionProjectReport, ProvisioningFailure> {
+        let mut providers = ProvisioningProviders {
+            repository: &mut rig.repository,
+            storage: &mut rig.storage,
+            hosting: &mut rig.hosting,
+            domain: &mut rig.domain,
+            credentials: &rig.credentials,
+        };
+        provision_project(path, &mut providers, &mut |event| captured.push(event))
     }
 
     #[test]
@@ -790,6 +865,181 @@ mod tests {
         ]);
         provision(&path, &mut rig).unwrap();
         assert_eq!(rig.branches(), ["main"], "absent branch → contract default");
+    }
+
+    #[test]
+    fn a_successful_run_emits_the_provisioning_lifecycle_in_fixed_order() {
+        // Phase 7-K.5: the envelope is the existing use-case lifecycle, and
+        // every resource gets exactly one started + one finished marker, in
+        // the contractual order repository → storage → hosting → domain
+        // (domain only when declared).
+        let root = tempdir().unwrap();
+        let path = write_project(&root, true);
+        let mut rig = Rig::new([
+            Script::Created,
+            Script::Created,
+            Script::Created,
+            Script::Created,
+        ]);
+        let mut events: Vec<ApplicationEvent> = Vec::new();
+        provision_capturing(&path, &mut rig, &mut events).unwrap();
+        use crate::events::ProvisioningResource as R;
+        assert_eq!(
+            events,
+            vec![
+                ApplicationEvent::EnteredStep(WorkflowStep::Provisioning),
+                ApplicationEvent::ProvisioningResourceStarted(R::Repository),
+                ApplicationEvent::ProvisioningResourceFinished {
+                    resource: R::Repository,
+                    ok: true
+                },
+                ApplicationEvent::ProvisioningResourceStarted(R::Storage),
+                ApplicationEvent::ProvisioningResourceFinished {
+                    resource: R::Storage,
+                    ok: true
+                },
+                ApplicationEvent::ProvisioningResourceStarted(R::Hosting),
+                ApplicationEvent::ProvisioningResourceFinished {
+                    resource: R::Hosting,
+                    ok: true
+                },
+                ApplicationEvent::ProvisioningResourceStarted(R::Domain),
+                ApplicationEvent::ProvisioningResourceFinished {
+                    resource: R::Domain,
+                    ok: true
+                },
+                ApplicationEvent::LeftStep {
+                    step: WorkflowStep::Provisioning,
+                    ok: true
+                },
+                ApplicationEvent::Finished,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failing_step_emits_its_failure_marker_and_never_a_final_finished() {
+        // Stop-on-first-failure is preserved by the events too: completed
+        // resources report ok, the failed one reports not-ok, nothing later
+        // starts, and the run ends with Failed — never Finished.
+        let root = tempdir().unwrap();
+        let path = write_project(&root, true);
+        let mut rig = Rig::new([
+            Script::Created,
+            Script::Unchanged,
+            Script::Conflict,
+            Script::Created,
+        ]);
+        let mut events: Vec<ApplicationEvent> = Vec::new();
+        let failure = provision_capturing(&path, &mut rig, &mut events).unwrap_err();
+        assert_eq!(failure.error.kind, ApplicationErrorKind::Provisioning);
+        use crate::events::ProvisioningResource as R;
+        assert_eq!(
+            events,
+            vec![
+                ApplicationEvent::EnteredStep(WorkflowStep::Provisioning),
+                ApplicationEvent::ProvisioningResourceStarted(R::Repository),
+                ApplicationEvent::ProvisioningResourceFinished {
+                    resource: R::Repository,
+                    ok: true
+                },
+                ApplicationEvent::ProvisioningResourceStarted(R::Storage),
+                ApplicationEvent::ProvisioningResourceFinished {
+                    resource: R::Storage,
+                    ok: true
+                },
+                ApplicationEvent::ProvisioningResourceStarted(R::Hosting),
+                ApplicationEvent::ProvisioningResourceFinished {
+                    resource: R::Hosting,
+                    ok: false
+                },
+                ApplicationEvent::LeftStep {
+                    step: WorkflowStep::Provisioning,
+                    ok: false
+                },
+                ApplicationEvent::Failed,
+            ]
+        );
+        assert!(!events.contains(&ApplicationEvent::Finished));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ApplicationEvent::ProvisioningResourceStarted(R::Domain)
+        ) || matches!(
+            event,
+            ApplicationEvent::ProvisioningResourceFinished {
+                resource: R::Domain,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_v1_rejection_emits_the_envelope_without_any_resource_marker() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("project.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "project": {"id": "joao-maria-2026", "name": "João & Maria"},
+                "gallery": {"template": "editorial-v1", "title": "João & Maria"},
+                "source": {"type": "folder", "path": "fotos"},
+                "repository": {"provider": "local", "repository": "local"},
+                "hosting": {"provider": "local"},
+                "storage": {"preview": {"provider": "local"}, "highResolution": {"provider": "local"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut rig = Rig::new([
+            Script::Created,
+            Script::Created,
+            Script::Created,
+            Script::Created,
+        ]);
+        let mut events: Vec<ApplicationEvent> = Vec::new();
+        let failure = provision_capturing(&path, &mut rig, &mut events).unwrap_err();
+        assert_eq!(failure.error.kind, ApplicationErrorKind::ProjectInvalid);
+        assert_eq!(
+            events,
+            vec![
+                ApplicationEvent::EnteredStep(WorkflowStep::Provisioning),
+                ApplicationEvent::LeftStep {
+                    step: WorkflowStep::Provisioning,
+                    ok: false
+                },
+                ApplicationEvent::Failed,
+            ]
+        );
+        assert!(rig.calls().is_empty());
+    }
+
+    #[test]
+    fn provisioning_events_carry_no_secrets_paths_or_generated_data() {
+        // Events are plain taxonomy: they must never expose credentials,
+        // absolute machine paths, identities, or non-deterministic data.
+        let root = tempdir().unwrap();
+        let path = write_project(&root, true);
+        let mut rig = Rig::new([
+            Script::Created,
+            Script::Created,
+            Script::Conflict,
+            Script::Created,
+        ]);
+        rig.credentials
+            .set("github.token", SENTINEL.as_bytes())
+            .unwrap();
+        let mut events: Vec<ApplicationEvent> = Vec::new();
+        let _ = provision_capturing(&path, &mut rig, &mut events);
+        let rendered = format!("{events:?}");
+        assert!(!rendered.contains(SENTINEL));
+        assert!(!rendered.contains(root.path().display().to_string().as_str()));
+        for needle in ["token", "secret", "PHOTO_PUBLISHER_", "C:\\"] {
+            assert!(
+                !rendered.contains(needle),
+                "provisioning events leaked {needle}: {rendered}"
+            );
+        }
     }
 
     #[test]

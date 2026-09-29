@@ -2040,10 +2040,13 @@ fn provisioning_section_exists_as_an_explicit_separate_action() {
 }
 
 #[test]
-fn provision_requires_valid_configuration_and_never_runs_automatically() {
+fn provision_requires_a_successful_preflight_and_never_runs_automatically() {
     let script = read_source("/ui/app.js");
-    // Preconditions: current validated project + coherent configuration +
-    // idle UI + no pending recovery + same path.
+    // Phase 7-K.5 pipeline order: Validar → Preflight → Provisionar →
+    // Preparar → ... — the provisioning gate is the successful Preflight
+    // (which already carries the configuration coherence rules), the idle
+    // UI, no pending recovery, and the same path. It never requires the
+    // local bootstrap, dry run, or publish.
     let guard = script
         .split("function canProvision()")
         .nth(1)
@@ -2054,11 +2057,17 @@ fn provision_requires_valid_configuration_and_never_runs_automatically() {
     for required in [
         "!state.busy",
         "state.validated",
-        "state.configReady",
+        "state.preflightReady",
         "currentPath() === state.projectPath",
         "!state.needsRecovery",
     ] {
         assert!(guard.contains(required), "canProvision needs {required}");
+    }
+    for forbidden in ["state.configReady", "state.localReady", "state.dryRunReady"] {
+        assert!(
+            !guard.contains(forbidden),
+            "provisioning must not require {forbidden}"
+        );
     }
     let handler = script
         .split("async function onProvision()")
@@ -2084,7 +2093,12 @@ fn provision_requires_valid_configuration_and_never_runs_automatically() {
 }
 
 #[test]
-fn provision_invalidates_prior_publish_results_but_never_enables_publish() {
+fn provision_keeps_preflight_valid_but_stales_dry_run_and_never_enables_publish() {
+    // Phase 7-K.5 pipeline order: provisioning changes REMOTE infrastructure
+    // only. A successful (or failed) run must NOT invalidate the Preflight
+    // (local/declared preconditions unchanged) so the flow can continue to
+    // Preparar galeria local — but any earlier Dry Run plan is stale and
+    // Publish still requires a fresh one.
     let script = read_source("/ui/app.js");
     let handler = script
         .split("async function onProvision()")
@@ -2093,8 +2107,6 @@ fn provision_invalidates_prior_publish_results_but_never_enables_publish() {
         .split("\n}\n")
         .next()
         .unwrap();
-    // Success branch and failure branch both invalidate preflight/dry-run
-    // results (the infrastructure may haved changed in either case).
     let success = handler
         .split("showProvision(outcome);")
         .nth(1)
@@ -2102,14 +2114,24 @@ fn provision_invalidates_prior_publish_results_but_never_enables_publish() {
         .split("} catch (error) {")
         .next()
         .unwrap();
-    assert!(success.contains("state.preflightReady = false"));
+    assert!(
+        !success.contains("state.preflightReady = false"),
+        "provisioning must keep the preflight verdict (7-K.5 order)"
+    );
+    assert!(success.contains("state.provisioned = true"));
     assert!(success.contains("state.dryRunReady = false"));
+    assert!(success.contains("hide(\"dry-run-result\")"));
+    assert!(success.contains("hide(\"publish-result\")"));
     assert!(
         !success.contains("publish-button\").disabled = false"),
         "a successful provision must never re-enable Publish"
     );
     let failure = handler.split("} catch (error) {").nth(1).unwrap();
-    assert!(failure.contains("state.preflightReady = false"));
+    assert!(
+        !failure.contains("state.preflightReady = false"),
+        "a failed provision keeps the preflight verdict too"
+    );
+    assert!(failure.contains("state.provisioned = false"));
     assert!(failure.contains("state.dryRunReady = false"));
     // Publish continues to require validated + preflight + dry-run.
     let can_publish = script
@@ -2216,6 +2238,7 @@ fn path_change_invalidates_provisioning_too() {
         .unwrap();
     for required in [
         "state.configReady = false",
+        "state.provisioned = false",
         "el(\"provision-button\").disabled = true",
         "hide(\"provision-result\")",
     ] {
@@ -2638,7 +2661,7 @@ fn the_exclusive_slot_is_a_permit_released_only_by_the_worker_completion() {
         .next()
         .unwrap();
     assert!(runner.contains("let _held = permit;"));
-    assert!(runner.contains("work(project_path)"));
+    assert!(runner.contains("work(project_path, events)"));
     // The refusal constructs pure data only: no provisioner, no application
     // service, no environment, no path.
     let refusal = commands
@@ -2661,4 +2684,237 @@ fn the_exclusive_slot_is_a_permit_released_only_by_the_worker_completion() {
         );
     }
     assert!(refusal.contains("PROVISIONING_BUSY_KIND"));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7-K.5 — Desktop Wiring: provisioning in the visual flow
+//
+// The provisioning backend existed since 7-J; this phase connects it to the
+// pipeline order (Validar → Preflight → Provisionar → Preparar → Dry Run →
+// Publicar) and to the single event channel. These tests pin: the new
+// pipeline step, the preflight gate, the ephemeral `provisioned` state, the
+// event bridge, and the per-resource activity rendering.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pipeline_shows_provisionar_between_preflight_and_prepare() {
+    let html = read_source("/ui/index.html");
+    assert!(html.contains("id=\"step-provision\""));
+    let preflight = html.find("id=\"step-preflight\"").unwrap();
+    let provision = html.find("id=\"step-provision\"").unwrap();
+    let prepare = html.find("id=\"step-prepare\"").unwrap();
+    let dryrun = html.find("id=\"step-dryrun\"").unwrap();
+    assert!(
+        preflight < provision && provision < prepare && prepare < dryrun,
+        "pipeline order must be preflight → provision → prepare → dry-run"
+    );
+    // The provisioning section sits in the same visual order, after the
+    // preflight result and before the local bootstrap result.
+    let preflight_result = html.find("id=\"preflight-result\"").unwrap();
+    let provision_section = html.find("id=\"provision-section\"").unwrap();
+    let prepare_result = html.find("id=\"prepare-local-result\"").unwrap();
+    assert!(preflight_result < provision_section && provision_section < prepare_result);
+    // The step participates in the visual progress highlighting.
+    let script = read_source("/ui/app.js");
+    let pipeline = script
+        .split("function setPipelineStep()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(pipeline.contains("\"step-provision\""));
+}
+
+#[test]
+fn provisioned_is_ephemeral_state_invalidated_by_path_change_and_revalidation() {
+    let script = read_source("/ui/app.js");
+    // The session-only flag exists and starts false; nothing persists it.
+    assert!(script.contains("provisioned: false"));
+    let path_handler = script
+        .split("function onProjectPathChanged()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(path_handler.contains("state.provisioned = false"));
+    let validate_handler = script
+        .split("async function onValidate()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(validate_handler.contains("state.provisioned = false"));
+    // A new provisioning run resets the verdict before the await boundary.
+    let handler = script
+        .split("async function onProvision()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let await_pos = handler.find("await tauri.invoke").unwrap();
+    let reset = handler.find("state.provisioned = false").unwrap();
+    assert!(reset < await_pos, "the verdict resets before the async run");
+}
+
+#[test]
+fn provisioning_events_reach_the_single_channel_and_the_activity_feed() {
+    // Binary: the provisioning wrapper forwards events exactly like publish
+    // and prepare-local do — same channel, same adapter, same boundary.
+    let main = read_source("/src/main.rs");
+    let wrapper = main
+        .split("async fn provision_project")
+        .nth(1)
+        .expect("the provisioning wrapper must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "tauri::AppHandle",
+        "app_handle.emit(",
+        "PUBLISHER_EVENT_CHANNEL",
+        "DesktopEvent::from(&event)",
+        "&mut sink",
+    ] {
+        assert!(
+            wrapper.contains(required),
+            "the provisioning wrapper must forward events ({required})"
+        );
+    }
+    assert_eq!(wrapper.matches("app_handle.emit(").count(), 1);
+    // Command: the adapter takes the sink and hands it to the app service.
+    let commands = read_source("/src/commands.rs");
+    let command = commands
+        .split("pub fn provision_project")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(command.contains("events: &mut EventSink"));
+    assert!(command.contains("publisher_app::provision_project("));
+    assert!(command.contains("events,"));
+    // Adapter: a dedicated, stable provisioning payload exists.
+    let events = read_source("/src/events.rs");
+    for required in [
+        "Provisioning(ProvisioningEventDto)",
+        "\"provisioning\"",
+        "\"finished_ok\"",
+        "\"finished_failed\"",
+        "\"repository\"",
+        "\"storage\"",
+        "\"hosting\"",
+        "\"domain\"",
+    ] {
+        assert!(
+            events.contains(required),
+            "the desktop event adapter must define {required}"
+        );
+    }
+    // UI: the activity feed renders the granular lifecycle.
+    let script = read_source("/ui/app.js");
+    assert!(script.contains("event.type === \"provisioning\""));
+    let describe = script
+        .split("function describePublisherEvent(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(describe.contains("finished_failed"));
+    let workflow = script
+        .split("const WORKFLOW_STEP_MESSAGES =")
+        .nth(1)
+        .unwrap()
+        .split("};")
+        .next()
+        .unwrap();
+    assert!(workflow.contains("provisioning:"));
+    let resources = script
+        .split("const PROVISION_STEP_MESSAGES =")
+        .nth(1)
+        .unwrap()
+        .split("};")
+        .next()
+        .unwrap();
+    for key in ["repository", "storage", "hosting", "domain"] {
+        assert!(
+            resources.contains(key),
+            "activity messages must cover {key}"
+        );
+    }
+    // A finished marker carries its outcome: a failed resource never
+    // renders as success.
+    assert!(resources.contains("finished_failed"));
+}
+
+#[test]
+fn a_partial_provisioning_is_never_presented_as_a_full_success() {
+    // The error branch renders the embedded partial report and names it a
+    // partial completion; success styling stays exclusive to the Ok path.
+    let script = read_source("/ui/app.js");
+    let error = script
+        .split("function showProvisionError(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(error.contains("error.report"));
+    assert!(error.contains("parcial"));
+    assert!(error.contains("attention"));
+    assert!(!error.contains("\"ok\""));
+    let success = script
+        .split("function showProvision(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(success.contains("classList.add(\"ok\")"));
+    assert!(!success.contains("attention"));
+}
+
+#[test]
+fn provisioning_commands_keep_their_shape_and_stay_within_their_scope() {
+    // The command set is unchanged (thirteen commands, one channel), and the
+    // provisioning command remains a pure adapter: gate → composition root →
+    // publisher_app::provision_project. No provisioning rule lives here.
+    let main = read_source("/src/main.rs");
+    assert!(main.contains("provision_project"));
+    let commands = read_source("/src/commands.rs");
+    assert!(commands.contains("pub fn provision_project"));
+    assert!(commands.contains("publisher_app::provision_project"));
+    let body = commands
+        .split("pub fn provision_project")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "publish_project(",
+        "dry_run_project(",
+        "recover_project(",
+        "create_project_setup(",
+        "prepare_local_publication(",
+        "GitHubRepositoryProvisioner",
+        "R2StorageProvisioner",
+        "VercelHostingProvisioner",
+        "EnvironmentCredentialStore",
+        "std::env",
+        "reqwest",
+        ".publish(",
+        ".put(",
+        ".commit(",
+        ".delete(",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "provision_project command must not contain {forbidden}"
+        );
+    }
 }

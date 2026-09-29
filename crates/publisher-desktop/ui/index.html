@@ -38,16 +38,20 @@
             <span class="step-index">3</span>
             <span class="step-label">Preflight</span>
           </li>
-          <li id="step-prepare" class="step">
+          <li id="step-provision" class="step">
             <span class="step-index">4</span>
+            <span class="step-label">Provisionar</span>
+          </li>
+          <li id="step-prepare" class="step">
+            <span class="step-index">5</span>
             <span class="step-label">Preparar galeria local</span>
           </li>
           <li id="step-dryrun" class="step">
-            <span class="step-index">5</span>
+            <span class="step-index">6</span>
             <span class="step-label">Dry Run</span>
           </li>
           <li id="step-publish" class="step">
-            <span class="step-index">6</span>
+            <span class="step-index">7</span>
             <span class="step-label">Publicar</span>
           </li>
         </ol>
@@ -76,10 +80,10 @@
           <button id="publish-button" type="button" disabled>Publicar</button>
         </div>
         <p class="hint">
-          Valide o projeto, execute o Preflight (configuração e credenciais),
-          prepare a galeria local, execute o Dry Run e só então publique.
-          Validar configuração é um diagnóstico estrutural — não altera o
-          fluxo de publicação.
+          Valide o projeto, execute o Preflight (configuração, origem,
+          template e credenciais), provisione a infraestrutura, prepare a
+          galeria local, execute o Dry Run e só então publique. Validar
+          configuração é um diagnóstico estrutural — não altera o fluxo.
         </p>
       </section>
 
@@ -99,9 +103,15 @@
         <ul id="config-issues" class="issue-list"></ul>
       </section>
 
-      <!-- Infraestrutura (Phase 7-J): ação explícita e separada de Publicar.
-           Provisionar cria/reconcilia a infraestrutura declarada; nunca
-           publica conteúdo. -->
+      <section id="preflight-result" class="card result" hidden aria-live="polite">
+        <h2 id="preflight-result-title">Preflight</h2>
+        <p id="preflight-status" class="status"></p>
+        <ul id="preflight-issues" class="issue-list"></ul>
+      </section>
+
+      <!-- Infraestrutura (Phase 7-J/7-K.5): ação explícita entre Preflight e
+           Preparar galeria local. Provisionar cria/reconcilia a
+           infraestrutura declarada; nunca publica conteúdo. -->
       <section id="provision-section" class="card" aria-labelledby="provision-title">
         <h2 id="provision-title">Infraestrutura</h2>
         <p class="hint">
@@ -120,13 +130,7 @@
         </div>
       </section>
 
-      <section id="preflight-result" class="card result" hidden aria-live="polite">
-        <h2 id="preflight-result-title">Preflight</h2>
-        <p id="preflight-status" class="status"></p>
-        <ul id="preflight-issues" class="issue-list"></ul>
-      </section>
-
-      <!-- Publicação local (Phase 7-K.2): etapa explícita entre Preflight e
+      <!-- Publicação local (Phase 7-K.2): etapa explícita entre Provisionar e
            Dry Run — constrói a galeria local comprometida que o Dry Run
            planeia e que antes só o Publicar criava. Apenas local; nada é
            publicado remotamente aqui. -->

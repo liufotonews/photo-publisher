@@ -26,7 +26,7 @@ pub use credentials::{
     credential_status, delete_credential, set_credential, CredentialStatus, SUPPORTED_CREDENTIALS,
 };
 pub use errors::{ApplicationError, ApplicationErrorKind};
-pub use events::{ApplicationEvent, WorkflowStep};
+pub use events::{ApplicationEvent, ProvisioningResource, WorkflowStep};
 pub use outcome::PublicationOutcome;
 pub use project::{
     load_project_document, resolve_output_dir, resolve_source_dir, ProjectHandle, ProjectKind,
