@@ -398,7 +398,7 @@ fn command_layer_contains_no_provider_or_network_wiring() {
 }
 
 #[test]
-fn binary_registers_exactly_the_twelve_commands_and_the_single_channel() {
+fn binary_registers_exactly_the_thirteen_commands_and_the_single_channel() {
     // The Tauri binary is the only place that may touch `tauri`; the command
     // set and the event channel feed must remain exactly what this phase
     // specifies. Line endings are normalized (CI checkouts on Windows use
@@ -430,7 +430,8 @@ fn binary_registers_exactly_the_twelve_commands_and_the_single_channel() {
             "set_credential",
             "delete_credential",
             "preflight_project",
-            "provision_project"
+            "provision_project",
+            "prepare_local_publication"
         ]
     );
     assert!(source.contains("publisher_desktop::events::PUBLISHER_EVENT_CHANNEL"));
@@ -496,20 +497,23 @@ fn publish_v2_without_credentials_fails_before_any_remote_effect() {
 }
 
 /// The desktop-wide invariant of phase 6-F.7: the async boundary exists only
-/// in the Tauri wrapper of publish; the library stays synchronous.
+/// in the Tauri wrappers that run long work off the caller's context; the
+/// library stays synchronous.
 #[test]
 fn publication_boundary_is_async_only_at_the_tauri_wrapper() {
     let source = read_source("/src/main.rs").replace("\r\n", "\n");
     assert!(source.contains("async fn publish_project"));
     assert!(source.contains("async fn provision_project"));
+    assert!(source.contains("async fn prepare_local_publication"));
     assert!(source.contains("tauri::async_runtime::spawn_blocking"));
     assert!(source.contains("fn validate_project("));
     assert!(source.contains("fn dry_run_project("));
     assert!(source.contains("fn get_app_info("));
-    // Exactly two async points exist, both doing remote work: the publish
-    // wrapper and the provisioning wrapper. Everything else stays synchronous.
-    assert_eq!(source.matches("async fn").count(), 2);
-    assert_eq!(source.matches("spawn_blocking").count(), 2);
+    // Exactly three async points exist, each a long-running wrapper: the
+    // publish wrapper, the provisioning wrapper, and the local bootstrap.
+    // Everything else stays synchronous.
+    assert_eq!(source.matches("async fn").count(), 3);
+    assert_eq!(source.matches("spawn_blocking").count(), 3);
 }
 
 #[test]
@@ -524,6 +528,7 @@ fn the_library_stays_synchronous() {
     assert!(commands.contains("publisher_app::publish_project"));
     assert!(commands.contains("publisher_app::dry_run_project"));
     assert!(commands.contains("publisher_app::provision_project"));
+    assert!(commands.contains("publisher_app::prepare_local_publication"));
 }
 
 #[test]
@@ -792,7 +797,8 @@ fn recover_project_is_registered_and_remains_a_pure_adapter() {
             "set_credential",
             "delete_credential",
             "preflight_project",
-            "provision_project"
+            "provision_project",
+            "prepare_local_publication"
         ]
     );
     // The desktop command layer delegates to the application use case.
@@ -833,7 +839,7 @@ fn create_project_setup_is_registered_and_a_pure_adapter() {
         .filter(|n| !n.is_empty())
         .collect();
     assert!(names.contains(&"create_project_setup"));
-    assert_eq!(names.len(), 12);
+    assert_eq!(names.len(), 13);
     let commands = read_source("/src/commands.rs");
     assert!(commands.contains("publisher_app::create_project_setup"));
     assert!(commands.contains("pub struct CreateProjectSetupOutcomeDto"));
@@ -1191,6 +1197,7 @@ fn aba_protection_uses_operation_generation_in_all_async_workflows() {
     for handler_name in [
         "async function onValidate()",
         "async function onDryRun()",
+        "async function onPrepareLocal()",
         "async function onPublish()",
     ] {
         let handler = script
@@ -1231,6 +1238,7 @@ fn aba_protection_uses_operation_generation_in_all_async_workflows() {
     for handler_name in [
         "async function onValidate()",
         "async function onDryRun()",
+        "async function onPrepareLocal()",
         "async function onPublish()",
     ] {
         let handler = script
@@ -2280,6 +2288,224 @@ fn preflight_rerun_invalidates_the_previous_dry_run() {
         .next()
         .unwrap();
     assert!(can_publish.contains("state.dryRunReady"));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7-K.2 — Explicit local publication bootstrap
+//
+// The committed local publication that Dry Run plans against — until now
+// created only inside Publish — becomes an explicit UI step between Preflight
+// and Dry Run. These tests pin the UI contract, the stale/ABA discipline of
+// the new handler, and the backend boundary of the new command.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn local_bootstrap_step_button_and_result_exist_between_preflight_and_dry_run() {
+    let html = read_source("/ui/index.html");
+    for id in [
+        "id=\"step-prepare\"",
+        "id=\"prepare-local-button\"",
+        "id=\"prepare-local-result\"",
+        "id=\"prepare-local-generation\"",
+    ] {
+        assert!(html.contains(id), "index.html must contain {id}");
+    }
+    // The visual sequence gains the explicit step:
+    // Preflight < Preparar local < Dry Run < Publicar.
+    let preflight = html.find("id=\"step-preflight\"").unwrap();
+    let prepare = html.find("id=\"step-prepare\"").unwrap();
+    let dryrun = html.find("id=\"step-dryrun\"").unwrap();
+    let publish = html.find("id=\"step-publish\"").unwrap();
+    assert!(preflight < prepare && prepare < dryrun && dryrun < publish);
+    let script = read_source("/ui/app.js");
+    assert!(
+        script.contains("el(\"prepare-local-button\").addEventListener(\"click\", onPrepareLocal)")
+    );
+    // The new step participates in the visual progress highlighting.
+    let pipeline = script
+        .split("function setPipelineStep()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(pipeline.contains("\"step-prepare\""));
+}
+
+#[test]
+fn local_bootstrap_gates_dry_run_and_keeps_publish_on_dry_run() {
+    let script = read_source("/ui/app.js");
+    // The bootstrap itself requires validation and a fresh preflight.
+    let guard = script
+        .split("function canPrepareLocal()")
+        .nth(1)
+        .expect("canPrepareLocal must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "!state.busy",
+        "state.validated",
+        "state.preflightReady",
+        "currentPath() === state.projectPath",
+    ] {
+        assert!(
+            guard.contains(required),
+            "canPrepareLocal must require {required}"
+        );
+    }
+    let handler = script
+        .split("async function onPrepareLocal()")
+        .nth(1)
+        .expect("onPrepareLocal must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(handler.contains("if (!canPrepareLocal()) return;"));
+    // Dry Run now additionally requires the committed local publication…
+    let can_dry_run = script
+        .split("function canDryRun()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(can_dry_run.contains("state.localReady"));
+    // …at the button gate AND inside the handler (defense in depth).
+    let on_dry_run = script
+        .split("async function onDryRun()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(on_dry_run.contains("if (!state.localReady) return;"));
+    // Publish keeps its existing gate: dryRunReady only, never localReady.
+    let can_publish = script
+        .split("function canPublish()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(can_publish.contains("state.dryRunReady"));
+    assert!(
+        !can_publish.contains("state.localReady"),
+        "publish keeps its existing gate"
+    );
+}
+
+#[test]
+fn local_bootstrap_success_unlocks_dry_run_and_invalidates_previous_plans() {
+    let script = read_source("/ui/app.js");
+    let handler = script
+        .split("async function onPrepareLocal()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // The run invalidates the previous local/dry-run state BEFORE awaiting.
+    let await_pos = handler.find("await tauri.invoke").unwrap();
+    assert!(handler.find("state.localReady = false").unwrap() < await_pos);
+    assert!(handler.find("state.dryRunReady = false").unwrap() < await_pos);
+    // Success: local ready, previous dry-run plan invalidated. The try
+    // block carries the state assignments before rendering the outcome.
+    let success = handler
+        .split("try {")
+        .nth(1)
+        .expect("the success branch must exist")
+        .split("} catch (error) {")
+        .next()
+        .unwrap();
+    assert!(success.contains("state.localReady = true"));
+    assert!(success.contains("state.dryRunReady = false"));
+    assert!(success.contains("showPrepareLocal(outcome);"));
+    assert!(success.contains("el(\"dry-run-button\").disabled = !canDryRun()"));
+    // Failure: stays not ready.
+    let failure = handler.split("} catch (error) {").nth(1).unwrap();
+    assert!(failure.contains("state.localReady = false"));
+}
+
+#[test]
+fn local_bootstrap_is_invalidated_by_path_change_validation_and_preflight() {
+    let script = read_source("/ui/app.js");
+    // A path change clears the step completely.
+    let path_handler = script
+        .split("function onProjectPathChanged()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for required in [
+        "state.localReady = false",
+        "el(\"prepare-local-button\").disabled = true",
+        "hide(\"prepare-local-result\")",
+    ] {
+        assert!(
+            path_handler.contains(required),
+            "path change must contain {required}"
+        );
+    }
+    // Revalidation restarts the flow for the same path.
+    let validate_handler = script
+        .split("async function onValidate()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(validate_handler.contains("state.localReady = false"));
+    // A new Preflight invalidates downstream state before its await.
+    let preflight_handler = script
+        .split("async function onPreflight()")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let await_pos = preflight_handler.find("await tauri.invoke").unwrap();
+    let invalidation = preflight_handler.find("state.localReady = false").unwrap();
+    assert!(
+        invalidation < await_pos,
+        "the preflight invalidation must precede the await"
+    );
+}
+
+#[test]
+fn prepare_local_command_is_registered_and_stays_a_pure_local_adapter() {
+    // Library side: a synchronous command delegating to the application use
+    // case — with no provider, credential, or environment surface.
+    let commands = read_source("/src/commands.rs");
+    assert!(commands.contains("pub fn prepare_local_publication"));
+    assert!(commands.contains("publisher_app::prepare_local_publication"));
+    let body = commands
+        .split("pub fn prepare_local_publication")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "build_providers(",
+        "build_provisioners(",
+        "credential_store(",
+        "EnvironmentCredentialStore",
+        "std::env",
+        "reqwest",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "the local bootstrap must not reference {forbidden}"
+        );
+    }
+    // Binary side: registered exactly once in the handler list, behind the
+    // same async boundary as the other long operations. The name appears
+    // exactly four times: doc comment, definition, call, registration.
+    let main = read_source("/src/main.rs");
+    assert_eq!(main.matches("prepare_local_publication").count(), 4);
+    assert!(main.contains("async fn prepare_local_publication"));
 }
 
 // ---------------------------------------------------------------------------

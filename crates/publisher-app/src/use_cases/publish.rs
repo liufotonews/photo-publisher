@@ -186,7 +186,12 @@ struct PreparedPublication {
     plan: IntegrationPlan,
 }
 
-fn build_local_publication(handle: &ProjectHandle) -> Result<(), ApplicationError> {
+/// Builds the local publication for a resolved handle: extracts the gallery
+/// title through the existing document rule and runs the local pipeline.
+/// Shared verbatim by `publish_project` and by the explicit
+/// `prepare_local_publication` bootstrap (Phase 7-K.2) — one implementation,
+/// two orchestrations.
+pub(crate) fn build_local_publication(handle: &ProjectHandle) -> Result<(), ApplicationError> {
     let document = crate::project::load_project_document(&handle.project_path)?;
     let title = document["gallery"]["title"].as_str().ok_or_else(|| {
         ApplicationError::new(

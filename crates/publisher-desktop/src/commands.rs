@@ -713,6 +713,35 @@ pub fn preflight_project(
     })
 }
 
+/// Outcome of the explicit local bootstrap (Phase 7-K.2): public identity
+/// facts plus the committed generation. Never secrets, never internal types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrepareLocalOutcomeDto {
+    pub project_id: String,
+    pub project_name: String,
+    /// Generation of the committed local publication (e.g. `g-000001`).
+    pub generation: String,
+}
+
+/// Prepares the local publication explicitly (Phase 7-K.2).
+///
+/// Pure adapter: delegates to `publisher_app::prepare_local_publication`,
+/// which resolves the project and runs the exact local-publication step
+/// Publish uses. Exclusively local — this command builds no providers,
+/// touches no credential, and reaches no network.
+pub fn prepare_local_publication(
+    project_path: &str,
+    events: &mut EventSink<'_>,
+) -> Result<PrepareLocalOutcomeDto, CommandError> {
+    let path = check_path(project_path)?;
+    let outcome = publisher_app::prepare_local_publication(&path, events)?;
+    Ok(PrepareLocalOutcomeDto {
+        project_id: outcome.project_id,
+        project_name: outcome.project_name,
+        generation: outcome.generation,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1649,5 +1678,78 @@ mod tests {
         // Nothing ran: the report is empty and the message is public text.
         assert_eq!(*failure.report, ProvisionProjectOutcomeDto::default());
         assert!(!failure.message.is_empty());
+    }
+
+    // --- Local bootstrap (Phase 7-K.2) ----------------------------------------
+
+    #[test]
+    fn prepare_local_bootstraps_a_committed_publication_and_reports_it() {
+        let root = tempdir().unwrap();
+        let project = write_v1_project_with_photo(root.path());
+        let mut captured: Vec<publisher_app::ApplicationEvent> = Vec::new();
+        let outcome =
+            prepare_local_publication(project.to_str().unwrap(), &mut |event| captured.push(event))
+                .unwrap();
+        assert_eq!(outcome.project_id, "app-test");
+        assert_eq!(outcome.project_name, "App Test");
+        assert_eq!(outcome.generation, "g-000001");
+        assert!(root.path().join("output").join("gallery.json").is_file());
+        // The workflow lifecycle of the shared local-publication step.
+        assert_eq!(
+            captured,
+            vec![
+                publisher_app::ApplicationEvent::EnteredStep(
+                    publisher_app::WorkflowStep::LocalPublication
+                ),
+                publisher_app::ApplicationEvent::LeftStep {
+                    step: publisher_app::WorkflowStep::LocalPublication,
+                    ok: true
+                },
+                publisher_app::ApplicationEvent::Finished,
+            ]
+        );
+        // Idempotent: a second run reports the same generation (no new one).
+        let again = prepare_local_publication(project.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert_eq!(again.generation, "g-000001");
+    }
+
+    #[test]
+    fn prepare_local_works_for_v2_projects_too() {
+        // The bootstrap is the same local operation for every schema
+        // version — never artificially limited to v2 (or vice versa).
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("fotos")).unwrap();
+        let path = write_coherent_v2_project(root.path());
+        let outcome = prepare_local_publication(path.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert_eq!(outcome.project_id, "joao-maria-2026");
+        assert_eq!(outcome.generation, "g-000001");
+    }
+
+    #[test]
+    fn prepare_local_classifies_failures_without_internals() {
+        let error = prepare_local_publication("   ", &mut |_| {}).unwrap_err();
+        assert_eq!(error.kind, "project_invalid");
+        let root = tempdir().unwrap();
+        let missing = root.path().join("project.json");
+        let error = prepare_local_publication(missing.to_str().unwrap(), &mut |_| {}).unwrap_err();
+        assert_eq!(error.kind, "resource_missing");
+        assert!(!error.message.contains("panicked"));
+    }
+
+    #[test]
+    fn prepare_local_rejects_concurrent_executions_through_the_pipeline_lock() {
+        // The domain protection is the pipeline's own execution lock: with
+        // the lock held, the bootstrap is refused without any UI guard.
+        let root = tempdir().unwrap();
+        let project = write_project(root.path());
+        let publisher_dir = root.path().join("output").join(".publisher");
+        std::fs::create_dir_all(&publisher_dir).unwrap();
+        std::fs::write(publisher_dir.join("run.lock"), b"").unwrap();
+        let error = prepare_local_publication(project.to_str().unwrap(), &mut |_| {}).unwrap_err();
+        assert_eq!(error.kind, "publication_failed");
+        assert!(error
+            .message
+            .contains("another publisher execution is active"));
+        assert!(!root.path().join("output").join("gallery.json").exists());
     }
 }

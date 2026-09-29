@@ -42,8 +42,8 @@ pub use setup::{
 };
 pub use setup_service::{create_project_setup, ProjectSetupOutcome};
 pub use use_cases::{
-    dry_run_project, inspect_project, preflight_project, publish_project, recover_publication,
-    validate_project, DryRunOutcome, InspectOutcome, JournalSummary, PreflightIssue,
-    PreflightIssueCode, PreflightOutcome, PublishOptions, PublishOutcome, RecoverOutcome,
-    RecoveryState,
+    dry_run_project, inspect_project, preflight_project, prepare_local_publication,
+    publish_project, recover_publication, validate_project, DryRunOutcome, InspectOutcome,
+    JournalSummary, PreflightIssue, PreflightIssueCode, PreflightOutcome, PrepareLocalOutcome,
+    PublishOptions, PublishOutcome, RecoverOutcome, RecoveryState,
 };

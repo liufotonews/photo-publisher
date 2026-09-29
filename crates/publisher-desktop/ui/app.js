@@ -16,6 +16,7 @@ const state = {
   validated: false,
   configReady: false,
   preflightReady: false,
+  localReady: false,
   dryRunReady: false,
   busy: false,
   needsRecovery: false,
@@ -74,6 +75,20 @@ function canDryRun() {
     !state.busy &&
     state.validated &&
     state.preflightReady &&
+    state.localReady &&
+    state.projectPath !== "" &&
+    currentPath() === state.projectPath
+  );
+}
+
+// Preparar a galeria local (Phase 7-K.2) exige projeto validado E Preflight
+// concluído: é a etapa que produz a publicação local comprometida sobre a
+// qual o Dry Run passa a planear.
+function canPrepareLocal() {
+  return (
+    !state.busy &&
+    state.validated &&
+    state.preflightReady &&
     state.projectPath !== "" &&
     currentPath() === state.projectPath
   );
@@ -108,6 +123,7 @@ function refreshButtons() {
   el("config-validate-button").disabled = state.busy;
   el("provision-button").disabled = !canProvision();
   el("preflight-button").disabled = !canPreflight();
+  el("prepare-local-button").disabled = !canPrepareLocal();
   el("dry-run-button").disabled = !canDryRun();
   el("publish-button").disabled = !canPublish();
   el("recover-button").disabled = !canRecover();
@@ -120,6 +136,7 @@ function setPipelineStep() {
     "step-project",
     "step-validate",
     "step-preflight",
+    "step-prepare",
     "step-dryrun",
     "step-publish",
   ];
@@ -134,6 +151,8 @@ function setPipelineStep() {
     active = "step-publish";
   } else if (label.includes("publica")) {
     active = "step-publish";
+  } else if (label.includes("prepar")) {
+    active = "step-prepare";
   } else if (label.includes("Preflight")) {
     active = "step-preflight";
   } else if (label.includes("Dry Run") || label.includes("dry")) {
@@ -374,8 +393,12 @@ async function onPreflight() {
   // Um novo Preflight é uma nova verificação de pré-condições: o Dry Run
   // anterior deixa de representar o estado atual e tem de ser repetido.
   state.dryRunReady = false;
+  // A preparação local também fica inválida: as pré-condições podem ter
+  // mudado e a etapa tem de ser repetida antes do Dry Run.
+  state.localReady = false;
   hide("preflight-result");
   hide("dry-run-result");
+  hide("prepare-local-result");
   setBusy(true, "A executar Preflight…");
   try {
     const outcome = await tauri.invoke("preflight_project", { projectPath });
@@ -407,6 +430,74 @@ async function onPreflight() {
     state.preflightReady = false;
     showPreflightError(error);
     setBusy(false, "Falha no Preflight.");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Local bootstrap (Phase 7-K.2)
+//
+// Etapa explícita entre Preflight e Dry Run: a publicação local comprometida
+// — que o Dry Run planeia e que antes só o Publicar criava — é construída
+// aqui pelo mesmo pipeline, sem tocar em providers, credenciais ou rede. O
+// estado segue a disciplina habitual de geração/ABA; a operação é longa e
+// partilha o mesmo busy das demais. Nenhuma informação sensível é
+// renderizada.
+// ---------------------------------------------------------------------------
+
+function showPrepareLocal(outcome) {
+  el("prepare-local-result").hidden = false;
+  el("prepare-local-result-title").textContent = "Publicação local";
+  el("prepare-local-status").textContent =
+    "✓ Galeria local preparada e pronta para o Dry Run.";
+  el("prepare-local-generation").textContent = outcome.generation;
+}
+
+function showPrepareLocalError(error) {
+  el("prepare-local-result").hidden = false;
+  el("prepare-local-result-title").textContent = "Publicação local";
+  el("prepare-local-status").textContent =
+    error && error.message ? error.message : "Erro desconhecido.";
+  el("prepare-local-generation").textContent = "";
+}
+
+async function onPrepareLocal() {
+  if (!canPrepareLocal()) return;
+  const projectPath = state.projectPath;
+  const generation = beginOperation();
+  state.localReady = false;
+  // Um novo bootstrap invalida o plano anterior: o Dry Run tem de ser
+  // repetido sobre a publicação local que esta execução produzir.
+  state.dryRunReady = false;
+  hide("prepare-local-result");
+  hide("dry-run-result");
+  hide("publish-result");
+  setBusy(true, "A preparar galeria local…");
+  try {
+    const outcome = await tauri.invoke("prepare_local_publication", { projectPath });
+    // Mesma disciplina stale/ABA dos outros handlers: uma resposta antiga
+    // não toca o estado atual.
+    if (currentPath() !== projectPath) {
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
+      return;
+    }
+    state.localReady = true;
+    state.dryRunReady = false;
+    showPrepareLocal(outcome);
+    setBusy(false, "Galeria local preparada.");
+    el("dry-run-button").disabled = !canDryRun();
+    el("publish-button").disabled = !canPublish();
+  } catch (error) {
+    if (currentPath() !== projectPath) {
+      return;
+    }
+    if (!isCurrentOperation(generation, projectPath)) {
+      return;
+    }
+    state.localReady = false;
+    showPrepareLocalError(error);
+    setBusy(false, "Falha ao preparar a galeria local.");
   }
 }
 
@@ -667,11 +758,14 @@ async function onValidate() {
   // sequência volta a exigir Validar → Configuração → Preflight para este
   // caminho (e Provisionar fica travado até lá).
   state.preflightReady = false;
+  state.localReady = false;
   state.configReady = false;
   hide("provision-result");
   el("provision-button").disabled = true;
   hide("preflight-result");
   el("preflight-button").disabled = true;
+  hide("prepare-local-result");
+  el("prepare-local-button").disabled = true;
   el("dry-run-button").disabled = true;
   el("publish-button").disabled = true;
   state.projectPath = projectPath;
@@ -713,6 +807,9 @@ async function onValidate() {
 
 async function onDryRun() {
   if (state.busy || !state.validated) return;
+  // O Dry Run planeia contra a publicação local comprometida: ela só
+  // existe depois de Preparar a galeria local (Phase 7-K.2).
+  if (!state.localReady) return;
   const projectPath = state.projectPath;
   if (!projectPath || currentPath() !== projectPath) return;
   const generation = beginOperation();
@@ -830,17 +927,20 @@ function onProjectPathChanged() {
   hide("recover-result");
   hide("recover-section");
   state.preflightReady = false;
+  state.localReady = false;
   state.dryRunReady = false;
   state.configReady = false;
   state.projectPath = "";
   el("provision-button").disabled = true;
   el("preflight-button").disabled = true;
+  el("prepare-local-button").disabled = true;
   el("dry-run-button").disabled = true;
   el("publish-button").disabled = true;
   hide("project-result");
   hide("configuration-result");
   hide("provision-result");
   hide("preflight-result");
+  hide("prepare-local-result");
   hide("dry-run-result");
   hide("publish-result");
   // The superseded operation is no longer current: the UI frees its busy
@@ -1121,6 +1221,7 @@ function setCreateMode(active) {
   el("configuration-result").hidden = active;
   el("provision-section").hidden = active;
   el("preflight-result").hidden = active;
+  el("prepare-local-result").hidden = active;
   el("dry-run-result").hidden = active;
   el("publish-result").hidden = active;
   el("recover-section").hidden = active;
@@ -1136,6 +1237,7 @@ async function main() {
   el("config-validate-button").addEventListener("click", onValidateConfiguration);
   el("provision-button").addEventListener("click", onProvision);
   el("preflight-button").addEventListener("click", onPreflight);
+  el("prepare-local-button").addEventListener("click", onPrepareLocal);
   el("dry-run-button").addEventListener("click", onDryRun);
   el("publish-button").addEventListener("click", onPublish);
   el("recover-button").addEventListener("click", onRecover);

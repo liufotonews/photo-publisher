@@ -15,8 +15,9 @@
 
 use publisher_desktop::commands::{
     AppInfo, CommandError, CreateProjectSetupOutcomeDto, CredentialStatusDto, DryRunOutcomeDto,
-    PreflightOutcomeDto, ProvisionProjectFailureDto, ProvisionProjectOutcomeDto, ProvisioningGate,
-    PublishOutcomeDto, RecoverOutcomeDto, ValidateConfigurationOutcomeDto, ValidateProjectOutcome,
+    PreflightOutcomeDto, PrepareLocalOutcomeDto, ProvisionProjectFailureDto,
+    ProvisionProjectOutcomeDto, ProvisioningGate, PublishOutcomeDto, RecoverOutcomeDto,
+    ValidateConfigurationOutcomeDto, ValidateProjectOutcome,
 };
 use tauri::Emitter;
 
@@ -191,6 +192,36 @@ async fn provision_project(
     })?
 }
 
+/// Prepares the local publication explicitly (Phase 7-K.2): the committed
+/// gallery that Dry Run plans against and that, until now, only Publish
+/// created. Like publication, it can be long (scanning, hashing, resizing),
+/// so it shares the same boundary: synchronous business logic in
+/// `commands::prepare_local_publication`, async only here at the Tauri
+/// wrapper, events forwarded through the single channel. Exclusively local —
+/// no provider, no credential, no network.
+#[tauri::command]
+async fn prepare_local_publication(
+    app_handle: tauri::AppHandle,
+    project_path: String,
+) -> Result<PrepareLocalOutcomeDto, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut sink = |event: publisher_app::ApplicationEvent| {
+            let _ = app_handle.emit(
+                publisher_desktop::events::PUBLISHER_EVENT_CHANNEL,
+                publisher_desktop::events::DesktopEvent::from(&event),
+            );
+        };
+        publisher_desktop::commands::prepare_local_publication(&project_path, &mut sink)
+    })
+    .await
+    .map_err(|_| CommandError {
+        kind: publisher_app::ApplicationErrorKind::Internal
+            .as_str()
+            .to_owned(),
+        message: "local publication task failed to join".to_owned(),
+    })?
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(DesktopState)
@@ -210,7 +241,8 @@ fn main() {
             set_credential,
             delete_credential,
             preflight_project,
-            provision_project
+            provision_project,
+            prepare_local_publication
         ])
         .run(tauri::generate_context!("tauri.conf.json"))
         .expect("error while running the Photo Publisher desktop application");

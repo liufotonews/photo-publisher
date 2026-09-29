@@ -38,12 +38,16 @@
             <span class="step-index">3</span>
             <span class="step-label">Preflight</span>
           </li>
-          <li id="step-dryrun" class="step">
+          <li id="step-prepare" class="step">
             <span class="step-index">4</span>
+            <span class="step-label">Preparar galeria local</span>
+          </li>
+          <li id="step-dryrun" class="step">
+            <span class="step-index">5</span>
             <span class="step-label">Dry Run</span>
           </li>
           <li id="step-publish" class="step">
-            <span class="step-index">5</span>
+            <span class="step-index">6</span>
             <span class="step-label">Publicar</span>
           </li>
         </ol>
@@ -67,13 +71,15 @@
             Validar configuração
           </button>
           <button id="preflight-button" type="button" disabled>Executar Preflight</button>
+          <button id="prepare-local-button" type="button" disabled>Preparar galeria local</button>
           <button id="dry-run-button" type="button" disabled>Executar Dry Run</button>
           <button id="publish-button" type="button" disabled>Publicar</button>
         </div>
         <p class="hint">
           Valide o projeto, execute o Preflight (configuração e credenciais),
-          execute o Dry Run e só então publique. Validar configuração é um
-          diagnóstico estrutural — não altera o fluxo de publicação.
+          prepare a galeria local, execute o Dry Run e só então publique.
+          Validar configuração é um diagnóstico estrutural — não altera o
+          fluxo de publicação.
         </p>
       </section>
 
@@ -118,6 +124,18 @@
         <h2 id="preflight-result-title">Preflight</h2>
         <p id="preflight-status" class="status"></p>
         <ul id="preflight-issues" class="issue-list"></ul>
+      </section>
+
+      <!-- Publicação local (Phase 7-K.2): etapa explícita entre Preflight e
+           Dry Run — constrói a galeria local comprometida que o Dry Run
+           planeia e que antes só o Publicar criava. Apenas local; nada é
+           publicado remotamente aqui. -->
+      <section id="prepare-local-result" class="card result" hidden aria-live="polite">
+        <h2 id="prepare-local-result-title">Publicação local</h2>
+        <p id="prepare-local-status" class="status"></p>
+        <dl id="prepare-local-summary" class="summary">
+          <div><dt>Geração</dt><dd id="prepare-local-generation"></dd></div>
+        </dl>
       </section>
 
       <section id="dry-run-result" class="card result" hidden aria-live="polite">
