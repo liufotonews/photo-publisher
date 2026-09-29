@@ -1050,7 +1050,12 @@ mod tests {
     /// A schema-valid, fully coherent v2 document for the 7-D command tests.
     fn write_coherent_v2_project(root: &Path) -> std::path::PathBuf {
         // Configuration validation reads only the document — no source
-        // directory, credentials, or network are needed.
+        // directory, credentials, or network are needed. The declared bundle
+        // is materialized as well: Preflight (7-K.3) checks the template
+        // resource on disk, and a coherent project has it available.
+        let bundle = root.join("gallery-app");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("index.html"), b"<h1>template</h1>").unwrap();
         let path = root.join("project.json");
         std::fs::write(
             &path,
@@ -1263,6 +1268,35 @@ mod tests {
         assert_eq!(outcome.schema_version, 2);
         assert_eq!(outcome.project_id, "joao-maria-2026");
         assert!(outcome.issues.is_empty());
+        clear_all_credentials();
+    }
+
+    #[test]
+    fn preflight_project_reports_template_unavailability_without_exposing_paths() {
+        // Phase 7-K.3: the declared gallery template is a local resource the
+        // integrated publication needs; when it is absent the outcome is
+        // ready=false with the stable `template_unavailable` diagnosis.
+        let _guard = crate::composition::ENV_LOCK.lock().unwrap();
+        clear_all_credentials();
+        set_all_credentials("test-value");
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("fotos")).unwrap();
+        let path = write_coherent_v2_project(root.path());
+        std::fs::remove_dir_all(root.path().join("gallery-app")).unwrap();
+        let outcome = preflight_project(path.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert!(!outcome.ready);
+        assert_eq!(outcome.issues.len(), 1, "issues: {:?}", outcome.issues);
+        assert_eq!(outcome.issues[0].code, "template_unavailable");
+        assert_eq!(outcome.issues[0].field, "gallery.bundlePath");
+        let json = serde_json::to_string(&outcome).unwrap();
+        // The declared path is the user's own configuration and may appear;
+        // the resolved machine path, credential values, and environment
+        // names may never appear.
+        assert!(json.contains("'gallery-app'"));
+        assert!(!json.contains(root.path().display().to_string().as_str()));
+        for needle in ["test-value", "PHOTO_PUBLISHER_"] {
+            assert!(!json.contains(needle), "preflight DTO leaked {needle}");
+        }
         clear_all_credentials();
     }
 

@@ -7,8 +7,9 @@
 //! inspects is local: the project document (level 1, reused), the declared
 //! configuration (level 2, reuse of Phase 7-D), the source folder's
 //! availability (the existing path-resolution rule), and — for the
-//! integrated flow only — the *configured bits* of the allowlisted
-//! credentials (reuse of the Phase 7-E service).
+//! integrated flow only — the gallery template's availability (the existing
+//! bundle-resolution rule, Phase 7-K.3) and the *configured bits* of the
+//! allowlisted credentials (reuse of the Phase 7-E service).
 //!
 //! A credential is only ever read as "configured / not configured"; its
 //! value never appears in an issue, an error, or the outcome.
@@ -33,6 +34,10 @@ pub enum PreflightIssueCode {
     Configuration(ConfigurationIssueCode),
     /// The declared source folder does not exist on this machine.
     SourceUnavailable,
+    /// The gallery template the integrated publication composes from (the
+    /// local bundle declared in `gallery.bundlePath`) is not available on
+    /// this machine.
+    TemplateUnavailable,
     /// A credential the integrated publication needs is not configured.
     CredentialMissing,
 }
@@ -43,6 +48,7 @@ impl PreflightIssueCode {
         match self {
             Self::Configuration(code) => code.as_str(),
             Self::SourceUnavailable => "source_unavailable",
+            Self::TemplateUnavailable => "template_unavailable",
             Self::CredentialMissing => "credential_missing",
         }
     }
@@ -136,6 +142,42 @@ fn run(
                     // never a resolved absolute machine path.
                     message: format!(
                         "A pasta de origem declarada ('{declared}') não existe neste computador."
+                    ),
+                });
+            }
+        }
+    }
+
+    // Template availability (Phase 7-K.3): the integrated (v2) publication
+    // composes the publishable application from the local bundle the
+    // document declares in `gallery.bundlePath`, so that resource must exist
+    // before the flow continues. The check reuses the exact resolution and
+    // loading rule Dry Run and Publish apply — resolve relative to the
+    // project file, reject absolute/escaping paths, load as an application
+    // bundle — and is strictly read-only: nothing is fetched, downloaded,
+    // created, or provisioned. The v1 local publication is produced by the
+    // local pipeline alone and never consumes a template directory, so no
+    // template resource is required (or looked at) there.
+    if setup.schema_version == 2 {
+        if let Some(bundle_path) = setup
+            .gallery
+            .bundle_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+        {
+            if photo_publisher_integration::ApplicationBundle::from_project_bundle(
+                project_path,
+                bundle_path,
+            )
+            .is_err()
+            {
+                issues.push(PreflightIssue {
+                    code: PreflightIssueCode::TemplateUnavailable,
+                    field: "gallery.bundlePath".to_owned(),
+                    // The declared path is the user's own configuration —
+                    // never a resolved absolute machine path.
+                    message: format!(
+                        "O template da galeria ('{bundle_path}') não está disponível neste computador."
                     ),
                 });
             }
@@ -242,6 +284,14 @@ mod tests {
     ) -> std::path::PathBuf {
         if with_source {
             std::fs::create_dir_all(root.join("fotos")).unwrap();
+        }
+        // A declared bundle path materializes as a minimal on-disk template:
+        // preflight then sees exactly the resource the publication would
+        // consume. Tests for its absence remove the directory explicitly.
+        if let Some(bundle_path) = document["gallery"]["bundlePath"].as_str() {
+            let directory = root.join(bundle_path);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("index.html"), b"<h1>template</h1>").unwrap();
         }
         let path = root.join("project.json");
         std::fs::write(&path, serde_json::to_vec(document).unwrap()).unwrap();
@@ -368,6 +418,116 @@ mod tests {
                 .contains(root.path().display().to_string().as_str()),
             "the resolved absolute path must never leak into the message"
         );
+    }
+
+    #[test]
+    fn v2_with_a_missing_template_is_not_ready_and_reports_template_unavailable() {
+        let root = tempdir().unwrap();
+        let path = write_project(root.path(), &v2_document(), true);
+        // The declared bundle is not (or no longer) on this machine.
+        std::fs::remove_dir_all(root.path().join("gallery-app")).unwrap();
+        let store = fully_configured_store();
+        let outcome = preflight_project(&path, &store, &mut |_| {}).unwrap();
+        assert!(!outcome.ready);
+        assert_eq!(codes(&outcome), ["template_unavailable"]);
+        assert_eq!(outcome.issues[0].field, "gallery.bundlePath");
+        // The message carries the declared path (the user's own
+        // configuration) — never the resolved absolute machine path.
+        assert!(outcome.issues[0].message.contains("'gallery-app'"));
+        assert!(
+            !outcome.issues[0]
+                .message
+                .contains(root.path().display().to_string().as_str()),
+            "the resolved absolute path must never leak into the message"
+        );
+    }
+
+    #[test]
+    fn template_availability_joins_the_fixed_issue_order_of_the_preflight() {
+        // No source folder, no bundle on disk, no credentials: every rule
+        // fires exactly once — configuration issues first (none here), then
+        // source availability, then template availability, then the
+        // credential bits. The new rule inserts into the established order;
+        // it never starts a parallel one.
+        let root = tempdir().unwrap();
+        let path = write_project(root.path(), &v2_document(), false);
+        std::fs::remove_dir_all(root.path().join("gallery-app")).unwrap();
+        let outcome = preflight_project(&path, &FakeStore::default(), &mut |_| {}).unwrap();
+        assert!(!outcome.ready);
+        let all = codes(&outcome);
+        assert_eq!(all.first(), Some(&"source_unavailable"));
+        assert_eq!(all.get(1), Some(&"template_unavailable"));
+        assert_eq!(
+            all.iter().skip(2).copied().collect::<Vec<_>>(),
+            vec!["credential_missing"; 4]
+        );
+    }
+
+    #[test]
+    fn v1_never_requires_a_template_bundle_on_disk() {
+        // The v1 local publication is produced by the local pipeline alone:
+        // no template directory is resolved or read for it — even when the
+        // document happens to declare a (never consumed) bundle path.
+        let root = tempdir().unwrap();
+        let mut document = v1_document();
+        document["gallery"]["bundlePath"] = serde_json::Value::String("missing-bundle".to_owned());
+        let path = write_project(root.path(), &document, true);
+        std::fs::remove_dir_all(root.path().join("missing-bundle")).unwrap();
+        let store = FakeStore::default();
+        let outcome = preflight_project(&path, &store, &mut |_| {}).unwrap();
+        assert!(outcome.ready, "issues: {:?}", outcome.issues);
+        assert!(outcome.issues.is_empty());
+    }
+
+    /// Deterministic recursive snapshot of a project tree: every relative
+    /// path plus, for files, its byte length.
+    fn tree_snapshot(root: &Path) -> Vec<String> {
+        fn walk(root: &Path, dir: &Path, entries: &mut Vec<String>) {
+            let mut listing: Vec<_> = std::fs::read_dir(dir).unwrap().collect();
+            listing.sort_by_key(|entry| entry.as_ref().unwrap().path());
+            for entry in listing {
+                let entry = entry.unwrap();
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    entries.push(format!("{relative}/"));
+                    walk(root, &entry.path(), entries);
+                } else {
+                    let size = std::fs::read(entry.path()).unwrap().len();
+                    entries.push(format!("{relative}:{size}"));
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        walk(root, root, &mut entries);
+        entries
+    }
+
+    #[test]
+    fn preflight_writes_nothing_whatever_the_template_state() {
+        for template_present in [true, false] {
+            let root = tempdir().unwrap();
+            let path = write_project(root.path(), &v2_document(), true);
+            if !template_present {
+                std::fs::remove_dir_all(root.path().join("gallery-app")).unwrap();
+            }
+            let before = tree_snapshot(root.path());
+            let outcome = preflight_project(&path, &fully_configured_store(), &mut |_| {}).unwrap();
+            assert_eq!(outcome.ready, template_present);
+            assert_eq!(
+                before,
+                tree_snapshot(root.path()),
+                "preflight must be strictly read-only"
+            );
+            // No gallery, state, journal, ledger, staging, or backup is
+            // ever produced: the local output directory is not even created.
+            assert!(!root.path().join("output").exists());
+        }
     }
 
     #[test]
