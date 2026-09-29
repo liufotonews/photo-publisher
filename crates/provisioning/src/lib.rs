@@ -175,6 +175,32 @@ mod tests {
     }
 
     #[test]
+    fn the_repository_branch_is_additive_and_defaults_to_main() {
+        // Phase 7-K.4: `branch` arrives as an optional declaration; absent
+        // means the Publisher's existing default — exactly one field, one
+        // convention.
+        let config = RepositoryProvisionConfig::new("fotografo", "projeto").unwrap();
+        assert_eq!(config.branch, None);
+        assert_eq!(config.branch(), "main");
+        assert_eq!(
+            config.clone().with_branch(None).unwrap().branch(),
+            "main",
+            "None keeps the default branch"
+        );
+        for declared in ["main", "production"] {
+            let config = config
+                .clone()
+                .with_branch(Some(declared.to_owned()))
+                .unwrap();
+            assert_eq!(config.branch(), declared);
+            assert_eq!(config.branch.as_deref(), Some(declared));
+        }
+        // Structural validation mirrors the identity parts' style.
+        assert!(config.clone().with_branch(Some(" ".to_owned())).is_err());
+        assert!(config.with_branch(Some("has space".to_owned())).is_err());
+    }
+
+    #[test]
     fn conflicts_are_errors_and_reconciliation_states_are_outcomes() {
         // A divergent existing resource is representable as an *error*...
         let error = ProvisioningError::new(

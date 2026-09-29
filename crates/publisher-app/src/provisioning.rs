@@ -174,7 +174,10 @@ pub fn provision_project(
             ),
         ));
     };
+    // The declared branch is infrastructure identity for the repository
+    // provisioner (Phase 7-K.4); absent means the contract default.
     let repository_config = RepositoryProvisionConfig::new(owner, name)
+        .and_then(|config| config.with_branch(setup.repository.branch.clone()))
         .map_err(|error| failure(report.clone(), from_provisioner(error)))?;
 
     let (Some(account_id), Some(bucket)) = (
@@ -322,10 +325,12 @@ mod tests {
 
     /// Each stub records its invocation in the shared log and reads its
     /// expected credential name through the boundary (a handshake that is
-    /// observable, and that never retains the value).
+    /// observable, and that never retains the value). The repository stub
+    /// also records the branch the configuration carried.
     struct StubRepository {
         script: Script,
         log: Rc<RefCell<Vec<&'static str>>>,
+        branches: Rc<RefCell<Vec<String>>>,
     }
     struct StubStorage {
         script: Script,
@@ -362,6 +367,7 @@ mod tests {
             credentials: &dyn CredentialStore,
         ) -> ProvisioningResult<ProvisioningOutcome<RepositoryIdentity>> {
             self.log.borrow_mut().push("repository");
+            self.branches.borrow_mut().push(config.branch().to_owned());
             let _ = credentials.get("github.token").map_err(|_| {
                 ProvisioningError::new(ProvisioningErrorKind::Internal, "store read failed")
             })?;
@@ -418,15 +424,18 @@ mod tests {
         domain: StubDomain,
         credentials: FakeCredentials,
         log: Rc<RefCell<Vec<&'static str>>>,
+        branches: Rc<RefCell<Vec<String>>>,
     }
 
     impl Rig {
         fn new(scripts: [Script; 4]) -> Self {
             let log = Rc::new(RefCell::new(Vec::new()));
+            let branches = Rc::new(RefCell::new(Vec::new()));
             Self {
                 repository: StubRepository {
                     script: scripts[0],
                     log: Rc::clone(&log),
+                    branches: Rc::clone(&branches),
                 },
                 storage: StubStorage {
                     script: scripts[1],
@@ -442,11 +451,16 @@ mod tests {
                 },
                 credentials: FakeCredentials::default(),
                 log,
+                branches,
             }
         }
 
         fn calls(&self) -> Vec<&'static str> {
             self.log.borrow().clone()
+        }
+
+        fn branches(&self) -> Vec<String> {
+            self.branches.borrow().clone()
         }
     }
 
@@ -726,6 +740,56 @@ mod tests {
         assert_eq!(failure.error.kind, ApplicationErrorKind::ResourceMissing);
         assert!(rig.calls().is_empty());
         assert_eq!(*failure.report, ProvisionProjectReport::default());
+    }
+
+    #[test]
+    fn the_declared_repository_branch_reaches_the_repository_provisioner() {
+        // Phase 7-K.4: repository.branch in project.json is infrastructure
+        // identity and must reach the repository provisioner verbatim; an
+        // undeclared branch means the contract default ("main").
+        let root = tempdir().unwrap();
+        let path = write_project(&root, false); // fixture declares "main"
+        let mut rig = Rig::new([
+            Script::Created,
+            Script::Created,
+            Script::Created,
+            Script::Created,
+        ]);
+        provision(&path, &mut rig).unwrap();
+        assert_eq!(rig.branches(), ["main"]);
+
+        let root = tempdir().unwrap();
+        let path = write_project(&root, false);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        document["repository"]["branch"] = serde_json::Value::String("production".to_owned());
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let mut rig = Rig::new([
+            Script::Created,
+            Script::Created,
+            Script::Created,
+            Script::Created,
+        ]);
+        provision(&path, &mut rig).unwrap();
+        assert_eq!(rig.branches(), ["production"]);
+
+        let root = tempdir().unwrap();
+        let path = write_project(&root, false);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        document["repository"]
+            .as_object_mut()
+            .unwrap()
+            .remove("branch");
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let mut rig = Rig::new([
+            Script::Created,
+            Script::Created,
+            Script::Created,
+            Script::Created,
+        ]);
+        provision(&path, &mut rig).unwrap();
+        assert_eq!(rig.branches(), ["main"], "absent branch → contract default");
     }
 
     #[test]

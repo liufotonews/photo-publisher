@@ -36,7 +36,15 @@ impl fmt::Display for RepositoryIdentity {
 pub struct RepositoryProvisionConfig {
     pub owner: String,
     pub name: String,
+    /// The branch the Publisher requires on the repository (Phase 7-K.4).
+    /// `None` means the default branch: the Publisher's own fallback,
+    /// [`DEFAULT_BRANCH`], is reused — never a second convention.
+    pub branch: Option<String>,
 }
+
+/// The branch the Publisher assumes when `project.json` declares none:
+/// identical to the publishing-side default (`provider-github`).
+pub const DEFAULT_BRANCH: &str = "main";
 
 impl RepositoryProvisionConfig {
     /// Structural validation only: both parts must be non-blank and free of
@@ -55,7 +63,38 @@ impl RepositoryProvisionConfig {
                 "repository identity must be a non-blank 'owner/name' pair",
             ));
         }
-        Ok(Self { owner, name })
+        Ok(Self {
+            owner,
+            name,
+            branch: None,
+        })
+    }
+
+    /// Attaches the declared branch (Phase 7-K.4). A present branch must be
+    /// non-blank and free of whitespace — the same structural, provider-
+    /// agnostic rule as the identity parts. `None` keeps the default.
+    pub fn with_branch(mut self, branch: Option<String>) -> ProvisioningResult<Self> {
+        if let Some(branch) = &branch {
+            if branch.trim().is_empty() || branch.chars().any(char::is_whitespace) {
+                return Err(ProvisioningError::new(
+                    ProvisioningErrorKind::InvalidConfiguration,
+                    "repository branch must be non-blank and free of whitespace",
+                ));
+            }
+        }
+        self.branch = branch;
+        Ok(self)
+    }
+
+    /// The branch that must exist after provisioning: the declared one, or
+    /// [`DEFAULT_BRANCH`] when the document declares none. The remote
+    /// repository's own default is never consulted as a substitute.
+    pub fn branch(&self) -> &str {
+        self.branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or(DEFAULT_BRANCH)
     }
 
     /// The public identity this configuration refers to.
