@@ -620,6 +620,18 @@ function showPublishError(error) {
     error && error.message ? error.message : "Erro desconhecido.";
 }
 
+// Rejeição do PublicationGate (Phase 7-K.6): a tentativa NUNCA começou —
+// não é uma publicação que falhou. Estado válido existente e o andamento da
+// publicação em execução não são tocados; só a recusa é apresentada.
+function showPublishBusy(error) {
+  el("publish-result").hidden = false;
+  el("publish-result-title").textContent = "Publicação em andamento";
+  el("publish-status").textContent =
+    error && error.message
+      ? error.message
+      : "Já existe uma publicação em andamento.";
+}
+
 function showRecover(outcome) {
   el("recover-result").hidden = false;
   if (outcome.recovered) {
@@ -934,6 +946,14 @@ async function onPublish() {
       return;
     }
     if (!isCurrentOperation(generation, projectPath)) {
+      return;
+    }
+    // PublicationGate (7-K.6): uma recusa de concorrência não é uma
+    // publicação falha — nenhum estado válido (preflight, dry-run,
+    // provisionamento, publicação local) é invalidado por ela.
+    if (error && error.kind === "publication_busy") {
+      showPublishBusy(error);
+      setBusy(false, "Publicação em andamento.");
       return;
     }
     showPublishError(error);

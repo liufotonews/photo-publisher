@@ -2918,3 +2918,257 @@ fn provisioning_commands_keep_their_shape_and_stay_within_their_scope() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7-K.6 — PublicationGate: one publication at a time
+//
+// The JavaScript busy flag is presentation only; the real exclusion is a
+// Tauri-managed backend gate, acquired atomically before any blocking work
+// is queued and released only by the worker finishing. These structural
+// tests pin the binary/library wiring and the UI presentation of a refused
+// concurrent publication.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn publication_exclusion_is_managed_state_acquired_before_the_blocking_work() {
+    let main = read_source("/src/main.rs");
+    // The publication gate is registered as Tauri-managed state, as an
+    // INDEPENDENT slot next to the provisioning one.
+    assert!(
+        main.contains(".manage(PublicationGate::new())"),
+        "the publication gate must be registered as managed state"
+    );
+    assert!(main.contains(".manage(ProvisioningGate::new())"));
+    let wrapper = main
+        .split("async fn publish_project")
+        .nth(1)
+        .expect("the publication wrapper must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // Acquisition precedes the blocking task...
+    let acquire = wrapper
+        .find("try_acquire()")
+        .expect("the wrapper must acquire the gate");
+    let spawn = wrapper
+        .find("spawn_blocking")
+        .expect("the wrapper must run the work in a blocking task");
+    assert!(
+        acquire < spawn,
+        "the slot must be acquired before any blocking work is queued"
+    );
+    // ...and the refusal is immediate: it returns before anything is queued.
+    let refusal = wrapper
+        .find("publication_busy_error()")
+        .expect("the refusal must be the dedicated busy error");
+    assert!(refusal < spawn, "a refused attempt must not queue any work");
+    // The refusal branch is a pure return: no command, no runner, no spawn.
+    let refusal_block = wrapper[wrapper.find("else {").unwrap()..]
+        .split('}')
+        .next()
+        .unwrap();
+    for forbidden in [
+        "publish_project(",
+        "publish_exclusive",
+        "spawn_blocking",
+        "build_providers",
+    ] {
+        assert!(
+            !refusal_block.contains(forbidden),
+            "the refusal must never reference {forbidden}"
+        );
+    }
+    assert!(refusal_block.contains("return Err"));
+    assert!(refusal_block.contains("publication_busy_error()"));
+    // A refused publication emits no events: nothing started, so the
+    // activity feed must not observe a phantom run. The refusal has no sink.
+    assert!(!refusal_block.contains("emit("));
+}
+
+#[test]
+fn the_publication_permit_covers_the_whole_blocking_execution() {
+    let main = read_source("/src/main.rs");
+    let wrapper = main
+        .split("async fn publish_project")
+        .nth(1)
+        .expect("the publication wrapper must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // The acquired permit moves INTO the blocking worker and is handed to
+    // the exclusive runner, so the slot stays held for the entire
+    // publication — load, local publication, plan, providers — and is
+    // released exactly when the worker completes.
+    let exclusive_call = wrapper
+        .split("publish_exclusive(")
+        .nth(1)
+        .expect("the wrapper must run the work through the exclusive runner");
+    assert!(
+        exclusive_call.contains("permit,"),
+        "the permit must move into the exclusive runner"
+    );
+    assert!(
+        exclusive_call.contains("publisher_desktop::commands::publish_project"),
+        "the work must be the publication command"
+    );
+    assert!(
+        exclusive_call.contains("&mut sink"),
+        "the event sink must keep flowing through the runner"
+    );
+    // The wrapper itself never releases the slot: exactly one acquisition
+    // point, and no explicit drop of the permit outside the worker.
+    assert_eq!(
+        wrapper.matches("try_acquire()").count(),
+        1,
+        "exactly one acquisition point exists"
+    );
+    assert!(
+        !wrapper.contains("drop(permit"),
+        "the wrapper must never release the slot itself"
+    );
+}
+
+#[test]
+fn the_publication_slot_primitives_live_in_the_command_layer() {
+    // Library side of the contract: the gate is managed-state friendly, the
+    // permit is a data-free RAII token whose drop is the single release
+    // point, the exclusive runner holds it for its whole body, and the
+    // refusal is pure fixed data with a distinct kind.
+    let commands = read_source("/src/commands.rs");
+    for required in [
+        "pub struct PublicationGate",
+        "pub struct PublicationPermit",
+        "impl Drop for PublicationPermit",
+        "pub fn try_acquire",
+        "pub fn publish_exclusive",
+        "pub fn publication_busy_error",
+        "pub const PUBLICATION_BUSY_KIND",
+        "\"publication_busy\"",
+    ] {
+        assert!(
+            commands.contains(required),
+            "the publication gate must define {required}"
+        );
+    }
+    let runner = commands
+        .split("pub fn publish_exclusive")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(runner.contains("let _held = permit;"));
+    assert!(runner.contains("work(project_path, events)"));
+    // The refusal constructs pure data only: no provider, no application
+    // service, no environment, no path.
+    let refusal = commands
+        .split("pub fn publication_busy_error")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "publish_project(",
+        "build_providers",
+        "std::env",
+        "reqwest",
+        "project_path",
+    ] {
+        assert!(
+            !refusal.contains(forbidden),
+            "the publication refusal must not reference {forbidden}"
+        );
+    }
+    assert!(refusal.contains("PUBLICATION_BUSY_KIND"));
+}
+
+#[test]
+fn only_publish_acquires_the_publication_gate() {
+    // The gate belongs exclusively to Publish: no other command wrapper may
+    // reference it (dry-run stays free of providers/network/credentials and
+    // never holds the publication slot; provisioning keeps its own gate).
+    let main = read_source("/src/main.rs");
+    for wrapper_name in [
+        "async fn publish_project",
+        "async fn provision_project",
+        "async fn prepare_local_publication",
+        "fn dry_run_project",
+        "fn recover_project",
+        "fn validate_project",
+        "fn preflight_project",
+    ] {
+        let wrapper = main
+            .split(wrapper_name)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{wrapper_name} must exist"))
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        if wrapper_name == "async fn publish_project" {
+            assert!(
+                wrapper.contains("PublicationGate"),
+                "publish must acquire the publication gate"
+            );
+        } else {
+            assert!(
+                !wrapper.contains("PublicationGate"),
+                "{wrapper_name} must not touch the publication gate"
+            );
+        }
+    }
+    assert!(main.contains("pub struct PublicationGate") || main.contains("PublicationGate,"));
+}
+
+#[test]
+fn a_refused_concurrent_publish_is_presented_distinctly_and_invalidates_nothing() {
+    // UI side of 7-K.6: the rejection is shown as "another publication is
+    // running" — never as a failed publication — and it must leave every
+    // piece of valid state untouched (no dryRunReady/localReady/provisioned
+    // invalidation, no activity pollution, no result cleanup of the run in
+    // flight).
+    let script = read_source("/ui/app.js");
+    assert!(script.contains("function showPublishBusy("));
+    let busy = script
+        .split("function showPublishBusy(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(busy.contains("textContent"));
+    assert!(!busy.contains("innerHTML"));
+    let handler = script
+        .split("async function onPublish()")
+        .nth(1)
+        .expect("onPublish must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let catch = handler.split("} catch (error) {").nth(1).unwrap();
+    assert!(catch.contains("error.kind === \"publication_busy\""));
+    // The busy branch and its surroundings invalidate nothing.
+    let busy_branch = catch
+        .split("error.kind === \"publication_busy\"")
+        .nth(1)
+        .unwrap();
+    for forbidden in [
+        "state.dryRunReady = false",
+        "state.preflightReady = false",
+        "state.localReady = false",
+        "state.provisioned = false",
+        "state.validated = false",
+        "hide(\"dry-run-result\")",
+        "hide(\"preflight-result\")",
+        "addActivity(",
+    ] {
+        assert!(
+            !busy_branch.contains(forbidden),
+            "a refused publication must not contain {forbidden}"
+        );
+    }
+    // The failure presentation stays distinct: the generic failure path
+    // still exists for real failures.
+    assert!(catch.contains("showPublishError(error)"));
+    assert!(catch.contains("Falha na publicação."));
+}

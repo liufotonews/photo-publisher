@@ -16,8 +16,8 @@
 use publisher_desktop::commands::{
     AppInfo, CommandError, CreateProjectSetupOutcomeDto, CredentialStatusDto, DryRunOutcomeDto,
     PreflightOutcomeDto, PrepareLocalOutcomeDto, ProvisionProjectFailureDto,
-    ProvisionProjectOutcomeDto, ProvisioningGate, PublishOutcomeDto, RecoverOutcomeDto,
-    ValidateConfigurationOutcomeDto, ValidateProjectOutcome,
+    ProvisionProjectOutcomeDto, ProvisioningGate, PublicationGate, PublishOutcomeDto,
+    RecoverOutcomeDto, ValidateConfigurationOutcomeDto, ValidateProjectOutcome,
 };
 use tauri::Emitter;
 
@@ -58,11 +58,27 @@ fn validate_project(
 /// work stays fully synchronous inside `commands::publish_project`; only the
 /// boundary is async. Events are emitted from the background closure through
 /// the same single channel; emission failure never changes the outcome.
+/// Publication is additionally EXCLUSIVE in the backend (Phase 7-K.6): the
+/// single slot of the managed gate is acquired atomically below, BEFORE any
+/// blocking work is queued, and the acquired permit moves into the worker,
+/// so the slot stays held for the entire publication. A second attempt while
+/// one is running is refused immediately — nothing is constructed, nothing
+/// is called — and the slot is released only when the worker finishes, with
+/// success or error. A refused attempt emits no events: no publication ever
+/// started, so the activity feed must not suggest one did.
 #[tauri::command]
 async fn publish_project(
     app_handle: tauri::AppHandle,
+    gate: tauri::State<'_, PublicationGate>,
     project_path: String,
 ) -> Result<PublishOutcomeDto, CommandError> {
+    let Some(permit) = gate.try_acquire() else {
+        // Immediate refusal: nothing is queued, nothing is constructed, no
+        // provider is built, no credential is read, no service runs. Only
+        // the worker that owns a permit can ever release the slot — never
+        // a UI result.
+        return Err(publisher_desktop::commands::publication_busy_error());
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let mut sink = |event: publisher_app::ApplicationEvent| {
             let _ = app_handle.emit(
@@ -70,7 +86,15 @@ async fn publish_project(
                 publisher_desktop::events::DesktopEvent::from(&event),
             );
         };
-        publisher_desktop::commands::publish_project(&project_path, &mut sink)
+        // The permit lives inside the worker for its entire execution; it
+        // drops here when the work returns (success or error) or while a
+        // panic unwinds — the single release point of the slot.
+        publisher_desktop::commands::publish_exclusive(
+            permit,
+            &project_path,
+            publisher_desktop::commands::publish_project,
+            &mut sink,
+        )
     })
     .await
     .map_err(|_| CommandError {
@@ -237,6 +261,9 @@ fn main() {
         // state, so the "one provisioning at a time" exclusion is enforced
         // by the backend for every command invocation — not by the UI.
         .manage(ProvisioningGate::new())
+        // The single publication slot (Phase 7-K.6): same rule for Publish,
+        // enforced by the backend — independent of the provisioning slot.
+        .manage(PublicationGate::new())
         .invoke_handler(tauri::generate_handler![
             get_app_info,
             validate_project,

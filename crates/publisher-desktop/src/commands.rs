@@ -631,6 +631,133 @@ where
     work(project_path, events)
 }
 
+// ---------------------------------------------------------------------------
+// Publication exclusion (Phase 7-K.6)
+//
+// One publication at a time, enforced by the desktop backend — never by the
+// JavaScript busy flag. This gate deliberately MIRRORS the provisioning one
+// instead of sharing an abstraction: the two operations are independent
+// (Provisioning and Publish never share a slot) and a premature
+// generalization would grow this phase. Different responsibilities from the
+// pipeline's execution lock: that one guards the local publication's
+// integrity on disk; this one admits exactly one Publish run anywhere in
+// the application, rejected before any provider, credential, network, or
+// application-service work exists.
+// ---------------------------------------------------------------------------
+
+/// Stable desktop classification of the concurrent-publication refusal.
+/// This is deliberately not an application-layer failure kind: the refused
+/// run never started, so nothing failed — the backend is saying "one
+/// publication at a time". It stays distinct from any publication failure.
+pub const PUBLICATION_BUSY_KIND: &str = "publication_busy";
+
+/// Tauri-managed exclusive slot for publication (Phase 7-K.6).
+///
+/// Registered once by the desktop bootstrap as managed state and never
+/// recreated afterwards. The flag is `true` while exactly one publication
+/// is running anywhere in the application. The inner mutex guards only the
+/// instant check-and-set of [`PublicationGate::try_acquire`] and the
+/// instant reset of the permit's drop — it is never held across any
+/// publication work, so a second attempt can never wait on the running
+/// operation: it is answered immediately.
+#[derive(Debug, Default)]
+pub struct PublicationGate {
+    slot: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+/// A live acquisition of [`PublicationGate`].
+///
+/// Owning this value is what "a publication is running" means. It owns its
+/// share of the slot (so it can move into the blocking worker) and releases
+/// on drop — the ONLY release path, which happens exactly when the worker
+/// holding it finishes, with success or error. The value carries no data:
+/// no path, no credentials, no results.
+#[derive(Debug)]
+pub struct PublicationPermit {
+    slot: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+impl PublicationGate {
+    /// One free slot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Atomically acquires the single publication slot.
+    ///
+    /// `Some(permit)`: the caller now exclusively owns publication until the
+    /// permit drops. `None`: a publication is already running and this
+    /// attempt is refused immediately — no waiting, no provider
+    /// construction, no credential read, no application service call. The
+    /// check-and-set runs under the slot mutex, which is held only for that
+    /// instant.
+    pub fn try_acquire(&self) -> Option<PublicationPermit> {
+        let mut busy = Self::lock_slot(&self.slot);
+        if *busy {
+            return None;
+        }
+        *busy = true;
+        Some(PublicationPermit {
+            slot: std::sync::Arc::clone(&self.slot),
+        })
+    }
+
+    /// Locks the slot flag. Poisoning could only originate in a panic
+    /// inside the instant check-and-set/reset sections; the flag carries no
+    /// invariant a panic could corrupt, so recovering the guard is always
+    /// the correct (and deadlock-free) choice.
+    fn lock_slot(slot: &std::sync::Mutex<bool>) -> std::sync::MutexGuard<'_, bool> {
+        slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for PublicationPermit {
+    /// The single release point: the worker finished (its closure dropped
+    /// this permit), so the slot becomes free for the next publication.
+    fn drop(&mut self) {
+        *PublicationGate::lock_slot(&self.slot) = false;
+    }
+}
+
+/// The immediate refusal returned when a publication is attempted while
+/// another one is still running.
+///
+/// Pure fixed data: a stable kind and one public sentence — nothing ran, so
+/// nothing completed. No path, no environment name, and no secret material
+/// can ever appear here, because the refusal consults nothing.
+pub fn publication_busy_error() -> CommandError {
+    CommandError {
+        kind: PUBLICATION_BUSY_KIND.to_owned(),
+        message:
+            "Já existe uma publicação em andamento. Aguarde a conclusão antes de iniciar outra."
+                .to_owned(),
+    }
+}
+
+/// Runs one publication attempt holding the exclusively acquired slot
+/// (Phase 7-K.6).
+///
+/// The permit crosses by value: it stays alive for the entire body — the
+/// acquisition covers the whole blocking execution (load, local publication,
+/// plan, providers) — and drops exactly when `work` returns, with success
+/// or error, which is the only moment the slot is released. `work` is the
+/// command adapter (the Tauri wrapper passes [`publish_project`]); it is a
+/// parameter so the exclusion contract can be tested without providers or
+/// network reach. A refused attempt never reaches this function at all:
+/// without a permit there is nothing to run.
+pub fn publish_exclusive<F>(
+    permit: PublicationPermit,
+    project_path: &str,
+    work: F,
+    events: &mut EventSink<'_>,
+) -> Result<PublishOutcomeDto, CommandError>
+where
+    F: FnOnce(&str, &mut EventSink<'_>) -> Result<PublishOutcomeDto, CommandError>,
+{
+    let _held = permit;
+    work(project_path, events)
+}
+
 /// Runs the explicit infrastructure provisioning for a project (Phase 7-J,
 /// wired to the event channel in Phase 7-K.5).
 ///
@@ -1760,6 +1887,276 @@ mod tests {
         // Nothing ran: the report is empty and the message is public text.
         assert_eq!(*failure.report, ProvisionProjectOutcomeDto::default());
         assert!(!failure.message.is_empty());
+    }
+
+    // --- Publication exclusion (Phase 7-K.6) ---------------------------------
+    //
+    // The desktop backend — not the JavaScript — enforces "one publication
+    // at a time". The tests mirror the provisioning exclusion contract:
+    // acquire the single slot atomically, run the work holding the permit,
+    // and release only when the work finishes.
+
+    fn publish_sample_outcome() -> PublishOutcomeDto {
+        PublishOutcomeDto {
+            outcome: "no_change",
+            generation: "g-000001".to_owned(),
+            storage: None,
+            repository: None,
+            hosting: None,
+        }
+    }
+
+    /// Mirrors the Tauri wrapper's acquire-then-run shape, so the tests
+    /// exercise the same composition the binary performs.
+    fn gated_publish_attempt(
+        gate: &PublicationGate,
+        project_path: &str,
+        work: impl FnOnce(&str, &mut EventSink<'_>) -> Result<PublishOutcomeDto, CommandError>,
+    ) -> Result<PublishOutcomeDto, CommandError> {
+        match gate.try_acquire() {
+            Some(permit) => publish_exclusive(permit, project_path, work, &mut |_| {}),
+            None => Err(publication_busy_error()),
+        }
+    }
+
+    #[test]
+    fn second_publication_is_rejected_while_the_first_is_active() {
+        let gate = PublicationGate::new();
+        // The first publication acquires the slot — from this moment the
+        // refusal is already in force, before its blocking worker even
+        // starts, exactly like the queued worker of the desktop runtime.
+        let permit = gate
+            .try_acquire()
+            .expect("the first publication must acquire the slot");
+        assert!(
+            gate.try_acquire().is_none(),
+            "a second attempt must be refused before the worker starts"
+        );
+
+        // The first publication runs in a worker thread and stays
+        // mid-"remote call" until the test lets it finish.
+        let (resume, hold) = std::sync::mpsc::channel::<()>();
+        let (started, started_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            publish_exclusive(
+                permit,
+                "first",
+                move |_, _| {
+                    hold.recv().unwrap(); // the remote publication is still running
+                    Ok(publish_sample_outcome())
+                },
+                &mut |_| {},
+            )
+        });
+        started_rx.recv().unwrap();
+
+        // While the first publication is active, the second is refused
+        // immediately, with the fixed busy error — not a worker result.
+        let failure = gated_publish_attempt(&gate, "second", |_, _| Ok(publish_sample_outcome()))
+            .expect_err("an active publication must block a second one");
+        assert_eq!(failure.kind, PUBLICATION_BUSY_KIND);
+
+        // Let the first publication finish: the slot is released exactly
+        // when its worker completes, with success.
+        resume.send(()).unwrap();
+        let first = worker
+            .join()
+            .unwrap()
+            .expect("the first publication completed successfully");
+        assert_eq!(first.generation, "g-000001");
+
+        // After the first finished, the slot is free and a new publication
+        // runs normally — end to end.
+        let second_run =
+            gated_publish_attempt(&gate, "second", |_, _| Ok(publish_sample_outcome()))
+                .expect("a new publication must run after the previous one finishes");
+        assert_eq!(second_run.generation, "g-000001");
+    }
+
+    #[test]
+    fn the_refused_publication_never_calls_the_application_service() {
+        let gate = PublicationGate::new();
+        // The first publication is active: its permit is alive.
+        let _active = gate.try_acquire().expect("the first attempt acquires");
+
+        // The refusal is the fixed busy error — NOT the error the real
+        // command would have produced (a missing project answers
+        // resource_missing through the application service). Observing the
+        // busy kind proves the service was never invoked for the refused
+        // attempt: no provider was built, no credential was read, no
+        // network was reached.
+        let root = tempdir().unwrap();
+        let missing = root.path().join("project.json");
+        let failure = gated_publish_attempt(&gate, missing.to_str().unwrap(), publish_project)
+            .expect_err("the second attempt must be refused");
+        assert_eq!(failure.kind, PUBLICATION_BUSY_KIND);
+
+        // A counting seam confirms the same for the generic work: a refusal
+        // never runs anything.
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let counted = {
+            let calls = std::sync::Arc::clone(&calls);
+            move |_: &str, _: &mut EventSink<'_>| {
+                *calls.lock().unwrap() += 1;
+                Ok(publish_sample_outcome())
+            }
+        };
+        let again = gated_publish_attempt(&gate, "second", counted).expect_err("still refused");
+        assert_eq!(again.kind, PUBLICATION_BUSY_KIND);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            0,
+            "no work may run for a refused attempt"
+        );
+    }
+
+    #[test]
+    fn the_publication_slot_is_released_after_a_successful_run() {
+        let gate = PublicationGate::new();
+        let outcome = gated_publish_attempt(&gate, "project", |_, _| Ok(publish_sample_outcome()))
+            .expect("the first run succeeds");
+        assert_eq!(outcome.generation, "g-000001");
+        // The worker finished successfully: the slot is free again...
+        assert!(
+            gate.try_acquire().is_some(),
+            "the slot must be free after a successful run"
+        );
+        // ...and a full new publication runs normally.
+        assert!(
+            gated_publish_attempt(&gate, "project", |_, _| Ok(publish_sample_outcome())).is_ok(),
+            "a new publication must run after the previous one finishes"
+        );
+    }
+
+    #[test]
+    fn the_publication_slot_is_released_after_a_failed_run() {
+        let gate = PublicationGate::new();
+        let failure = gated_publish_attempt(&gate, "project", |_, _| {
+            Err(CommandError {
+                kind: "publication".to_owned(),
+                message: "simulated publication failure".to_owned(),
+            })
+        })
+        .expect_err("the run fails");
+        assert_eq!(failure.kind, "publication");
+        // The worker finished with an error: the slot is free again.
+        assert!(
+            gate.try_acquire().is_some(),
+            "the slot must be free after a failed run"
+        );
+    }
+
+    #[test]
+    fn the_publication_slot_is_released_after_the_real_command_fails_before_any_network() {
+        // The real production composition: the work is the actual command,
+        // which fails at the application layer before any remote call (the
+        // project document is missing). The slot must free on that error.
+        let gate = PublicationGate::new();
+        let root = tempdir().unwrap();
+        let missing = root.path().join("project.json");
+        let failure = gated_publish_attempt(&gate, missing.to_str().unwrap(), publish_project)
+            .expect_err("the real command must fail on a missing document");
+        assert_eq!(failure.kind, "resource_missing");
+        assert!(
+            gate.try_acquire().is_some(),
+            "the slot must be free after the real command errored"
+        );
+    }
+
+    #[test]
+    fn stale_publication_results_never_release_the_slot() {
+        let gate = PublicationGate::new();
+        let _active = gate.try_acquire().expect("the first publication is active");
+        // Everything the UI side can do with a stale result — receive it,
+        // render it, discard it unread — operates on plain data. None of it
+        // can touch the slot: the permit is unreachable from any result, so
+        // the slot stays held.
+        let stale_ok = Ok::<PublishOutcomeDto, CommandError>(publish_sample_outcome());
+        let stale_refusal = publication_busy_error();
+        let _ = format!("{stale_ok:?} {stale_refusal:?}");
+        let _ = serde_json::to_string(&stale_refusal).unwrap();
+        drop(stale_ok);
+        drop(stale_refusal);
+        assert!(
+            gate.try_acquire().is_none(),
+            "stale results can never release the slot"
+        );
+        // Only the worker finishing releases it — the guarantee the UI
+        // staleness guard could never provide on its own.
+        drop(_active);
+        assert!(
+            gate.try_acquire().is_some(),
+            "the worker finishing releases the slot"
+        );
+    }
+
+    #[test]
+    fn publication_acquisition_is_atomic_exactly_one_attempt_wins_across_threads() {
+        // Eight concurrent attempts race for the single slot; the barrier
+        // guarantees nobody releases before every attempt has happened, so
+        // the outcome is deterministic: exactly one winner.
+        const ATTEMPTS: usize = 8;
+        let gate = std::sync::Arc::new(PublicationGate::new());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(ATTEMPTS));
+        let wins = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let mut threads = Vec::new();
+        for _ in 0..ATTEMPTS {
+            let gate = std::sync::Arc::clone(&gate);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let wins = std::sync::Arc::clone(&wins);
+            threads.push(std::thread::spawn(move || {
+                let permit = gate.try_acquire();
+                barrier.wait(); // every attempt has now happened; nobody released yet
+                if let Some(permit) = permit {
+                    drop(permit); // release only after all attempts completed
+                    *wins.lock().unwrap() += 1;
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            *wins.lock().unwrap(),
+            1,
+            "exactly one concurrent attempt may acquire the slot"
+        );
+        // And after the winner released, the slot works again.
+        assert!(gate.try_acquire().is_some());
+    }
+
+    #[test]
+    fn the_publication_busy_refusal_carries_no_sensitive_information() {
+        let error = publication_busy_error();
+        assert_eq!(error.kind, PUBLICATION_BUSY_KIND);
+        // The refusal kind stays distinct from a real publication failure…
+        assert_ne!(error.kind, "publication");
+        // …and from the provisioning refusal (independent operations).
+        assert_ne!(error.kind, PROVISIONING_BUSY_KIND);
+        // The refusal consults nothing: no path is read, no environment
+        // name is touched, so nothing sensitive can leak into it.
+        let json = serde_json::to_string(&error).unwrap();
+        for needle in [
+            "PHOTO_PUBLISHER_",
+            "token",
+            "secret",
+            "password",
+            "c:\\",
+            "http",
+            "authorization",
+        ] {
+            assert!(
+                !json.to_lowercase().contains(needle),
+                "the publication refusal must not carry {needle}: {json}"
+            );
+        }
+        // Deterministic: the refusal is the same fixed data every time.
+        assert_eq!(
+            json,
+            serde_json::to_string(&publication_busy_error()).unwrap()
+        );
+        assert!(!error.message.is_empty());
     }
 
     // --- Local bootstrap (Phase 7-K.2) ----------------------------------------
